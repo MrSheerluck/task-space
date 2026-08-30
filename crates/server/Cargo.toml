@@ -1,0 +1,6 @@
+[package]
+name = "task-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
