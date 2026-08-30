@@ -1,0 +1,13 @@
+{
+  "name": "waitlist-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "migrate:local": "wrangler d1 migrations apply task-space-waitlist --local",
+    "migrate:remote": "wrangler d1 migrations apply task-space-waitlist --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}

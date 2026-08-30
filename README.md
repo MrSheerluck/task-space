@@ -1,6 +1,7 @@
-# task-space
+# Task Space
 
 A paper-and-sticky-notes style canvas task manager. Local-first, your tasks live in the browser and stay yours. Optional Pro (sync across devices) is paid
+
 
 ## Stack
 
@@ -12,7 +13,14 @@ A paper-and-sticky-notes style canvas task manager. Local-first, your tasks live
 ## Development
 
 ```sh
-trunk serve    # app under apps/web (after workspace is scaffolded, M0)
+make dev          # app under apps/web (trunk, :8080); runs `make css` first (Tailwind)
+```
+
+
+```sh
+# https://task-space-waitlist.mrsheerluck003.workers.dev  (POST /waitlist, GET /waitlist/count)
+cd api/waitlist && npm run dev        # optional: local miniflare on :8787
+# deploy after changes: npx wrangler d1 migrations apply task-space-waitlist --remote && npx wrangler deploy
 ```
 
 ## Status

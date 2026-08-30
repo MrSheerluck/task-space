@@ -1,0 +1,13 @@
+{
+  "name": "task-space-waitlist",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-28",
+  "d1_databases": [
+    {
+      "binding": "WAITLIST_DB",
+      "database_name": "task-space-waitlist",
+      "database_id": "eb82c8e8-99be-45a0-b5d3-fa4cd7a2feb4",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

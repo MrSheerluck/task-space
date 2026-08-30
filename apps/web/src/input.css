@@ -1,0 +1,59 @@
+@import "tailwindcss";
+/* Caveat (OFL): generated data URI font-face, see `make fonts` */
+@import "./fonts-inline.css";
+
+@theme {
+  --font-handwriting: "Caveat", "Kalam", cursive;
+  --font-sans: "Avenir Next", "Segoe UI", ui-sans-serif, system-ui,
+    -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* §2.5: paper & ink */
+  --color-paper: #f5f1e8;
+  --color-paper-shelf: #efe9dc;
+  --color-ink: #2a2722;
+  --color-ink-soft: #5a554b;
+  --color-marker: #ffe567;
+
+  /* §2.5: pastel note set */
+  --color-note-yellow: #fff7c6;
+  --color-note-pink: #ffd9e3;
+  --color-note-blue: #c9e8ff;
+  --color-note-green: #d9f3d9;
+  --color-note-lav: #e7dff7;
+
+  /* ink tuned per note color (≥4.5:1 on pastels) */
+  --color-note-ink-yellow: #6b5a2e;
+  --color-note-ink-pink: #6d3547;
+  --color-note-ink-blue: #2e4a66;
+  --color-note-ink-green: #2f5732;
+  --color-note-ink-lav: #453a68;
+
+  /* theme-aware whites */
+  --color-blank: rgb(255 255 255 / 0.7);
+  --color-tape: rgb(255 255 255 / 0.4);
+  --color-chip: rgb(255 255 255 / 0.6);
+
+  --radius-note: 3px;
+}
+
+@layer base {
+  html,
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+
+  body {
+    background-image: radial-gradient(
+      color-mix(in srgb, var(--color-ink-soft) 12%, transparent) 1px,
+      transparent 1.5px
+    );
+    background-size: 24px 24px;
+  }
+
+  ::selection {
+    background-color: var(--color-marker);
+    color: var(--color-ink);
+  }
+}

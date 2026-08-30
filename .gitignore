@@ -1,5 +1,9 @@
 /target
 /dist
+/apps/web/dist
 .env
 .env.local
+/apps/web/node_modules
+/apps/web/src/main.css
+/apps/web/src/fonts-inline.css
 roadmap.md
