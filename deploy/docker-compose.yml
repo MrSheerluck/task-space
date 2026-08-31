@@ -1,0 +1,29 @@
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  task-space:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+
+  # journal: second SMBL product
+  # (in its own compose once its source + domain + secrets are confirmed;
+  #  caddy routes journal.<domain> -> journal:80 when enabled)
+  journal:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    entrypoint: ["sh", "-c", "echo 'journal placeholder - source pending'; sleep infinity"]
+
+volumes:
+  caddy_data:
+  caddy_config:

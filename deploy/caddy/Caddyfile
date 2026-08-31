@@ -1,0 +1,8 @@
+taskspace.smbl.dev {
+	encode gzip zstd
+	reverse_proxy task-space:80
+}
+
+http://167.233.72.182 {
+	respond "origin ok"
+}
