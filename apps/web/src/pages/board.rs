@@ -8,7 +8,6 @@ use web_sys::{
 };
 
 const STORAGE_KEY: &str = "task-space.board.v1";
-const DRAG_THRESHOLD_PX: f64 = 6.0;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Note {
@@ -138,16 +137,6 @@ fn board_position(client_x: f64, client_y: f64, offset: (f64, f64)) -> Option<(f
     Some((x, y))
 }
 
-fn drag_is_blocked(event: &PointerEvent) -> bool {
-    let Some(target) = event
-        .target()
-        .and_then(|target| target.dyn_into::<Element>().ok())
-    else {
-        return false;
-    };
-    target.tag_name() == "TEXTAREA" || target.has_attribute("data-note-action")
-}
-
 fn note_snapshot(notes: RwSignal<Vec<Note>>, id: u64) -> Option<Note> {
     notes.get().into_iter().find(|note| note.id == id)
 }
@@ -159,8 +148,6 @@ fn NoteCard(
     editing: RwSignal<Option<u64>>,
     dragged: RwSignal<Option<u64>>,
     drag_offset: RwSignal<Option<(f64, f64)>>,
-    drag_start: RwSignal<Option<(u64, f64, f64)>>,
-    did_drag: RwSignal<Option<u64>>,
 ) -> impl IntoView {
     let toggle_done = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -185,51 +172,46 @@ fn NoteCard(
             editing.set(None);
         }
     };
-    let start_drag = move |ev: PointerEvent| {
-        if ev.button() != 0 || drag_is_blocked(&ev) {
+    let edit_note = move |ev: MouseEvent| {
+        let Some(target) = ev
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        else {
+            editing.set(Some(id));
+            return;
+        };
+        if target.has_attribute("data-note-drag-handle") || target.has_attribute("data-note-action")
+        {
             return;
         }
-        let Some(card) = ev
+        editing.set(Some(id));
+    };
+    let start_drag = move |ev: PointerEvent| {
+        if ev.button() != 0 {
+            return;
+        }
+        let Some(handle) = ev
             .current_target()
             .and_then(|target| target.dyn_into::<Element>().ok())
         else {
             return;
         };
+        let Some(card) = handle.parent_element() else {
+            return;
+        };
         let rect = card.get_bounding_client_rect();
+        let _ = handle.set_pointer_capture(ev.pointer_id());
         drag_offset.set(Some((
             f64::from(ev.client_x()) - rect.left(),
             f64::from(ev.client_y()) - rect.top(),
         )));
-        drag_start.set(Some((
-            id,
-            f64::from(ev.client_x()),
-            f64::from(ev.client_y()),
-        )));
+        dragged.set(Some(id));
     };
     let move_dragged_note = move |ev: PointerEvent| {
-        let Some((start_id, start_x, start_y)) = drag_start.get_untracked() else {
-            return;
-        };
-        if start_id != id {
-            return;
-        }
         if dragged.get_untracked() != Some(id) {
-            let dx = f64::from(ev.client_x()) - start_x;
-            let dy = f64::from(ev.client_y()) - start_y;
-            if dx.mul_add(dx, dy * dy) < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
-                return;
-            }
-            let Some(card) = ev
-                .current_target()
-                .and_then(|target| target.dyn_into::<Element>().ok())
-            else {
-                return;
-            };
-            let _ = card.set_pointer_capture(ev.pointer_id());
-            dragged.set(Some(id));
+            return;
         }
         ev.prevent_default();
-        did_drag.set(Some(id));
         if let Some(offset) = drag_offset.get_untracked() {
             if let Some((x, y)) =
                 board_position(f64::from(ev.client_x()), f64::from(ev.client_y()), offset)
@@ -245,13 +227,6 @@ fn NoteCard(
     };
     let finish_drag = move |ev: PointerEvent| {
         if dragged.get_untracked() != Some(id) {
-            if drag_start
-                .get_untracked()
-                .is_some_and(|(start_id, _, _)| start_id == id)
-            {
-                drag_start.set(None);
-                drag_offset.set(None);
-            }
             return;
         }
         if let Some(card) = ev
@@ -259,12 +234,6 @@ fn NoteCard(
             .and_then(|target| target.dyn_into::<Element>().ok())
         {
             let _ = card.release_pointer_capture(ev.pointer_id());
-        }
-        if drag_start
-            .get_untracked()
-            .is_some_and(|(start_id, _, _)| start_id == id)
-        {
-            drag_start.set(None);
         }
         dragged.set(None);
         drag_offset.set(None);
@@ -278,7 +247,7 @@ fn NoteCard(
                 if dragged.get() == Some(id) {
                     "z-20 cursor-grabbing shadow-2xl ring-2 ring-ink/10"
                 } else {
-                    "cursor-grab hover:shadow-xl"
+                    "cursor-pointer hover:shadow-xl"
                 }
             )
             style=move || {
@@ -295,10 +264,7 @@ fn NoteCard(
                     if dragged.get() == Some(id) { "scale(1.02)" } else { "scale(1)" }
                 )
             }
-            on:pointerdown=start_drag
-            on:pointermove=move_dragged_note
-            on:pointerup=finish_drag
-            on:pointercancel=finish_drag
+            on:click=edit_note
             aria-label=move || note_snapshot(notes, id)
                 .map(|note| {
                     if note.text.trim().is_empty() {
@@ -309,7 +275,15 @@ fn NoteCard(
                 })
                 .unwrap_or_else(|| "Task note".to_string())
         >
-            <div class="absolute -top-2 left-1/2 -translate-x-1/2 w-11 h-3 bg-tape rotate-[-2deg]" aria-hidden="true"></div>
+            <div
+                class="absolute -top-2 left-1/2 -translate-x-1/2 w-11 h-3 cursor-grab bg-tape rotate-[-2deg]"
+                data-note-drag-handle="true"
+                aria-label="Drag note to move"
+                on:pointerdown=start_drag
+                on:pointermove=move_dragged_note
+                on:pointerup=finish_drag
+                on:pointercancel=finish_drag
+            ></div>
             {move || if editing.get() == Some(id) {
                 let text = notes
                     .get_untracked()
@@ -349,7 +323,10 @@ fn NoteCard(
                     <button
                         type="button"
                         data-note-action="finish-editing"
-                        on:click=move |_| editing.set(None)
+                        on:click=move |ev: MouseEvent| {
+                            ev.stop_propagation();
+                            editing.set(None);
+                        }
                         class="absolute bottom-2 left-3 text-xs font-sans underline underline-offset-2"
                     >
                         "done editing"
@@ -360,15 +337,6 @@ fn NoteCard(
                 view! {
                     <button
                         type="button"
-                        data-note-content="true"
-                        on:click=move |ev: MouseEvent| {
-                            if did_drag.get_untracked() == Some(id) {
-                                did_drag.set(None);
-                                ev.prevent_default();
-                            } else {
-                                editing.set(Some(id));
-                            }
-                        }
                         class=move || format!(
                             "w-full text-left font-handwriting text-2xl leading-tight {}",
                             if note_snapshot(notes, id).is_some_and(|note| note.done) {
@@ -447,8 +415,6 @@ pub fn Board() -> impl IntoView {
     let editing = RwSignal::new(None::<u64>);
     let dragged = RwSignal::new(None::<u64>);
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
-    let drag_start = RwSignal::new(None::<(u64, f64, f64)>);
-    let did_drag = RwSignal::new(None::<u64>);
     let restore_message = RwSignal::new(None::<String>);
     let next_id = RwSignal::new(
         notes
@@ -566,8 +532,6 @@ pub fn Board() -> impl IntoView {
                                 editing=editing
                                 dragged=dragged
                                 drag_offset=drag_offset
-                                drag_start=drag_start
-                                did_drag=did_drag
                             />
                         }
                     }
