@@ -369,85 +369,83 @@ pub fn Board() -> impl IntoView {
     let prevent_drag = move |ev: DragEvent| ev.prevent_default();
 
     view! {
-        <main class="min-h-screen px-4 py-4 sm:px-6 lg:px-8">
-            <div class="mx-auto max-w-7xl">
-                <header class="flex flex-wrap items-center justify-between gap-4 border-b border-ink-soft/15 pb-4">
-                    <a href="/" class="flex items-center gap-2" aria-label="Task Space home">
-                        <img src="/smbl-logo.png" alt="SMBL" class="h-7 w-auto"/>
-                        <span class="font-handwriting text-4xl leading-none">"Task Space"</span>
-                    </a>
-                    <div class="flex items-center gap-2 text-sm">
-                        <span class="mr-2 hidden text-ink-soft sm:inline">
-                            {move || format!("{} {}", notes.get().len(), if notes.get().len() == 1 { "note" } else { "notes" })}
-                        </span>
-                        <button
-                            type="button"
-                            on:click=add_note
-                            class="rounded-[3px] bg-marker px-3 py-2 font-medium shadow-sm hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40"
-                        >
-                            "+ new note"
-                        </button>
-                        <button
-                            type="button"
-                            on:click=move |_| export_notes(&notes.get_untracked())
-                            class="rounded-[3px] border border-ink/20 bg-blank px-3 py-2 hover:bg-white focus:outline-none focus:ring-2 focus:ring-ink/30"
-                        >
-                            "export"
-                        </button>
-                        <label class="cursor-pointer rounded-[3px] border border-ink/20 bg-blank px-3 py-2 hover:bg-white focus-within:ring-2 focus-within:ring-ink/30">
-                            "restore"
-                            <input type="file" accept="application/json,.json" class="sr-only" on:change=restore_file/>
-                        </label>
-                    </div>
-                </header>
-
-                <section class="py-6 sm:py-8">
-                    <div class="mb-5 flex flex-wrap items-end justify-between gap-3">
-                        <div>
-                            <p class="text-xs font-semibold uppercase tracking-[0.18em] text-ink-soft">"my space"</p>
-                            <h1 class="font-handwriting text-5xl leading-none sm:text-6xl">"the things on my mind"</h1>
+        <main class="relative h-[100dvh] min-h-screen overflow-hidden bg-paper">
+            <div
+                class="absolute inset-0 overflow-hidden bg-paper-shelf"
+                style="background-image: radial-gradient(color-mix(in srgb, var(--color-ink-soft) 18%, transparent) 1px, transparent 1.5px); background-size: 24px 24px;"
+                on:dragover=prevent_drag
+                on:drop=drop_note
+            >
+                <div class="pointer-events-none absolute inset-0 opacity-40" style="background:linear-gradient(110deg, transparent 0%, rgb(255 255 255 / .2) 47%, transparent 50%);"></div>
+                {move || if notes.get().is_empty() {
+                    view! {
+                        <div class="absolute inset-0 grid place-items-center p-8 text-center">
+                            <div class="max-w-sm rotate-[-1deg] rounded-[3px] bg-note-yellow px-8 py-7 text-note-ink-yellow shadow-lg">
+                                <p class="font-handwriting text-4xl">"start with one small thing"</p>
+                                <p class="mt-2 text-sm">"Put the task somewhere you can see it. The board remembers it here, even when the network disappears."</p>
+                                <button
+                                    type="button"
+                                    on:click=add_note
+                                    class="mt-5 rounded-[3px] bg-note-ink-yellow px-4 py-2 text-sm font-medium text-note-yellow hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50"
+                                >
+                                    "pin the first note"
+                                </button>
+                            </div>
                         </div>
-                        <p class="max-w-xs text-right text-sm text-ink-soft">
-                            "drag a note to move it · click the words to edit"
-                        </p>
-                    </div>
+                    }.into_any()
+                } else {
+                    notes.get().into_iter().map(|note| view! {
+                        <NoteCard note=note notes=notes editing=editing dragged=dragged/>
+                    }).collect_view().into_any()
+                }}
+            </div>
 
-                    <div
-                        class="relative min-h-[34rem] overflow-hidden rounded-md border border-ink-soft/15 bg-paper-shelf shadow-xl sm:min-h-[42rem]"
-                        style="background-image: radial-gradient(color-mix(in srgb, var(--color-ink-soft) 18%, transparent) 1px, transparent 1.5px); background-size: 24px 24px;"
-                        on:dragover=prevent_drag
-                        on:drop=drop_note
+            <header class="pointer-events-none absolute inset-x-3 top-3 z-10 flex items-start justify-between gap-3 sm:inset-x-5 sm:top-5">
+                <div class="pointer-events-auto flex items-center gap-3 rounded-md border border-ink-soft/15 bg-paper/90 px-3 py-2 shadow-md backdrop-blur-sm">
+                    <a href="/" class="flex items-center gap-2" aria-label="Task Space home">
+                        <img src="/smbl-logo.png" alt="SMBL" class="h-6 w-auto"/>
+                        <span class="font-handwriting text-3xl leading-none">"Task Space"</span>
+                    </a>
+                    <span class="hidden h-6 w-px bg-ink-soft/20 sm:block"></span>
+                    <span class="hidden text-xs text-ink-soft sm:block">
+                        {move || format!("{} {}", notes.get().len(), if notes.get().len() == 1 { "note" } else { "notes" })}
+                    </span>
+                </div>
+
+                <div class="pointer-events-auto flex items-center gap-1 rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:gap-2 sm:p-1.5">
+                    <button
+                        type="button"
+                        on:click=add_note
+                        class="rounded-[3px] bg-marker px-3 py-2 text-sm font-medium shadow-sm hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40"
                     >
-                        <div class="pointer-events-none absolute inset-0 opacity-40" style="background:linear-gradient(110deg, transparent 0%, rgb(255 255 255 / .2) 47%, transparent 50%);"></div>
-                        {move || if notes.get().is_empty() {
-                            view! {
-                                <div class="absolute inset-0 grid place-items-center p-8 text-center">
-                                    <div class="max-w-sm rotate-[-1deg] rounded-[3px] bg-note-yellow px-8 py-7 text-note-ink-yellow shadow-lg">
-                                        <p class="font-handwriting text-4xl">"start with one small thing"</p>
-                                        <p class="mt-2 text-sm">"Put the task somewhere you can see it. The board remembers it here, even when the network disappears."</p>
-                                        <button
-                                            type="button"
-                                            on:click=add_note
-                                            class="mt-5 rounded-[3px] bg-note-ink-yellow px-4 py-2 text-sm font-medium text-note-yellow hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50"
-                                        >
-                                            "pin the first note"
-                                        </button>
-                                    </div>
-                                </div>
-                            }.into_any()
-                        } else {
-                            notes.get().into_iter().map(|note| view! {
-                                <NoteCard note=note notes=notes editing=editing dragged=dragged/>
-                            }).collect_view().into_any()
-                        }}
-                    </div>
-                    <div class="mt-3 flex min-h-6 items-center justify-between gap-3 text-xs text-ink-soft">
-                        <span>"saved on this device"</span>
-                        {move || restore_message.get().map(|message| view! {
-                            <span class="rounded-[3px] bg-note-green px-2 py-1 text-note-ink-green">{message}</span>
-                        })}
-                    </div>
-                </section>
+                        "+ new note"
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_| export_notes(&notes.get_untracked())
+                        class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30 sm:px-3"
+                    >
+                        "export"
+                    </button>
+                    <label class="cursor-pointer rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus-within:ring-2 focus-within:ring-ink/30 sm:px-3">
+                        "restore"
+                        <input type="file" accept="application/json,.json" class="sr-only" on:change=restore_file/>
+                    </label>
+                </div>
+            </header>
+
+            <div class="pointer-events-none absolute inset-x-3 bottom-3 z-10 flex items-end justify-between gap-3 text-xs text-ink-soft sm:inset-x-5 sm:bottom-5">
+                <span class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
+                    "drag to move · click to edit"
+                </span>
+                <div class="flex min-h-7 items-center gap-2">
+                    {move || restore_message.get().map(|message| view! {
+                        <span class="rounded-[3px] bg-note-green px-2.5 py-1.5 text-note-ink-green shadow-sm">{message}</span>
+                    })}
+                    <span class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
+                        "saved on this device"
+                    </span>
+                </div>
             </div>
         </main>
     }
