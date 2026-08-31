@@ -2,12 +2,13 @@ use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_sys::{
     Blob, Element, FileReader, HtmlAnchorElement, HtmlInputElement, HtmlTextAreaElement, Url,
 };
 
 const STORAGE_KEY: &str = "task-space.board.v1";
+const DRAG_THRESHOLD_PX: f64 = 6.0;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Note {
@@ -61,12 +62,33 @@ impl NoteColor {
     }
 }
 
+fn note_position(index: usize) -> (f64, f64) {
+    let column = index % 4;
+    let row = (index / 4) % 3;
+    let x = 8.0 + (column as f64 * 20.0) + if row % 2 == 1 { 4.0 } else { 0.0 };
+    let y = 18.0 + (row as f64 * 23.0);
+    (x.min(78.0), y.min(78.0))
+}
+
 fn load_notes() -> Vec<Note> {
-    web_sys::window()
+    let mut notes: Vec<Note> = web_sys::window()
         .and_then(|window| window.local_storage().ok().flatten())
         .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    for index in 1..notes.len() {
+        let (previous, current) = notes.split_at_mut(index);
+        if previous.iter().any(|other| {
+            (other.x - current[0].x).abs() < 1.0 && (other.y - current[0].y).abs() < 1.0
+        }) {
+            let (x, y) = note_position(index);
+            current[0].x = x;
+            current[0].y = y;
+        }
+    }
+
+    notes
 }
 
 fn save_notes(notes: &[Note]) {
@@ -126,44 +148,20 @@ fn drag_is_blocked(event: &PointerEvent) -> bool {
     target.tag_name() == "TEXTAREA" || target.has_attribute("data-note-action")
 }
 
+fn note_snapshot(notes: RwSignal<Vec<Note>>, id: u64) -> Option<Note> {
+    notes.get().into_iter().find(|note| note.id == id)
+}
+
 #[component]
 fn NoteCard(
-    note: Note,
+    id: u64,
     notes: RwSignal<Vec<Note>>,
     editing: RwSignal<Option<u64>>,
     dragged: RwSignal<Option<u64>>,
     drag_offset: RwSignal<Option<(f64, f64)>>,
-    did_drag: RwSignal<bool>,
+    drag_start: RwSignal<Option<(u64, f64, f64)>>,
+    did_drag: RwSignal<Option<u64>>,
 ) -> impl IntoView {
-    let id = note.id;
-    let empty = note.text.trim().is_empty();
-    let aria_label = if empty {
-        "Empty task note".to_string()
-    } else {
-        note.text.clone()
-    };
-
-    let update_text = move |ev: Event| {
-        let Some(input) = ev
-            .target()
-            .and_then(|target| target.dyn_into::<HtmlTextAreaElement>().ok())
-        else {
-            return;
-        };
-        let value = input.value();
-        notes.update(|items| {
-            if let Some(note) = items.iter_mut().find(|note| note.id == id) {
-                note.text = value;
-            }
-        });
-    };
-
-    let finish_editing = move |_| editing.set(None);
-    let handle_key = move |ev: KeyboardEvent| {
-        if ev.key() == "Escape" {
-            editing.set(None);
-        }
-    };
     let toggle_done = move |ev: MouseEvent| {
         ev.stop_propagation();
         notes.update(|items| {
@@ -198,19 +196,40 @@ fn NoteCard(
             return;
         };
         let rect = card.get_bounding_client_rect();
-        let _ = card.set_pointer_capture(ev.pointer_id());
         drag_offset.set(Some((
             f64::from(ev.client_x()) - rect.left(),
             f64::from(ev.client_y()) - rect.top(),
         )));
-        dragged.set(Some(id));
+        drag_start.set(Some((
+            id,
+            f64::from(ev.client_x()),
+            f64::from(ev.client_y()),
+        )));
     };
     let move_dragged_note = move |ev: PointerEvent| {
-        if dragged.get_untracked() != Some(id) {
+        let Some((start_id, start_x, start_y)) = drag_start.get_untracked() else {
+            return;
+        };
+        if start_id != id {
             return;
         }
+        if dragged.get_untracked() != Some(id) {
+            let dx = f64::from(ev.client_x()) - start_x;
+            let dy = f64::from(ev.client_y()) - start_y;
+            if dx.mul_add(dx, dy * dy) < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
+                return;
+            }
+            let Some(card) = ev
+                .current_target()
+                .and_then(|target| target.dyn_into::<Element>().ok())
+            else {
+                return;
+            };
+            let _ = card.set_pointer_capture(ev.pointer_id());
+            dragged.set(Some(id));
+        }
         ev.prevent_default();
-        did_drag.set(true);
+        did_drag.set(Some(id));
         if let Some(offset) = drag_offset.get_untracked() {
             if let Some((x, y)) =
                 board_position(f64::from(ev.client_x()), f64::from(ev.client_y()), offset)
@@ -226,6 +245,13 @@ fn NoteCard(
     };
     let finish_drag = move |ev: PointerEvent| {
         if dragged.get_untracked() != Some(id) {
+            if drag_start
+                .get_untracked()
+                .is_some_and(|(start_id, _, _)| start_id == id)
+            {
+                drag_start.set(None);
+                drag_offset.set(None);
+            }
             return;
         }
         if let Some(card) = ev
@@ -233,6 +259,12 @@ fn NoteCard(
             .and_then(|target| target.dyn_into::<Element>().ok())
         {
             let _ = card.release_pointer_capture(ev.pointer_id());
+        }
+        if drag_start
+            .get_untracked()
+            .is_some_and(|(start_id, _, _)| start_id == id)
+        {
+            drag_start.set(None);
         }
         dragged.set(None);
         drag_offset.set(None);
@@ -242,46 +274,82 @@ fn NoteCard(
         <article
             class=move || format!(
                 "absolute w-44 min-h-40 p-3 pb-9 rounded-[3px] shadow-lg select-none touch-none transition-[transform,box-shadow] duration-100 {} {}",
-                if note.done { "opacity-70" } else { "" },
+                if note_snapshot(notes, id).is_some_and(|note| note.done) { "opacity-70" } else { "" },
                 if dragged.get() == Some(id) {
                     "z-20 cursor-grabbing shadow-2xl ring-2 ring-ink/10"
                 } else {
                     "cursor-grab hover:shadow-xl"
                 }
             )
-            style=move || format!(
-                "left:{}%;top:{}%;background-color:{};color:{};transform:rotate({}deg) {}",
-                note.x,
-                note.y,
-                note.color.background(),
-                note.color.ink(),
-                note.rotation,
-                if dragged.get() == Some(id) { "scale(1.02)" } else { "scale(1)" }
-            )
+            style=move || {
+                let Some(note) = note_snapshot(notes, id) else {
+                    return String::new();
+                };
+                format!(
+                    "left:{}%;top:{}%;background-color:{};color:{};transform:rotate({}deg) {}",
+                    note.x,
+                    note.y,
+                    note.color.background(),
+                    note.color.ink(),
+                    note.rotation,
+                    if dragged.get() == Some(id) { "scale(1.02)" } else { "scale(1)" }
+                )
+            }
             on:pointerdown=start_drag
             on:pointermove=move_dragged_note
             on:pointerup=finish_drag
             on:pointercancel=finish_drag
-            aria-label=aria_label
+            aria-label=move || note_snapshot(notes, id)
+                .map(|note| {
+                    if note.text.trim().is_empty() {
+                        "Empty task note".to_string()
+                    } else {
+                        note.text
+                    }
+                })
+                .unwrap_or_else(|| "Task note".to_string())
         >
             <div class="absolute -top-2 left-1/2 -translate-x-1/2 w-11 h-3 bg-tape rotate-[-2deg]" aria-hidden="true"></div>
-            {if editing.get() == Some(id) {
+            {move || if editing.get() == Some(id) {
+                let text = notes
+                    .get_untracked()
+                    .into_iter()
+                    .find(|note| note.id == id)
+                    .map(|note| note.text)
+                    .unwrap_or_default();
                 view! {
                     <textarea
-                        prop:value=note.text.clone()
+                        prop:value=text
                         autofocus=true
                         rows="4"
                         maxlength="180"
                         aria-label="Edit task"
-                        on:input=update_text
-                        on:keydown=handle_key
+                        on:input=move |ev: Event| {
+                            let Some(input) = ev
+                                .target()
+                                .and_then(|target| target.dyn_into::<HtmlTextAreaElement>().ok())
+                            else {
+                                return;
+                            };
+                            let value = input.value();
+                            notes.update(|items| {
+                                if let Some(note) = items.iter_mut().find(|note| note.id == id) {
+                                    note.text = value;
+                                }
+                            });
+                        }
+                        on:keydown=move |ev: KeyboardEvent| {
+                            if ev.key() == "Escape" {
+                                editing.set(None);
+                            }
+                        }
                         class="w-full resize-none bg-transparent font-handwriting text-2xl leading-tight outline-none placeholder:text-current/50"
                         placeholder="write a task…"
                     ></textarea>
                     <button
                         type="button"
                         data-note-action="finish-editing"
-                        on:click=finish_editing
+                        on:click=move |_| editing.set(None)
                         class="absolute bottom-2 left-3 text-xs font-sans underline underline-offset-2"
                     >
                         "done editing"
@@ -294,54 +362,81 @@ fn NoteCard(
                         type="button"
                         data-note-content="true"
                         on:click=move |ev: MouseEvent| {
-                            if did_drag.get_untracked() {
-                                did_drag.set(false);
+                            if did_drag.get_untracked() == Some(id) {
+                                did_drag.set(None);
                                 ev.prevent_default();
                             } else {
                                 editing.set(Some(id));
                             }
                         }
-                        class=format!(
+                        class=move || format!(
                             "w-full text-left font-handwriting text-2xl leading-tight {}",
-                            if note.done { "line-through" } else { "" }
+                            if note_snapshot(notes, id).is_some_and(|note| note.done) {
+                                "line-through"
+                            } else {
+                                ""
+                            }
                         )
                     >
-                        {if empty { "click to write" } else { note.text.as_str() }}
+                        {move || note_snapshot(notes, id)
+                            .map(|note| {
+                                if note.text.trim().is_empty() {
+                                    "click to write".to_string()
+                                } else {
+                                    note.text
+                                }
+                            })
+                            .unwrap_or_default()}
                     </button>
                 }
                 .into_any()
             }}
-            <div class="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-2 text-[11px] font-sans">
-                <button
-                    type="button"
-                    data-note-action="toggle-done"
-                    on:click=toggle_done
-                    class="rounded-sm border border-current/30 px-1.5 py-0.5 hover:bg-white/30 focus:outline-none focus:ring-2 focus:ring-current/30"
-                    title=if note.done { "Mark task open" } else { "Complete task" }
-                >
-                    {if note.done { "open" } else { "done" }}
-                </button>
-                <div class="flex items-center gap-2">
-                    <button
-                        type="button"
-                        data-note-action="cycle-color"
-                        on:click=cycle_color
-                        class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
-                        title="Change note colour"
-                    >
-                        "colour"
-                    </button>
-                    <button
-                        type="button"
-                        data-note-action="delete-note"
-                        on:click=delete_note
-                        class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
-                        title="Delete task"
-                    >
-                        "delete"
-                    </button>
-                </div>
-            </div>
+            {move || if editing.get() == Some(id) {
+                ().into_any()
+            } else {
+                view! {
+                    <div class="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-2 text-[11px] font-sans">
+                        <button
+                            type="button"
+                            data-note-action="toggle-done"
+                            on:click=toggle_done
+                            class="rounded-sm border border-current/30 px-1.5 py-0.5 hover:bg-white/30 focus:outline-none focus:ring-2 focus:ring-current/30"
+                            title=move || if note_snapshot(notes, id).is_some_and(|note| note.done) {
+                                "Mark task open"
+                            } else {
+                                "Complete task"
+                            }
+                        >
+                            {move || if note_snapshot(notes, id).is_some_and(|note| note.done) {
+                                "open"
+                            } else {
+                                "done"
+                            }}
+                        </button>
+                        <div class="flex items-center gap-2">
+                            <button
+                                type="button"
+                                data-note-action="cycle-color"
+                                on:click=cycle_color
+                                class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
+                                title="Change note colour"
+                            >
+                                "colour"
+                            </button>
+                            <button
+                                type="button"
+                                data-note-action="delete-note"
+                                on:click=delete_note
+                                class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
+                                title="Delete task"
+                            >
+                                "delete"
+                            </button>
+                        </div>
+                    </div>
+                }
+                .into_any()
+            }}
         </article>
     }
 }
@@ -352,7 +447,8 @@ pub fn Board() -> impl IntoView {
     let editing = RwSignal::new(None::<u64>);
     let dragged = RwSignal::new(None::<u64>);
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
-    let did_drag = RwSignal::new(false);
+    let drag_start = RwSignal::new(None::<(u64, f64, f64)>);
+    let did_drag = RwSignal::new(None::<u64>);
     let restore_message = RwSignal::new(None::<String>);
     let next_id = RwSignal::new(
         notes
@@ -372,6 +468,7 @@ pub fn Board() -> impl IntoView {
         let id = next_id.get_untracked();
         next_id.update(|next| *next += 1);
         notes.update(|items| {
+            let (x, y) = note_position(items.len());
             items.push(Note {
                 id,
                 text: String::new(),
@@ -383,8 +480,8 @@ pub fn Board() -> impl IntoView {
                     _ => NoteColor::Lavender,
                 },
                 done: false,
-                x: 42.0,
-                y: 42.0,
+                x,
+                y,
                 rotation: match id % 5 {
                     0 | 3 => -2,
                     1 | 4 => 2,
@@ -456,17 +553,25 @@ pub fn Board() -> impl IntoView {
                         </div>
                     }.into_any()
                 } else {
-                    notes.get().into_iter().map(|note| view! {
-                        <NoteCard
-                            note=note
-                            notes=notes
-                            editing=editing
-                            dragged=dragged
-                            drag_offset=drag_offset
-                            did_drag=did_drag
-                        />
-                    }).collect_view().into_any()
+                    ().into_any()
                 }}
+                <For
+                    each={move || notes.get().into_iter().map(|note| note.id).collect::<Vec<_>>()}
+                    key=|id| *id
+                    children=move |id: u64| {
+                        view! {
+                            <NoteCard
+                                id=id
+                                notes=notes
+                                editing=editing
+                                dragged=dragged
+                                drag_offset=drag_offset
+                                drag_start=drag_start
+                                did_drag=did_drag
+                            />
+                        }
+                    }
+                />
             </div>
 
             <header class="pointer-events-none absolute inset-x-3 top-3 z-10 flex items-start justify-between gap-3 sm:inset-x-5 sm:top-5">
