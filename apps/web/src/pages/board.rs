@@ -1,13 +1,15 @@
 use js_sys::Array;
-use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent};
+use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
     Blob, Element, FileReader, HtmlAnchorElement, HtmlInputElement, HtmlTextAreaElement, Url,
 };
 
-const STORAGE_KEY: &str = "task-space.board.v1";
+const STORAGE_KEY: &str = "task-space.board.v2";
+const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
+const VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Note {
@@ -18,6 +20,12 @@ struct Note {
     x: f64,
     y: f64,
     rotation: i8,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct ViewState {
+    pan: (f64, f64),
+    zoom: f64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -62,18 +70,35 @@ impl NoteColor {
 }
 
 fn note_position(index: usize) -> (f64, f64) {
-    let column = index % 4;
-    let row = (index / 4) % 3;
-    let x = 8.0 + (column as f64 * 20.0) + if row % 2 == 1 { 4.0 } else { 0.0 };
-    let y = 18.0 + (row as f64 * 23.0);
-    (x.min(78.0), y.min(78.0))
+    let column = index % 5;
+    let row = index / 5;
+    let x = (column as f64 - 2.0) * 220.0;
+    let y = (row as f64 - 2.0) * 190.0;
+    (x, y)
 }
 
 fn load_notes() -> Vec<Note> {
-    let mut notes: Vec<Note> = web_sys::window()
-        .and_then(|window| window.local_storage().ok().flatten())
+    let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
+    let current = storage
+        .as_ref()
         .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<Vec<Note>>(&raw).ok());
+    let mut notes = current
+        .or_else(|| {
+            storage
+                .as_ref()
+                .and_then(|storage| storage.get_item(LEGACY_STORAGE_KEY).ok().flatten())
+                .and_then(|raw| serde_json::from_str::<Vec<Note>>(&raw).ok())
+                .map(|mut notes| {
+                    // v1 stored positions as percentages. Put those notes around
+                    // the new canvas origin during the one-time migration.
+                    for note in &mut notes {
+                        note.x = note.x * 10.0 - 500.0;
+                        note.y = note.y * 8.0 - 400.0;
+                    }
+                    notes
+                })
+        })
         .unwrap_or_default();
 
     for index in 1..notes.len() {
@@ -97,6 +122,35 @@ fn save_notes(notes: &[Note]) {
     };
     if let Ok(raw) = serde_json::to_string(notes) {
         let _ = storage.set_item(STORAGE_KEY, &raw);
+    }
+}
+
+fn load_view() -> ViewState {
+    let view = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(VIEW_STORAGE_KEY).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<ViewState>(&raw).ok())
+        .unwrap_or(ViewState {
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+        });
+    ViewState {
+        pan: view.pan,
+        zoom: if view.zoom.is_finite() {
+            view.zoom.clamp(0.35, 2.5)
+        } else {
+            1.0
+        },
+    }
+}
+
+fn save_view(view: ViewState) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    if let Ok(raw) = serde_json::to_string(&view) {
+        let _ = storage.set_item(VIEW_STORAGE_KEY, &raw);
     }
 }
 
@@ -127,13 +181,19 @@ fn export_notes(notes: &[Note]) {
     let _ = Url::revoke_object_url(&url);
 }
 
-fn board_position(client_x: f64, client_y: f64, offset: (f64, f64)) -> Option<(f64, f64)> {
+fn board_position(
+    client_x: f64,
+    client_y: f64,
+    offset: (f64, f64),
+    pan: (f64, f64),
+    zoom: f64,
+) -> Option<(f64, f64)> {
     let board = web_sys::window()?
         .document()?
         .get_element_by_id("task-space-board")?;
     let rect = board.get_bounding_client_rect();
-    let x = ((client_x - rect.left() - offset.0) / rect.width() * 100.0).clamp(2.0, 86.0);
-    let y = ((client_y - rect.top() - offset.1) / rect.height() * 100.0).clamp(3.0, 88.0);
+    let x = (client_x - rect.left() - rect.width() / 2.0 - pan.0 - offset.0) / zoom;
+    let y = (client_y - rect.top() - rect.height() / 2.0 - pan.1 - offset.1) / zoom;
     Some((x, y))
 }
 
@@ -148,6 +208,8 @@ fn NoteCard(
     editing: RwSignal<Option<u64>>,
     dragged: RwSignal<Option<u64>>,
     drag_offset: RwSignal<Option<(f64, f64)>>,
+    pan: RwSignal<(f64, f64)>,
+    zoom: RwSignal<f64>,
 ) -> impl IntoView {
     let toggle_done = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -190,6 +252,7 @@ fn NoteCard(
         if ev.button() != 0 {
             return;
         }
+        ev.stop_propagation();
         let Some(handle) = ev
             .current_target()
             .and_then(|target| target.dyn_into::<Element>().ok())
@@ -200,7 +263,7 @@ fn NoteCard(
             return;
         };
         let rect = card.get_bounding_client_rect();
-        let _ = handle.set_pointer_capture(ev.pointer_id());
+        let _ = card.set_pointer_capture(ev.pointer_id());
         drag_offset.set(Some((
             f64::from(ev.client_x()) - rect.left(),
             f64::from(ev.client_y()) - rect.top(),
@@ -211,11 +274,16 @@ fn NoteCard(
         if dragged.get_untracked() != Some(id) {
             return;
         }
+        ev.stop_propagation();
         ev.prevent_default();
         if let Some(offset) = drag_offset.get_untracked() {
-            if let Some((x, y)) =
-                board_position(f64::from(ev.client_x()), f64::from(ev.client_y()), offset)
-            {
+            if let Some((x, y)) = board_position(
+                f64::from(ev.client_x()),
+                f64::from(ev.client_y()),
+                offset,
+                pan.get_untracked(),
+                zoom.get_untracked(),
+            ) {
                 notes.update(|items| {
                     if let Some(note) = items.iter_mut().find(|note| note.id == id) {
                         note.x = x;
@@ -229,6 +297,7 @@ fn NoteCard(
         if dragged.get_untracked() != Some(id) {
             return;
         }
+        ev.stop_propagation();
         if let Some(card) = ev
             .current_target()
             .and_then(|target| target.dyn_into::<Element>().ok())
@@ -242,7 +311,7 @@ fn NoteCard(
     view! {
         <article
             class=move || format!(
-                "absolute w-44 min-h-40 p-3 pb-9 rounded-[3px] shadow-lg select-none touch-none transition-[transform,box-shadow] duration-100 {} {}",
+                "task-space-note absolute w-44 min-h-40 p-3 pb-9 rounded-[3px] shadow-lg select-none touch-none transition-[transform,box-shadow] duration-100 {} {}",
                 if note_snapshot(notes, id).is_some_and(|note| note.done) { "opacity-70" } else { "" },
                 if dragged.get() == Some(id) {
                     "z-20 cursor-grabbing shadow-2xl ring-2 ring-ink/10"
@@ -255,7 +324,7 @@ fn NoteCard(
                     return String::new();
                 };
                 format!(
-                    "left:{}%;top:{}%;background-color:{};color:{};transform:rotate({}deg) {}",
+                    "left:{}px;top:{}px;background-color:{};color:{};transform:rotate({}deg) {}",
                     note.x,
                     note.y,
                     note.color.background(),
@@ -265,6 +334,9 @@ fn NoteCard(
                 )
             }
             on:click=edit_note
+            on:pointermove=move_dragged_note
+            on:pointerup=finish_drag
+            on:pointercancel=finish_drag
             aria-label=move || note_snapshot(notes, id)
                 .map(|note| {
                     if note.text.trim().is_empty() {
@@ -415,6 +487,11 @@ pub fn Board() -> impl IntoView {
     let editing = RwSignal::new(None::<u64>);
     let dragged = RwSignal::new(None::<u64>);
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
+    let initial_view = load_view();
+    let pan = RwSignal::new(initial_view.pan);
+    let zoom = RwSignal::new(initial_view.zoom);
+    let pan_pointer = RwSignal::new(None::<i32>);
+    let last_pan_point = RwSignal::new(None::<(f64, f64)>);
     let restore_message = RwSignal::new(None::<String>);
     let next_id = RwSignal::new(
         notes
@@ -429,6 +506,108 @@ pub fn Board() -> impl IntoView {
     Effect::new(move |_| {
         save_notes(&notes.get());
     });
+
+    Effect::new(move |_| {
+        save_view(ViewState {
+            pan: pan.get(),
+            zoom: zoom.get(),
+        });
+    });
+
+    let start_pan = move |ev: PointerEvent| {
+        if ev.button() != 0 || dragged.get_untracked().is_some() {
+            return;
+        }
+        let Some(target) = ev
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        else {
+            return;
+        };
+        if target.closest(".task-space-note").ok().flatten().is_some() {
+            return;
+        }
+        let Some(surface) = ev
+            .current_target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        else {
+            return;
+        };
+        let _ = surface.set_pointer_capture(ev.pointer_id());
+        pan_pointer.set(Some(ev.pointer_id()));
+        last_pan_point.set(Some((f64::from(ev.client_x()), f64::from(ev.client_y()))));
+    };
+
+    let move_pan = move |ev: PointerEvent| {
+        if pan_pointer.get_untracked() != Some(ev.pointer_id()) {
+            return;
+        }
+        ev.prevent_default();
+        let current = (f64::from(ev.client_x()), f64::from(ev.client_y()));
+        if let Some(previous) = last_pan_point.get_untracked() {
+            pan.update(|position| {
+                position.0 += current.0 - previous.0;
+                position.1 += current.1 - previous.1;
+            });
+        }
+        last_pan_point.set(Some(current));
+    };
+
+    let finish_pan = move |ev: PointerEvent| {
+        if pan_pointer.get_untracked() != Some(ev.pointer_id()) {
+            return;
+        }
+        if let Some(surface) = ev
+            .current_target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        {
+            let _ = surface.release_pointer_capture(ev.pointer_id());
+        }
+        pan_pointer.set(None);
+        last_pan_point.set(None);
+    };
+
+    let zoom_or_pan = move |ev: WheelEvent| {
+        ev.prevent_default();
+        if ev.ctrl_key() || ev.meta_key() {
+            let Some(board) = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.get_element_by_id("task-space-board"))
+            else {
+                return;
+            };
+            let rect = board.get_bounding_client_rect();
+            let cursor = (
+                f64::from(ev.client_x()) - rect.left() - rect.width() / 2.0,
+                f64::from(ev.client_y()) - rect.top() - rect.height() / 2.0,
+            );
+            let old_zoom = zoom.get_untracked();
+            let next_zoom =
+                (old_zoom * if ev.delta_y() < 0.0 { 1.1 } else { 0.9 }).clamp(0.35, 2.5);
+            let old_pan = pan.get_untracked();
+            let world_point = (
+                (cursor.0 - old_pan.0) / old_zoom,
+                (cursor.1 - old_pan.1) / old_zoom,
+            );
+            pan.set((
+                cursor.0 - world_point.0 * next_zoom,
+                cursor.1 - world_point.1 * next_zoom,
+            ));
+            zoom.set(next_zoom);
+        } else {
+            pan.update(|position| {
+                position.0 -= ev.delta_x();
+                position.1 -= ev.delta_y();
+            });
+        }
+    };
+
+    let zoom_in = move |_| zoom.update(|value| *value = (*value * 1.2).min(2.5));
+    let zoom_out = move |_| zoom.update(|value| *value = (*value / 1.2).max(0.35));
+    let reset_view = move |_| {
+        pan.set((0.0, 0.0));
+        zoom.set(1.0);
+    };
 
     let add_note = move |_| {
         let id = next_id.get_untracked();
@@ -498,8 +677,23 @@ pub fn Board() -> impl IntoView {
         <main class="relative h-[100dvh] min-h-screen overflow-hidden bg-paper">
             <div
                 id="task-space-board"
-                class="absolute inset-0 overflow-hidden bg-paper-shelf"
-                style="background-image: radial-gradient(color-mix(in srgb, var(--color-ink-soft) 18%, transparent) 1px, transparent 1.5px); background-size: 24px 24px;"
+                class=move || if pan_pointer.get().is_some() {
+                    "absolute inset-0 overflow-hidden bg-paper-shelf cursor-grabbing"
+                } else {
+                    "absolute inset-0 overflow-hidden bg-paper-shelf cursor-grab"
+                }
+                style=move || {
+                    let (pan_x, pan_y) = pan.get();
+                    let grid_size = 24.0 * zoom.get();
+                    format!(
+                        "background-image: radial-gradient(color-mix(in srgb, var(--color-ink-soft) 18%, transparent) 1px, transparent 1.5px); background-size: {grid_size}px {grid_size}px; background-position: calc(50% + {pan_x}px) calc(50% + {pan_y}px);"
+                    )
+                }
+                on:pointerdown=start_pan
+                on:pointermove=move_pan
+                on:pointerup=finish_pan
+                on:pointercancel=finish_pan
+                on:wheel=zoom_or_pan
             >
                 <div class="pointer-events-none absolute inset-0 opacity-40" style="background:linear-gradient(110deg, transparent 0%, rgb(255 255 255 / .2) 47%, transparent 50%);"></div>
                 {move || if notes.get().is_empty() {
@@ -521,21 +715,34 @@ pub fn Board() -> impl IntoView {
                 } else {
                     ().into_any()
                 }}
-                <For
-                    each={move || notes.get().into_iter().map(|note| note.id).collect::<Vec<_>>()}
-                    key=|id| *id
-                    children=move |id: u64| {
-                        view! {
-                            <NoteCard
-                                id=id
-                                notes=notes
-                                editing=editing
-                                dragged=dragged
-                                drag_offset=drag_offset
-                            />
-                        }
+                <div
+                    class="absolute left-1/2"
+                    style=move || {
+                        let (pan_x, pan_y) = pan.get();
+                        format!(
+                            "left:50%;top:50%;transform:translate3d({pan_x}px,{pan_y}px,0) scale({}); transform-origin:0 0;",
+                            zoom.get()
+                        )
                     }
-                />
+                >
+                    <For
+                        each={move || notes.get().into_iter().map(|note| note.id).collect::<Vec<_>>()}
+                        key=|id| *id
+                        children=move |id: u64| {
+                            view! {
+                                <NoteCard
+                                    id=id
+                                    notes=notes
+                                    editing=editing
+                                    dragged=dragged
+                                    drag_offset=drag_offset
+                                    pan=pan
+                                    zoom=zoom
+                                />
+                            }
+                        }
+                    />
+                </div>
             </div>
 
             <header class="pointer-events-none absolute inset-x-3 top-3 z-10 flex items-start justify-between gap-3 sm:inset-x-5 sm:top-5">
@@ -572,9 +779,32 @@ pub fn Board() -> impl IntoView {
                 </div>
             </header>
 
+            <div class="pointer-events-auto absolute bottom-12 left-3 z-10 flex items-center gap-1 rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:bottom-5 sm:left-5">
+                <button
+                    type="button"
+                    on:click=zoom_out
+                    class="rounded-[3px] px-2 py-1 text-lg leading-none text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                    aria-label="Zoom out"
+                >"−"</button>
+                <button
+                    type="button"
+                    on:click=reset_view
+                    class="min-w-14 rounded-[3px] px-1.5 py-1 text-xs text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                    title="Reset view"
+                >
+                    {move || format!("{}%", (zoom.get() * 100.0).round() as i32)}
+                </button>
+                <button
+                    type="button"
+                    on:click=zoom_in
+                    class="rounded-[3px] px-2 py-1 text-lg leading-none text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                    aria-label="Zoom in"
+                >"+"</button>
+            </div>
+
             <div class="pointer-events-none absolute inset-x-3 bottom-3 z-10 flex items-end justify-between gap-3 text-xs text-ink-soft sm:inset-x-5 sm:bottom-5">
                 <span class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
-                    "drag to move · click to edit"
+                    "drag empty space to pan · scroll to move · +/- to zoom"
                 </span>
                 <div class="flex min-h-7 items-center gap-2">
                     {move || restore_message.get().map(|message| view! {
