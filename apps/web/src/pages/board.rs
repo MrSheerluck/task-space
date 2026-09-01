@@ -703,6 +703,47 @@ fn add_selection_to_group(
     record_snapshot(notes, groups, history, before);
 }
 
+fn delete_selected_notes(
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    history: RwSignal<History>,
+    selection: RwSignal<Vec<u64>>,
+    note_editing: RwSignal<Option<u64>>,
+    note_edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    group_editing: RwSignal<Option<u64>>,
+    group_edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+) {
+    let selected_ids = selection.get_untracked();
+    if selected_ids.is_empty() {
+        return;
+    }
+    commit_pending_edit(notes, groups, history, note_editing, note_edit_snapshot);
+    commit_pending_group_edit(notes, groups, history, group_editing, group_edit_snapshot);
+    let before = board_snapshot(notes, groups);
+    notes.update(|items| items.retain(|note| !selected_ids.contains(&note.id)));
+    let used_groups = notes
+        .get_untracked()
+        .iter()
+        .filter_map(|note| note.group_id)
+        .collect::<Vec<_>>();
+    groups.update(|items| items.retain(|group| used_groups.contains(&group.id)));
+    selection.set(Vec::new());
+    record_snapshot(notes, groups, history, before);
+}
+
+fn keyboard_target_is_editable(ev: &KeyboardEvent) -> bool {
+    ev.target()
+        .and_then(|target| target.dyn_into::<Element>().ok())
+        .is_some_and(|target| {
+            matches!(target.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
+                || target
+                    .closest("[contenteditable=\"true\"]")
+                    .ok()
+                    .flatten()
+                    .is_some()
+        })
+}
+
 #[component]
 fn GroupFrame(
     id: u64,
@@ -1623,6 +1664,18 @@ pub fn Board() -> impl IntoView {
             group_edit_snapshot,
         );
     };
+    let delete_selected = move |_: MouseEvent| {
+        delete_selected_notes(
+            notes,
+            groups,
+            history,
+            selection,
+            editing,
+            edit_snapshot,
+            group_editing,
+            group_edit_snapshot,
+        );
+    };
 
     let add_to_group = move |ev: Event| {
         let Some(select) = ev
@@ -1730,10 +1783,31 @@ pub fn Board() -> impl IntoView {
     };
 
     let keyboard_listener = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
-        if !(ev.ctrl_key() || ev.meta_key()) {
+        if keyboard_target_is_editable(&ev) {
             return;
         }
         let key = ev.key().to_lowercase();
+        if (key == "delete" || key == "backspace")
+            && !ev.ctrl_key()
+            && !ev.meta_key()
+            && !ev.alt_key()
+        {
+            ev.prevent_default();
+            delete_selected_notes(
+                notes,
+                groups,
+                history,
+                selection,
+                editing,
+                edit_snapshot,
+                group_editing,
+                group_edit_snapshot,
+            );
+            return;
+        }
+        if !(ev.ctrl_key() || ev.meta_key()) {
+            return;
+        }
         if key == "g" {
             ev.prevent_default();
             if ev.shift_key() {
@@ -1940,6 +2014,16 @@ pub fn Board() -> impl IntoView {
                         title="Remove selected notes from their group"
                     >
                         "ungroup"
+                    </button>
+                    <button
+                        type="button"
+                        on:click=delete_selected
+                        disabled=move || selection.get().is_empty()
+                        class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                        aria-label="Delete selected notes"
+                        title="Delete selected notes (Delete or Backspace)"
+                    >
+                        "delete"
                     </button>
                     {move || if groups.get().is_empty() {
                         ().into_any()
