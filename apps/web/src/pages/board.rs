@@ -1,5 +1,6 @@
 use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
+use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -10,6 +11,7 @@ use web_sys::{
 const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const VIEW_STORAGE_KEY: &str = "task-space.view.v1";
+const MAX_HISTORY: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Note {
@@ -26,6 +28,12 @@ struct Note {
 struct ViewState {
     pan: (f64, f64),
     zoom: f64,
+}
+
+#[derive(Clone, Default)]
+struct History {
+    undo: Vec<Vec<Note>>,
+    redo: Vec<Vec<Note>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -133,6 +141,75 @@ fn save_notes(notes: &[Note]) {
     }
 }
 
+fn record_snapshot(notes: RwSignal<Vec<Note>>, history: RwSignal<History>, before: Vec<Note>) {
+    if notes.get_untracked() == before {
+        return;
+    }
+    history.update(|history| {
+        history.undo.push(before);
+        if history.undo.len() > MAX_HISTORY {
+            history.undo.remove(0);
+        }
+        history.redo.clear();
+    });
+}
+
+fn mutate_notes<F>(notes: RwSignal<Vec<Note>>, history: RwSignal<History>, change: F)
+where
+    F: FnOnce(&mut Vec<Note>),
+{
+    let before = notes.get_untracked();
+    notes.update(change);
+    record_snapshot(notes, history, before);
+}
+
+fn commit_pending_edit(
+    notes: RwSignal<Vec<Note>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, Vec<Note>)>>,
+) {
+    if let Some((_, before)) = edit_snapshot.get_untracked() {
+        record_snapshot(notes, history, before);
+    }
+    edit_snapshot.set(None);
+    editing.set(None);
+}
+
+fn undo_notes(
+    notes: RwSignal<Vec<Note>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, Vec<Note>)>>,
+) {
+    commit_pending_edit(notes, history, editing, edit_snapshot);
+    let current = notes.get_untracked();
+    if let Some(previous) = history.get_untracked().undo.last().cloned() {
+        history.update(|history| {
+            history.undo.pop();
+            history.redo.push(current);
+        });
+        notes.set(previous);
+    }
+}
+
+fn redo_notes(
+    notes: RwSignal<Vec<Note>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, Vec<Note>)>>,
+) {
+    commit_pending_edit(notes, history, editing, edit_snapshot);
+    let current = notes.get_untracked();
+    if let Some(next) = history.get_untracked().redo.last().cloned() {
+        history.update(|history| {
+            history.redo.pop();
+            history.undo.push(current);
+        });
+        notes.set(next);
+    }
+}
+
 fn load_view() -> ViewState {
     let view = web_sys::window()
         .and_then(|window| window.local_storage().ok().flatten())
@@ -213,15 +290,19 @@ fn note_snapshot(notes: RwSignal<Vec<Note>>, id: u64) -> Option<Note> {
 fn NoteCard(
     id: u64,
     notes: RwSignal<Vec<Note>>,
+    history: RwSignal<History>,
     editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, Vec<Note>)>>,
     dragged: RwSignal<Option<u64>>,
     drag_offset: RwSignal<Option<(f64, f64)>>,
+    drag_snapshot: RwSignal<Option<Vec<Note>>>,
     pan: RwSignal<(f64, f64)>,
     zoom: RwSignal<f64>,
 ) -> impl IntoView {
     let toggle_done = move |ev: MouseEvent| {
         ev.stop_propagation();
-        notes.update(|items| {
+        commit_pending_edit(notes, history, editing, edit_snapshot);
+        mutate_notes(notes, history, |items| {
             if let Some(note) = items.iter_mut().find(|note| note.id == id) {
                 note.done = !note.done;
             }
@@ -229,7 +310,8 @@ fn NoteCard(
     };
     let cycle_color = move |ev: MouseEvent| {
         ev.stop_propagation();
-        notes.update(|items| {
+        commit_pending_edit(notes, history, editing, edit_snapshot);
+        mutate_notes(notes, history, |items| {
             if let Some(note) = items.iter_mut().find(|note| note.id == id) {
                 note.color = note.color.next();
             }
@@ -237,7 +319,8 @@ fn NoteCard(
     };
     let delete_note = move |ev: MouseEvent| {
         ev.stop_propagation();
-        notes.update(|items| items.retain(|note| note.id != id));
+        commit_pending_edit(notes, history, editing, edit_snapshot);
+        mutate_notes(notes, history, |items| items.retain(|note| note.id != id));
         if editing.get_untracked() == Some(id) {
             editing.set(None);
         }
@@ -253,6 +336,10 @@ fn NoteCard(
         if target.has_attribute("data-note-drag-handle") || target.has_attribute("data-note-action")
         {
             return;
+        }
+        if editing.get_untracked() != Some(id) {
+            commit_pending_edit(notes, history, editing, edit_snapshot);
+            edit_snapshot.set(Some((id, notes.get_untracked())));
         }
         editing.set(Some(id));
     };
@@ -270,8 +357,10 @@ fn NoteCard(
         let Some(card) = handle.parent_element() else {
             return;
         };
+        commit_pending_edit(notes, history, editing, edit_snapshot);
         let rect = card.get_bounding_client_rect();
         let _ = card.set_pointer_capture(ev.pointer_id());
+        drag_snapshot.set(Some(notes.get_untracked()));
         drag_offset.set(Some((
             f64::from(ev.client_x()) - rect.left(),
             f64::from(ev.client_y()) - rect.top(),
@@ -312,6 +401,10 @@ fn NoteCard(
         {
             let _ = card.release_pointer_capture(ev.pointer_id());
         }
+        if let Some(before) = drag_snapshot.get_untracked() {
+            record_snapshot(notes, history, before);
+        }
+        drag_snapshot.set(None);
         dragged.set(None);
         drag_offset.set(None);
     };
@@ -394,7 +487,7 @@ fn NoteCard(
                         }
                         on:keydown=move |ev: KeyboardEvent| {
                             if ev.key() == "Escape" {
-                                editing.set(None);
+                                commit_pending_edit(notes, history, editing, edit_snapshot);
                             }
                         }
                         class="w-full resize-none bg-transparent font-handwriting text-2xl leading-tight outline-none placeholder:text-current/50"
@@ -405,7 +498,7 @@ fn NoteCard(
                         data-note-action="finish-editing"
                         on:click=move |ev: MouseEvent| {
                             ev.stop_propagation();
-                            editing.set(None);
+                            commit_pending_edit(notes, history, editing, edit_snapshot);
                         }
                         class="absolute bottom-2 left-3 text-xs font-sans underline underline-offset-2"
                     >
@@ -492,9 +585,12 @@ fn NoteCard(
 #[component]
 pub fn Board() -> impl IntoView {
     let notes = RwSignal::new(load_notes());
+    let history = RwSignal::new(History::default());
     let editing = RwSignal::new(None::<u64>);
+    let edit_snapshot = RwSignal::new(None::<(u64, Vec<Note>)>);
     let dragged = RwSignal::new(None::<u64>);
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
+    let drag_snapshot = RwSignal::new(None::<Vec<Note>>);
     let initial_view = load_view();
     let pan = RwSignal::new(initial_view.pan);
     let zoom = RwSignal::new(initial_view.zoom);
@@ -617,10 +713,14 @@ pub fn Board() -> impl IntoView {
         zoom.set(1.0);
     };
 
+    let undo = move |_| undo_notes(notes, history, editing, edit_snapshot);
+    let redo = move |_| redo_notes(notes, history, editing, edit_snapshot);
+
     let add_note = move |_| {
+        commit_pending_edit(notes, history, editing, edit_snapshot);
         let id = next_id.get_untracked();
         next_id.update(|next| *next += 1);
-        notes.update(|items| {
+        mutate_notes(notes, history, |items| {
             let (x, y) = viewport_note_position(pan.get_untracked(), zoom.get_untracked());
             items.push(Note {
                 id,
@@ -642,6 +742,7 @@ pub fn Board() -> impl IntoView {
                 },
             });
         });
+        edit_snapshot.set(Some((id, notes.get_untracked())));
         editing.set(Some(id));
         restore_message.set(None);
     };
@@ -656,6 +757,7 @@ pub fn Board() -> impl IntoView {
         let Some(file) = input.files().and_then(|files| files.get(0)) else {
             return;
         };
+        commit_pending_edit(notes, history, editing, edit_snapshot);
         let Ok(reader) = FileReader::new() else {
             restore_message.set(Some("couldn't open that file".into()));
             return;
@@ -668,7 +770,10 @@ pub fn Board() -> impl IntoView {
                 .and_then(|value| value.as_string());
             match result.and_then(|raw| serde_json::from_str::<Vec<Note>>(&raw).ok()) {
                 Some(restored) => {
+                    let before = notes.get_untracked();
                     notes.set(restored);
+                    record_snapshot(notes, history, before);
+                    edit_snapshot.set(None);
                     editing.set(None);
                     restore_message.set(Some("board restored".into()));
                 }
@@ -680,6 +785,19 @@ pub fn Board() -> impl IntoView {
         let _ = reader.read_as_text(&file);
         input.set_value("");
     };
+
+    let keyboard_listener = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
+        if !(ev.ctrl_key() || ev.meta_key()) || ev.key().to_lowercase() != "z" {
+            return;
+        }
+        ev.prevent_default();
+        if ev.shift_key() {
+            redo_notes(notes, history, editing, edit_snapshot);
+        } else {
+            undo_notes(notes, history, editing, edit_snapshot);
+        }
+    });
+    on_cleanup(move || keyboard_listener.remove());
 
     view! {
         <main class="relative h-[100dvh] min-h-screen overflow-hidden bg-paper">
@@ -741,9 +859,12 @@ pub fn Board() -> impl IntoView {
                                 <NoteCard
                                     id=id
                                     notes=notes
+                                    history=history
                                     editing=editing
+                                    edit_snapshot=edit_snapshot
                                     dragged=dragged
                                     drag_offset=drag_offset
+                                    drag_snapshot=drag_snapshot
                                     pan=pan
                                     zoom=zoom
                                 />
@@ -766,6 +887,26 @@ pub fn Board() -> impl IntoView {
                 </div>
 
                 <div class="pointer-events-auto flex items-center gap-1 rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:gap-2 sm:p-1.5">
+                    <button
+                        type="button"
+                        on:click=undo
+                        disabled=move || history.get().undo.is_empty()
+                        class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                        aria-label="Undo"
+                        title="Undo"
+                    >
+                        "undo"
+                    </button>
+                    <button
+                        type="button"
+                        on:click=redo
+                        disabled=move || history.get().redo.is_empty()
+                        class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                        aria-label="Redo"
+                        title="Redo"
+                    >
+                        "redo"
+                    </button>
                     <button
                         type="button"
                         on:click=add_note
