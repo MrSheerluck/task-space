@@ -13,6 +13,13 @@ const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
+const NOTE_WIDTH: f64 = 176.0;
+const NOTE_HEIGHT: f64 = 200.0;
+const HORIZONTAL_PADDING: f64 = 24.0;
+const TOP_PADDING: f64 = 52.0;
+const BOTTOM_PADDING: f64 = 24.0;
+const MIN_GROUP_WIDTH: f64 = NOTE_WIDTH + HORIZONTAL_PADDING * 2.0;
+const MIN_GROUP_HEIGHT: f64 = NOTE_HEIGHT + TOP_PADDING + BOTTOM_PADDING;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Note {
@@ -352,9 +359,6 @@ fn note_snapshot(notes: RwSignal<Vec<Note>>, id: u64) -> Option<Note> {
 }
 
 fn group_origin(group_id: u64, notes: &[Note]) -> Option<(f64, f64)> {
-    const HORIZONTAL_PADDING: f64 = 24.0;
-    const TOP_PADDING: f64 = 52.0;
-
     notes
         .iter()
         .filter(|note| note.group_id == Some(group_id))
@@ -367,6 +371,26 @@ fn group_origin(group_id: u64, notes: &[Note]) -> Option<(f64, f64)> {
         .map(|(left, top)| (left - HORIZONTAL_PADDING, top - TOP_PADDING))
 }
 
+fn group_member_bounds(
+    group_id: u64,
+    notes: &[Note],
+    excluded_ids: &[u64],
+) -> Option<(f64, f64, f64, f64)> {
+    let mut bounds = None;
+    for note in notes
+        .iter()
+        .filter(|note| note.group_id == Some(group_id) && !excluded_ids.contains(&note.id))
+    {
+        let entry =
+            bounds.get_or_insert((note.x, note.y, note.x + NOTE_WIDTH, note.y + NOTE_HEIGHT));
+        entry.0 = entry.0.min(note.x);
+        entry.1 = entry.1.min(note.y);
+        entry.2 = entry.2.max(note.x + NOTE_WIDTH);
+        entry.3 = entry.3.max(note.y + NOTE_HEIGHT);
+    }
+    bounds
+}
+
 fn group_bounds(group: &Group, notes: &[Note]) -> Option<(f64, f64, f64, f64)> {
     group_bounds_excluding(group, notes, &[])
 }
@@ -376,32 +400,12 @@ fn group_bounds_excluding(
     notes: &[Note],
     excluded_ids: &[u64],
 ) -> Option<(f64, f64, f64, f64)> {
-    const NOTE_WIDTH: f64 = 176.0;
-    const NOTE_HEIGHT: f64 = 200.0;
-    const HORIZONTAL_PADDING: f64 = 24.0;
-    const TOP_PADDING: f64 = 52.0;
-    const BOTTOM_PADDING: f64 = 24.0;
-
-    let members = notes
-        .iter()
-        .filter(|note| note.group_id == Some(group.id) && !excluded_ids.contains(&note.id));
-    let mut bounds = None;
-    for note in members {
-        let entry =
-            bounds.get_or_insert((note.x, note.y, note.x + NOTE_WIDTH, note.y + NOTE_HEIGHT));
-        entry.0 = entry.0.min(note.x);
-        entry.1 = entry.1.min(note.y);
-        entry.2 = entry.2.max(note.x + NOTE_WIDTH);
-        entry.3 = entry.3.max(note.y + NOTE_HEIGHT);
-    }
-    bounds.map(|(left, top, right, bottom)| {
+    group_member_bounds(group.id, notes, excluded_ids).map(|(left, top, right, bottom)| {
         let (frame_left, frame_top) = group
             .origin
             .unwrap_or((left - HORIZONTAL_PADDING, top - TOP_PADDING));
-        let auto_width =
-            (right - frame_left + HORIZONTAL_PADDING).max(NOTE_WIDTH + HORIZONTAL_PADDING * 2.0);
-        let auto_height =
-            (bottom - frame_top + BOTTOM_PADDING).max(NOTE_HEIGHT + TOP_PADDING + BOTTOM_PADDING);
+        let auto_width = (right - frame_left + HORIZONTAL_PADDING).max(MIN_GROUP_WIDTH);
+        let auto_height = (bottom - frame_top + BOTTOM_PADDING).max(MIN_GROUP_HEIGHT);
         let (width, height) = group
             .size
             .map_or((auto_width, auto_height), |(width, height)| {
@@ -409,6 +413,76 @@ fn group_bounds_excluding(
             });
         (frame_left, frame_top, width, height)
     })
+}
+
+fn resized_group_frame(
+    initial: (f64, f64, f64, f64),
+    delta: (f64, f64),
+    corner: (i8, i8),
+) -> (f64, f64, f64, f64) {
+    let (initial_left, initial_top, initial_width, initial_height) = initial;
+    let (horizontal, vertical) = corner;
+    let next_width = if horizontal < 0 {
+        (initial_width - delta.0).max(MIN_GROUP_WIDTH)
+    } else {
+        (initial_width + delta.0).max(MIN_GROUP_WIDTH)
+    };
+    let next_height = if vertical < 0 {
+        (initial_height - delta.1).max(MIN_GROUP_HEIGHT)
+    } else {
+        (initial_height + delta.1).max(MIN_GROUP_HEIGHT)
+    };
+    let next_left = if horizontal < 0 {
+        initial_left + initial_width - next_width
+    } else {
+        initial_left
+    };
+    let next_top = if vertical < 0 {
+        initial_top + initial_height - next_height
+    } else {
+        initial_top
+    };
+
+    (next_left, next_top, next_width, next_height)
+}
+
+fn constrain_group_frame_to_cards(
+    desired: (f64, f64, f64, f64),
+    initial: (f64, f64, f64, f64),
+    corner: (i8, i8),
+    cards: (f64, f64, f64, f64),
+) -> (f64, f64, f64, f64) {
+    let (mut left, mut top, mut width, mut height) = desired;
+    let (initial_left, initial_top, initial_width, initial_height) = initial;
+    let (horizontal, vertical) = corner;
+    let (cards_left, cards_top, cards_right, cards_bottom) = cards;
+    let fixed_right = initial_left + initial_width;
+    let fixed_bottom = initial_top + initial_height;
+
+    if horizontal < 0 {
+        left = left
+            .min(cards_left - HORIZONTAL_PADDING)
+            .min(fixed_right - MIN_GROUP_WIDTH);
+        width = fixed_right - left;
+    } else {
+        width = width
+            .max(cards_right + HORIZONTAL_PADDING - initial_left)
+            .max(MIN_GROUP_WIDTH);
+        left = initial_left;
+    }
+    if vertical < 0 {
+        top = top
+            .min(cards_top - TOP_PADDING)
+            .min(fixed_bottom - MIN_GROUP_HEIGHT);
+        height = fixed_bottom - top;
+    } else {
+        height = height
+            .max(cards_bottom + BOTTOM_PADDING - initial_top)
+            .max(MIN_GROUP_HEIGHT);
+        top = initial_top;
+    }
+
+    (left, top, width, height)
 }
 
 fn group_at_point(
@@ -644,7 +718,8 @@ fn GroupFrame(
     drag_snapshot: RwSignal<Option<BoardData>>,
     group_resizing: RwSignal<Option<u64>>,
     group_resize_start: RwSignal<Option<(f64, f64)>>,
-    group_resize_initial: RwSignal<Option<(f64, f64)>>,
+    group_resize_initial: RwSignal<Option<(f64, f64, f64, f64)>>,
+    group_resize_corner: RwSignal<Option<(i8, i8)>>,
     group_resize_snapshot: RwSignal<Option<BoardData>>,
     zoom: RwSignal<f64>,
 ) -> impl IntoView {
@@ -696,6 +771,12 @@ fn GroupFrame(
             (f64::from(ev.client_x()) - start.0) / zoom,
             (f64::from(ev.client_y()) - start.1) / zoom,
         );
+        let original_origin = snapshot
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .and_then(|group| group.origin)
+            .or_else(|| group_origin(id, &snapshot.notes));
         notes.update(|items| {
             for note in items {
                 if note.group_id == Some(id) {
@@ -706,6 +787,13 @@ fn GroupFrame(
                 }
             }
         });
+        if let Some((origin_x, origin_y)) = original_origin {
+            groups.update(|items| {
+                if let Some(group) = items.iter_mut().find(|group| group.id == id) {
+                    group.origin = Some((origin_x + delta.0, origin_y + delta.1));
+                }
+            });
+        }
     };
     let finish_group_drag = move |ev: PointerEvent| {
         if group_dragging.get_untracked() != Some(id) {
@@ -744,13 +832,27 @@ fn GroupFrame(
         else {
             return;
         };
-        let Some((_, _, width, height)) = group_bounds(&group, &notes.get_untracked()) else {
+        let Some((left, top, width, height)) = group_bounds(&group, &notes.get_untracked()) else {
+            return;
+        };
+        let Some(corner) =
+            handle
+                .get_attribute("data-resize-corner")
+                .and_then(|corner| match corner.as_str() {
+                    "top-left" => Some((-1, -1)),
+                    "top-right" => Some((1, -1)),
+                    "bottom-left" => Some((-1, 1)),
+                    "bottom-right" => Some((1, 1)),
+                    _ => None,
+                })
+        else {
             return;
         };
         let _ = handle.set_pointer_capture(ev.pointer_id());
         group_resizing.set(Some(id));
         group_resize_start.set(Some((f64::from(ev.client_x()), f64::from(ev.client_y()))));
-        group_resize_initial.set(Some((width, height)));
+        group_resize_initial.set(Some((left, top, width, height)));
+        group_resize_corner.set(Some(corner));
         group_resize_snapshot.set(Some(board_snapshot(notes, groups)));
     };
     let move_group_resize = move |ev: PointerEvent| {
@@ -759,20 +861,41 @@ fn GroupFrame(
         }
         ev.stop_propagation();
         ev.prevent_default();
-        let (Some(start), Some(initial)) = (
+        let (
+            Some(start),
+            Some((initial_left, initial_top, initial_width, initial_height)),
+            Some((horizontal, vertical)),
+        ) = (
             group_resize_start.get_untracked(),
             group_resize_initial.get_untracked(),
-        ) else {
+            group_resize_corner.get_untracked(),
+        )
+        else {
             return;
         };
         let zoom = zoom.get_untracked().max(0.01);
-        let next_size = (
-            (initial.0 + (f64::from(ev.client_x()) - start.0) / zoom).max(224.0),
-            (initial.1 + (f64::from(ev.client_y()) - start.1) / zoom).max(276.0),
+        let initial_frame = (initial_left, initial_top, initial_width, initial_height);
+        let next_frame = resized_group_frame(
+            initial_frame,
+            (
+                (f64::from(ev.client_x()) - start.0) / zoom,
+                (f64::from(ev.client_y()) - start.1) / zoom,
+            ),
+            (horizontal, vertical),
         );
+        let next_frame =
+            group_member_bounds(id, &notes.get_untracked(), &[]).map_or(next_frame, |cards| {
+                constrain_group_frame_to_cards(
+                    next_frame,
+                    initial_frame,
+                    (horizontal, vertical),
+                    cards,
+                )
+            });
         groups.update(|items| {
             if let Some(group) = items.iter_mut().find(|group| group.id == id) {
-                group.size = Some(next_size);
+                group.origin = Some((next_frame.0, next_frame.1));
+                group.size = Some((next_frame.2, next_frame.3));
             }
         });
     };
@@ -792,6 +915,7 @@ fn GroupFrame(
         }
         group_resize_snapshot.set(None);
         group_resize_initial.set(None);
+        group_resize_corner.set(None);
         group_resize_start.set(None);
         group_resizing.set(None);
     };
@@ -824,9 +948,40 @@ fn GroupFrame(
             }
         >
             <div
+                class="pointer-events-auto absolute left-[-7px] top-[-7px] h-4 w-4 cursor-nwse-resize rounded-sm border-2 border-paper-shelf bg-ink-soft/60 shadow-sm hover:bg-ink"
+                data-resize-corner="top-left"
+                aria-label="Resize group (top left)"
+                title="Drag to resize group from the top-left corner"
+                on:pointerdown=start_group_resize
+                on:pointermove=move_group_resize
+                on:pointerup=finish_group_resize
+                on:pointercancel=finish_group_resize
+            ></div>
+            <div
+                class="pointer-events-auto absolute right-[-7px] top-[-7px] h-4 w-4 cursor-nesw-resize rounded-sm border-2 border-paper-shelf bg-ink-soft/60 shadow-sm hover:bg-ink"
+                data-resize-corner="top-right"
+                aria-label="Resize group (top right)"
+                title="Drag to resize group from the top-right corner"
+                on:pointerdown=start_group_resize
+                on:pointermove=move_group_resize
+                on:pointerup=finish_group_resize
+                on:pointercancel=finish_group_resize
+            ></div>
+            <div
+                class="pointer-events-auto absolute bottom-[-7px] left-[-7px] h-4 w-4 cursor-nesw-resize rounded-sm border-2 border-paper-shelf bg-ink-soft/60 shadow-sm hover:bg-ink"
+                data-resize-corner="bottom-left"
+                aria-label="Resize group (bottom left)"
+                title="Drag to resize group from the bottom-left corner"
+                on:pointerdown=start_group_resize
+                on:pointermove=move_group_resize
+                on:pointerup=finish_group_resize
+                on:pointercancel=finish_group_resize
+            ></div>
+            <div
                 class="pointer-events-auto absolute bottom-[-7px] right-[-7px] h-4 w-4 cursor-nwse-resize rounded-sm border-2 border-paper-shelf bg-ink-soft/60 shadow-sm hover:bg-ink"
-                aria-label="Resize group"
-                title="Drag to resize group"
+                data-resize-corner="bottom-right"
+                aria-label="Resize group (bottom right)"
+                title="Drag to resize group from the bottom-right corner"
                 on:pointerdown=start_group_resize
                 on:pointermove=move_group_resize
                 on:pointerup=finish_group_resize
@@ -1292,7 +1447,8 @@ pub fn Board() -> impl IntoView {
     let group_drag_snapshot = RwSignal::new(None::<BoardData>);
     let group_resizing = RwSignal::new(None::<u64>);
     let group_resize_start = RwSignal::new(None::<(f64, f64)>);
-    let group_resize_initial = RwSignal::new(None::<(f64, f64)>);
+    let group_resize_initial = RwSignal::new(None::<(f64, f64, f64, f64)>);
+    let group_resize_corner = RwSignal::new(None::<(i8, i8)>);
     let group_resize_snapshot = RwSignal::new(None::<BoardData>);
     let restore_message = RwSignal::new(None::<String>);
     let next_id = RwSignal::new(
@@ -1695,6 +1851,7 @@ pub fn Board() -> impl IntoView {
                                     group_resizing=group_resizing
                                     group_resize_start=group_resize_start
                                     group_resize_initial=group_resize_initial
+                                    group_resize_corner=group_resize_corner
                                     group_resize_snapshot=group_resize_snapshot
                                     zoom=zoom
                                 />
@@ -1861,5 +2018,110 @@ pub fn Board() -> impl IntoView {
                 </div>
             </div>
         </main>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchored_group_frame_moves_with_its_cards() {
+        let group = Group {
+            id: 1,
+            label: "Work".into(),
+            origin: Some((100.0, 120.0)),
+            size: None,
+        };
+        let notes = vec![
+            Note {
+                id: 1,
+                text: "inside".into(),
+                color: NoteColor::Yellow,
+                done: false,
+                x: 124.0,
+                y: 172.0,
+                rotation: 0,
+                group_id: Some(1),
+            },
+            Note {
+                id: 2,
+                text: "outside".into(),
+                color: NoteColor::Blue,
+                done: false,
+                x: 0.0,
+                y: 0.0,
+                rotation: 0,
+                group_id: None,
+            },
+        ];
+
+        let before = group_bounds(&group, &notes).expect("group should have a frame");
+        let moved_group = Group {
+            origin: Some((220.0, 200.0)),
+            ..group
+        };
+        let moved_notes = vec![Note {
+            x: 244.0,
+            y: 252.0,
+            ..notes[0].clone()
+        }];
+        let after = group_bounds(&moved_group, &moved_notes).expect("group should have a frame");
+
+        assert_eq!(before.2, after.2);
+        assert_eq!(before.3, after.3);
+        assert_eq!(after.0 - before.0, 120.0);
+        assert_eq!(after.1 - before.1, 80.0);
+    }
+
+    #[test]
+    fn every_resize_corner_keeps_the_opposite_corner_fixed() {
+        let initial = (100.0, 120.0, 400.0, 400.0);
+
+        assert_eq!(
+            resized_group_frame(initial, (-40.0, -30.0), (-1, -1)),
+            (60.0, 90.0, 440.0, 430.0)
+        );
+        assert_eq!(
+            resized_group_frame(initial, (40.0, -30.0), (1, -1)),
+            (100.0, 90.0, 440.0, 430.0)
+        );
+        assert_eq!(
+            resized_group_frame(initial, (-40.0, 30.0), (-1, 1)),
+            (60.0, 120.0, 440.0, 430.0)
+        );
+        assert_eq!(
+            resized_group_frame(initial, (40.0, 30.0), (1, 1)),
+            (100.0, 120.0, 440.0, 430.0)
+        );
+        assert_eq!(
+            resized_group_frame(initial, (500.0, 500.0), (-1, -1)),
+            (276.0, 244.0, 224.0, 276.0)
+        );
+    }
+
+    #[test]
+    fn resizing_cannot_leave_grouped_cards_outside_the_frame() {
+        let initial = (100.0, 120.0, 424.0, 424.0);
+        let cards = (124.0, 172.0, 500.0, 520.0);
+
+        assert_eq!(
+            constrain_group_frame_to_cards(
+                resized_group_frame(initial, (500.0, 500.0), (-1, -1)),
+                initial,
+                (-1, -1),
+                cards,
+            ),
+            initial
+        );
+        assert_eq!(
+            constrain_group_frame_to_cards(
+                resized_group_frame(initial, (-500.0, -500.0), (1, 1)),
+                initial,
+                (1, 1),
+                cards,
+            ),
+            initial
+        );
     }
 }
