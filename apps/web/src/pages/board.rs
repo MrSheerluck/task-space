@@ -77,6 +77,14 @@ fn note_position(index: usize) -> (f64, f64) {
     (x, y)
 }
 
+fn viewport_note_position(pan: (f64, f64), zoom: f64) -> (f64, f64) {
+    // Notes use their top-left corner as the world-space anchor. Place the
+    // next note at the camera centre, with a small adjustment to centre the
+    // card itself in the viewport.
+    let zoom = zoom.max(0.01);
+    (-pan.0 / zoom - 88.0 / zoom, -pan.1 / zoom - 80.0 / zoom)
+}
+
 fn load_notes() -> Vec<Note> {
     let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
     let current = storage
@@ -613,7 +621,7 @@ pub fn Board() -> impl IntoView {
         let id = next_id.get_untracked();
         next_id.update(|next| *next += 1);
         notes.update(|items| {
-            let (x, y) = note_position(items.len());
+            let (x, y) = viewport_note_position(pan.get_untracked(), zoom.get_untracked());
             items.push(Note {
                 id,
                 text: String::new(),
