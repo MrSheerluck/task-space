@@ -11,7 +11,9 @@ use web_sys::{
 
 const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
-const VIEW_STORAGE_KEY: &str = "task-space.view.v1";
+const WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
+const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
+const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
 const NOTE_WIDTH: f64 = 208.0;
 const NOTE_HEIGHT: f64 = 200.0;
@@ -210,6 +212,36 @@ struct BoardData {
     groups: Vec<Group>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct Space {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    archived: bool,
+    board: BoardData,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct WorkspaceData {
+    spaces: Vec<Space>,
+    active_space_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ContextMenuTarget {
+    Board,
+    Note(u64),
+    Group(u64),
+    Space(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContextMenuState {
+    target: ContextMenuTarget,
+    x: i32,
+    y: i32,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct ViewState {
     pan: (f64, f64),
@@ -361,13 +393,88 @@ fn load_board() -> BoardData {
     board
 }
 
-fn save_board(board: &BoardData) {
+fn empty_board() -> BoardData {
+    BoardData {
+        notes: Vec::new(),
+        groups: Vec::new(),
+    }
+}
+
+fn load_workspace() -> WorkspaceData {
+    let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
+    let mut workspace = storage
+        .as_ref()
+        .and_then(|storage| storage.get_item(WORKSPACE_STORAGE_KEY).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<WorkspaceData>(&raw).ok())
+        .filter(|workspace| !workspace.spaces.is_empty())
+        .unwrap_or_else(|| WorkspaceData {
+            spaces: vec![Space {
+                id: 1,
+                name: "my space".into(),
+                archived: false,
+                board: load_board(),
+            }],
+            active_space_id: 1,
+        });
+
+    if !workspace
+        .spaces
+        .iter()
+        .any(|space| space.id == workspace.active_space_id && !space.archived)
+    {
+        if let Some(space) = workspace.spaces.iter_mut().find(|space| !space.archived) {
+            workspace.active_space_id = space.id;
+        } else if let Some(space) = workspace.spaces.first_mut() {
+            space.archived = false;
+            workspace.active_space_id = space.id;
+        }
+    }
+
+    workspace
+}
+
+fn save_workspace(workspace: &WorkspaceData) {
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
         return;
     };
-    if let Ok(raw) = serde_json::to_string(board) {
-        let _ = storage.set_item(STORAGE_KEY, &raw);
+    if let Ok(raw) = serde_json::to_string(workspace) {
+        let _ = storage.set_item(WORKSPACE_STORAGE_KEY, &raw);
+    }
+}
+
+fn persist_space_board(
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: u64,
+    board: BoardData,
+) {
+    spaces.update(|items| {
+        if let Some(space) = items.iter_mut().find(|space| space.id == active_space_id) {
+            space.board = board;
+        }
+    });
+    save_workspace(&WorkspaceData {
+        spaces: spaces.get_untracked(),
+        active_space_id,
+    });
+}
+
+fn next_note_id(board: &BoardData) -> u64 {
+    board
+        .notes
+        .iter()
+        .map(|note| note.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn normalize_space_name(value: &str) -> String {
+    let name = value.trim();
+    if name.is_empty() {
+        "untitled space".into()
+    } else {
+        name.chars().take(48).collect()
     }
 }
 
@@ -461,10 +568,17 @@ fn redo_board(
     }
 }
 
-fn load_view() -> ViewState {
+fn load_view(space_id: u64) -> ViewState {
+    let storage_key = format!("{VIEW_STORAGE_KEY_PREFIX}{space_id}");
     let view = web_sys::window()
         .and_then(|window| window.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(VIEW_STORAGE_KEY).ok().flatten())
+        .and_then(|storage| {
+            storage
+                .get_item(&storage_key)
+                .ok()
+                .flatten()
+                .or_else(|| storage.get_item(LEGACY_VIEW_STORAGE_KEY).ok().flatten())
+        })
         .and_then(|raw| serde_json::from_str::<ViewState>(&raw).ok())
         .unwrap_or(ViewState {
             pan: (0.0, 0.0),
@@ -480,13 +594,585 @@ fn load_view() -> ViewState {
     }
 }
 
-fn save_view(view: ViewState) {
+fn save_view(space_id: u64, view: ViewState) {
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
         return;
     };
+    let storage_key = format!("{VIEW_STORAGE_KEY_PREFIX}{space_id}");
     if let Ok(raw) = serde_json::to_string(&view) {
-        let _ = storage.set_item(VIEW_STORAGE_KEY, &raw);
+        let _ = storage.set_item(&storage_key, &raw);
+    }
+}
+
+fn activate_space(
+    space_id: u64,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    next_id: RwSignal<u64>,
+    selection: RwSignal<Vec<u64>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    group_editing: RwSignal<Option<u64>>,
+    group_edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    pan: RwSignal<(f64, f64)>,
+    zoom: RwSignal<f64>,
+    restore_message: RwSignal<Option<String>>,
+) -> bool {
+    let Some(space) = spaces
+        .get_untracked()
+        .into_iter()
+        .find(|space| space.id == space_id && !space.archived)
+    else {
+        return false;
+    };
+    active_space_id.set(space_id);
+    next_id.set(next_note_id(&space.board));
+    notes.set(space.board.notes);
+    groups.set(space.board.groups);
+    selection.set(Vec::new());
+    history.set(History::default());
+    editing.set(None);
+    edit_snapshot.set(None);
+    group_editing.set(None);
+    group_edit_snapshot.set(None);
+    let view = load_view(space_id);
+    pan.set(view.pan);
+    zoom.set(view.zoom);
+    restore_message.set(None);
+    true
+}
+
+#[derive(Clone, Copy)]
+struct SpaceActions {
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    next_id: RwSignal<u64>,
+    selection: RwSignal<Vec<u64>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    group_editing: RwSignal<Option<u64>>,
+    group_edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    pan: RwSignal<(f64, f64)>,
+    zoom: RwSignal<f64>,
+    restore_message: RwSignal<Option<String>>,
+    space_menu_open: RwSignal<bool>,
+    pending_delete_space: RwSignal<Option<u64>>,
+}
+
+impl SpaceActions {
+    fn create(self, next_space_id: RwSignal<u64>) {
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        commit_pending_group_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+        persist_space_board(
+            self.spaces,
+            self.active_space_id.get_untracked(),
+            board_snapshot(self.notes, self.groups),
+        );
+        let space_id = next_space_id.get_untracked();
+        next_space_id.update(|next| *next = next.saturating_add(1));
+        self.spaces.update(|items| {
+            items.push(Space {
+                id: space_id,
+                name: "new space".into(),
+                archived: false,
+                board: empty_board(),
+            });
+        });
+        self.switch(space_id);
+        save_workspace(&WorkspaceData {
+            spaces: self.spaces.get_untracked(),
+            active_space_id: space_id,
+        });
+        self.space_menu_open.set(false);
+    }
+
+    fn begin_rename(
+        self,
+        rename_space_id: RwSignal<Option<u64>>,
+        rename_value: RwSignal<String>,
+        space_id: u64,
+    ) {
+        if let Some(space) = self
+            .spaces
+            .get_untracked()
+            .into_iter()
+            .find(|space| space.id == space_id)
+        {
+            rename_value.set(space.name);
+            rename_space_id.set(Some(space_id));
+            self.space_menu_open.set(true);
+        }
+    }
+
+    fn archive_current(self) {
+        let active_count = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .filter(|space| !space.archived)
+            .count();
+        if active_count <= 1 {
+            self.restore_message.set(Some("keep one space open".into()));
+            self.space_menu_open.set(false);
+            return;
+        }
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        commit_pending_group_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+        let current_id = self.active_space_id.get_untracked();
+        persist_space_board(
+            self.spaces,
+            current_id,
+            board_snapshot(self.notes, self.groups),
+        );
+        self.spaces.update(|items| {
+            if let Some(space) = items.iter_mut().find(|space| space.id == current_id) {
+                space.archived = true;
+            }
+        });
+        if let Some(next_space_id) = self
+            .spaces
+            .get_untracked()
+            .into_iter()
+            .find(|space| !space.archived)
+            .map(|space| space.id)
+        {
+            self.switch(next_space_id);
+            save_workspace(&WorkspaceData {
+                spaces: self.spaces.get_untracked(),
+                active_space_id: next_space_id,
+            });
+        }
+        self.space_menu_open.set(false);
+    }
+
+    fn switch(self, space_id: u64) {
+        if self.active_space_id.get_untracked() == space_id {
+            self.space_menu_open.set(false);
+            return;
+        }
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        commit_pending_group_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+        persist_space_board(
+            self.spaces,
+            self.active_space_id.get_untracked(),
+            board_snapshot(self.notes, self.groups),
+        );
+        if activate_space(
+            space_id,
+            self.spaces,
+            self.active_space_id,
+            self.notes,
+            self.groups,
+            self.next_id,
+            self.selection,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+            self.group_editing,
+            self.group_edit_snapshot,
+            self.pan,
+            self.zoom,
+            self.restore_message,
+        ) {
+            self.space_menu_open.set(false);
+        }
+    }
+
+    fn restore(self, space_id: u64) {
+        self.spaces.update(|items| {
+            if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
+                space.archived = false;
+            }
+        });
+        self.pending_delete_space.set(None);
+        save_workspace(&WorkspaceData {
+            spaces: self.spaces.get_untracked(),
+            active_space_id: self.active_space_id.get_untracked(),
+        });
+    }
+
+    fn save_name(self, rename_space_id: RwSignal<Option<u64>>, rename_value: RwSignal<String>) {
+        let Some(id) = rename_space_id.get_untracked() else {
+            return;
+        };
+        let name = normalize_space_name(&rename_value.get_untracked());
+        self.spaces.update(|items| {
+            if let Some(space) = items.iter_mut().find(|space| space.id == id) {
+                space.name = name;
+            }
+        });
+        save_workspace(&WorkspaceData {
+            spaces: self.spaces.get_untracked(),
+            active_space_id: self.active_space_id.get_untracked(),
+        });
+        rename_space_id.set(None);
+    }
+
+    fn cancel_name(self, rename_space_id: RwSignal<Option<u64>>) {
+        rename_space_id.set(None);
+    }
+
+    fn request_delete(self, space_id: u64) {
+        self.pending_delete_space.set(Some(space_id));
+    }
+
+    fn confirm_delete(self) {
+        let Some(space_id) = self.pending_delete_space.get_untracked() else {
+            return;
+        };
+        let current_id = self.active_space_id.get_untracked();
+        if space_id == current_id
+            && self
+                .spaces
+                .get_untracked()
+                .iter()
+                .filter(|space| !space.archived)
+                .count()
+                <= 1
+        {
+            self.restore_message.set(Some("keep one space open".into()));
+            self.pending_delete_space.set(None);
+            return;
+        }
+        if space_id == current_id {
+            commit_pending_edit(
+                self.notes,
+                self.groups,
+                self.history,
+                self.editing,
+                self.edit_snapshot,
+            );
+            commit_pending_group_edit(
+                self.notes,
+                self.groups,
+                self.history,
+                self.group_editing,
+                self.group_edit_snapshot,
+            );
+            persist_space_board(self.spaces, current_id, board_snapshot(self.notes, self.groups));
+        }
+        self.spaces.update(|items| items.retain(|space| space.id != space_id));
+        if space_id == current_id {
+            if let Some(next_space_id) = self
+                .spaces
+                .get_untracked()
+                .into_iter()
+                .find(|space| !space.archived)
+                .map(|space| space.id)
+            {
+                self.switch(next_space_id);
+                save_workspace(&WorkspaceData {
+                    spaces: self.spaces.get_untracked(),
+                    active_space_id: next_space_id,
+                });
+            }
+        } else {
+            save_workspace(&WorkspaceData {
+                spaces: self.spaces.get_untracked(),
+                active_space_id: current_id,
+            });
+        }
+        self.pending_delete_space.set(None);
+        self.space_menu_open.set(false);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoardActions {
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    history: RwSignal<History>,
+    selection: RwSignal<Vec<u64>>,
+    next_id: RwSignal<u64>,
+    pan: RwSignal<(f64, f64)>,
+    zoom: RwSignal<f64>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    group_editing: RwSignal<Option<u64>>,
+    group_edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    due_date_request: RwSignal<Option<u64>>,
+    restore_message: RwSignal<Option<String>>,
+}
+
+impl BoardActions {
+    fn create_note(self) {
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        let id = self.next_id.get_untracked();
+        self.next_id.update(|next| *next += 1);
+        mutate_notes(self.notes, self.groups, self.history, |items| {
+            let (x, y) = viewport_note_position(self.pan.get_untracked(), self.zoom.get_untracked());
+            items.push(Note {
+                id,
+                text: String::new(),
+                color: match id % 5 {
+                    0 => NoteColor::Yellow,
+                    1 => NoteColor::Pink,
+                    2 => NoteColor::Blue,
+                    3 => NoteColor::Green,
+                    _ => NoteColor::Lavender,
+                },
+                status: NoteStatus::Todo,
+                due_date: None,
+                x,
+                y,
+                rotation: match id % 5 {
+                    0 | 3 => -2,
+                    1 | 4 => 2,
+                    _ => 1,
+                },
+                group_id: None,
+            });
+        });
+        self.edit_snapshot
+            .set(Some((id, board_snapshot(self.notes, self.groups))));
+        self.editing.set(Some(id));
+        self.restore_message.set(None);
+    }
+
+    fn undo(self) {
+        undo_board(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+    }
+
+    fn redo(self) {
+        redo_board(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+    }
+
+    fn group_selected(self) {
+        create_group(
+            self.notes,
+            self.groups,
+            self.history,
+            self.selection,
+            self.editing,
+            self.edit_snapshot,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+    }
+
+    fn ungroup_selected(self) {
+        ungroup_selection(
+            self.notes,
+            self.groups,
+            self.history,
+            self.selection,
+            self.editing,
+            self.edit_snapshot,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+    }
+
+    fn delete_selected(self) {
+        delete_selected_notes(
+            self.notes,
+            self.groups,
+            self.history,
+            self.selection,
+            self.editing,
+            self.edit_snapshot,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+    }
+
+    fn edit_note(self, id: u64) {
+        self.selection.set(vec![id]);
+        if self.editing.get_untracked() != Some(id) {
+            commit_pending_edit(
+                self.notes,
+                self.groups,
+                self.history,
+                self.editing,
+                self.edit_snapshot,
+            );
+            self.edit_snapshot
+                .set(Some((id, board_snapshot(self.notes, self.groups))));
+        }
+        self.editing.set(Some(id));
+    }
+
+    fn cycle_status(self, id: u64) {
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        mutate_notes(self.notes, self.groups, self.history, |items| {
+            if let Some(note) = items.iter_mut().find(|note| note.id == id) {
+                note.status = note.status.next();
+            }
+        });
+    }
+
+    fn cycle_color(self, id: u64) {
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        mutate_notes(self.notes, self.groups, self.history, |items| {
+            if let Some(note) = items.iter_mut().find(|note| note.id == id) {
+                note.color = note.color.next();
+            }
+        });
+    }
+
+    fn clear_due_date(self, id: u64) {
+        set_note_due_date(
+            id,
+            None,
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+    }
+
+    fn open_due_date_picker(self, id: u64) {
+        self.due_date_request.set(Some(id));
+    }
+
+    fn delete_note(self, id: u64) {
+        commit_pending_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.editing,
+            self.edit_snapshot,
+        );
+        let before = board_snapshot(self.notes, self.groups);
+        self.notes.update(|items| items.retain(|note| note.id != id));
+        let used_groups = self
+            .notes
+            .get_untracked()
+            .iter()
+            .filter_map(|note| note.group_id)
+            .collect::<Vec<_>>();
+        self.groups
+            .update(|items| items.retain(|group| used_groups.contains(&group.id)));
+        self.selection.update(|selected| selected.retain(|selected_id| *selected_id != id));
+        record_snapshot(self.notes, self.groups, self.history, before);
+    }
+
+    fn add_selection_to_group(self, group_id: u64) {
+        add_selection_to_group(
+            group_id,
+            self.notes,
+            self.groups,
+            self.history,
+            self.selection,
+            self.editing,
+            self.edit_snapshot,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+    }
+
+    fn rename_group(self, id: u64) {
+        if self.groups.get_untracked().iter().any(|group| group.id == id) {
+            commit_pending_group_edit(
+                self.notes,
+                self.groups,
+                self.history,
+                self.group_editing,
+                self.group_edit_snapshot,
+            );
+            self.group_edit_snapshot
+                .set(Some((id, board_snapshot(self.notes, self.groups))));
+            self.group_editing.set(Some(id));
+        }
+    }
+
+    fn ungroup_group(self, id: u64) {
+        commit_pending_group_edit(
+            self.notes,
+            self.groups,
+            self.history,
+            self.group_editing,
+            self.group_edit_snapshot,
+        );
+        let before = board_snapshot(self.notes, self.groups);
+        self.notes.update(|items| {
+            for note in items {
+                if note.group_id == Some(id) {
+                    note.group_id = None;
+                }
+            }
+        });
+        self.groups.update(|items| items.retain(|group| group.id != id));
+        record_snapshot(self.notes, self.groups, self.history, before);
+    }
+
+    fn reset_view(self) {
+        self.pan.set((0.0, 0.0));
+        self.zoom.set(1.0);
     }
 }
 
@@ -595,6 +1281,77 @@ fn group_bounds_excluding(
             });
         (frame_left, frame_top, width, height)
     })
+}
+
+fn note_rect(x: f64, y: f64) -> (f64, f64, f64, f64) {
+    (x, y, x + NOTE_WIDTH, y + NOTE_HEIGHT)
+}
+
+fn rects_overlap(first: (f64, f64, f64, f64), second: (f64, f64, f64, f64)) -> bool {
+    first.0 < second.2
+        && first.2 > second.0
+        && first.1 < second.3
+        && first.3 > second.1
+}
+
+fn positions_for_group(
+    group: &Group,
+    notes: &[Note],
+    moving_ids: &[u64],
+) -> Vec<(u64, f64, f64)> {
+    let (frame_left, frame_top, frame_width, frame_height) = group_bounds(group, notes).unwrap_or((
+        group.origin.map_or(0.0, |origin| origin.0),
+        group.origin.map_or(0.0, |origin| origin.1),
+        group.size.map_or(MIN_GROUP_WIDTH, |size| size.0),
+        group.size.map_or(MIN_GROUP_HEIGHT, |size| size.1),
+    ));
+    let inner_width = (frame_width - HORIZONTAL_PADDING * 2.0).max(NOTE_WIDTH);
+    let inner_height = (frame_height - TOP_PADDING - BOTTOM_PADDING).max(NOTE_HEIGHT);
+    let column_step = NOTE_WIDTH + HORIZONTAL_PADDING;
+    let row_step = NOTE_HEIGHT + BOTTOM_PADDING;
+    let columns = ((inner_width + HORIZONTAL_PADDING) / column_step)
+        .floor()
+        .max(1.0) as usize;
+    let rows = ((inner_height + BOTTOM_PADDING) / row_step)
+        .floor()
+        .max(1.0) as usize;
+    let moving_ids = moving_ids.iter().copied().collect::<Vec<_>>();
+    let reposition_ids = notes
+        .iter()
+        .filter(|note| moving_ids.contains(&note.id) && note.group_id != Some(group.id))
+        .map(|note| note.id)
+        .collect::<Vec<_>>();
+    let occupied = notes
+        .iter()
+        .filter(|note| note.group_id == Some(group.id) && !reposition_ids.contains(&note.id))
+        .map(|note| note_rect(note.x, note.y))
+        .collect::<Vec<_>>();
+    let mut placed = occupied.clone();
+    let mut positions = Vec::new();
+
+    for note in notes
+        .iter()
+        .filter(|note| reposition_ids.contains(&note.id))
+    {
+        let mut slot = None;
+        for index in 0..(columns * (rows + moving_ids.len() + 1)) {
+            let column = index % columns;
+            let row = index / columns;
+            let x = frame_left + HORIZONTAL_PADDING + column as f64 * column_step;
+            let y = frame_top + TOP_PADDING + row as f64 * row_step;
+            let candidate = note_rect(x, y);
+            if !placed.iter().any(|other| rects_overlap(candidate, *other)) {
+                slot = Some((x, y, candidate));
+                break;
+            }
+        }
+        if let Some((x, y, rect)) = slot {
+            placed.push(rect);
+            positions.push((note.id, x, y));
+        }
+    }
+
+    positions
 }
 
 fn resized_group_frame(
@@ -869,10 +1626,20 @@ fn add_selection_to_group(
     commit_pending_edit(notes, groups, history, note_editing, note_edit_snapshot);
     commit_pending_group_edit(notes, groups, history, group_editing, group_edit_snapshot);
     let before = board_snapshot(notes, groups);
+    let positions = groups
+        .get_untracked()
+        .into_iter()
+        .find(|group| group.id == group_id)
+        .map(|group| positions_for_group(&group, &notes.get_untracked(), &selected_ids))
+        .unwrap_or_default();
     notes.update(|items| {
         for note in items {
             if selected_ids.contains(&note.id) {
                 note.group_id = Some(group_id);
+                if let Some((_, x, y)) = positions.iter().find(|(id, _, _)| *id == note.id) {
+                    note.x = *x;
+                    note.y = *y;
+                }
             }
         }
     });
@@ -929,6 +1696,7 @@ fn keyboard_target_is_editable(ev: &KeyboardEvent) -> bool {
 #[component]
 fn GroupFrame(
     id: u64,
+    context_menu: RwSignal<Option<ContextMenuState>>,
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     history: RwSignal<History>,
@@ -1142,6 +1910,15 @@ fn GroupFrame(
         group_resize_start.set(None);
         group_resizing.set(None);
     };
+    let open_group_context_menu = move |ev: MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        context_menu.set(Some(ContextMenuState {
+            target: ContextMenuTarget::Group(id),
+            x: ev.client_x(),
+            y: ev.client_y(),
+        }));
+    };
     view! {
         <div
             class="pointer-events-auto absolute rounded-md border-2 border-dashed border-ink-soft/35 bg-marker/10"
@@ -1149,6 +1926,7 @@ fn GroupFrame(
             on:pointermove=move_group_drag
             on:pointerup=finish_group_drag
             on:pointercancel=finish_group_drag
+            on:contextmenu=open_group_context_menu
             style=move || {
                 let snapshot = drag_snapshot.get();
                 let dragged = dragged_ids.get();
@@ -1259,6 +2037,8 @@ fn GroupFrame(
 #[component]
 fn NoteCard(
     id: u64,
+    context_menu: RwSignal<Option<ContextMenuState>>,
+    due_date_request: RwSignal<Option<u64>>,
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     history: RwSignal<History>,
@@ -1283,6 +2063,19 @@ fn NoteCard(
             (today.get_full_year() as i32, today.get_month() + 1)
         });
     let calendar_month = RwSignal::new(initial_calendar_month);
+
+    Effect::new(move |_| {
+        if due_date_request.get() == Some(id) {
+            if let Some((year, month, _)) = note_snapshot(notes, id)
+                .and_then(|note| note.due_date)
+                .and_then(|date| parse_due_date(&date))
+            {
+                calendar_month.set((year, month));
+            }
+            due_calendar_open.set(true);
+            due_date_request.set(None);
+        }
+    });
 
     let cycle_status = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -1492,10 +2285,25 @@ fn NoteCard(
                         Some(&before),
                     )
                 });
+            let drop_positions = drop_group
+                .and_then(|group_id| {
+                    groups
+                        .get_untracked()
+                        .into_iter()
+                        .find(|group| group.id == group_id)
+                        .map(|group| positions_for_group(&group, &notes.get_untracked(), &moved_ids))
+                })
+                .unwrap_or_default();
             notes.update(|items| {
                 for note in items {
                     if moved_ids.contains(&note.id) {
                         note.group_id = drop_group;
+                        if let Some((_, x, y)) =
+                            drop_positions.iter().find(|(id, _, _)| *id == note.id)
+                        {
+                            note.x = *x;
+                            note.y = *y;
+                        }
                     }
                 }
             });
@@ -1512,6 +2320,18 @@ fn NoteCard(
         dragged_ids.set(Vec::new());
         dragged.set(None);
         drag_offset.set(None);
+    };
+    let open_note_context_menu = move |ev: MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        if !selection.get_untracked().contains(&id) {
+            selection.set(vec![id]);
+        }
+        context_menu.set(Some(ContextMenuState {
+            target: ContextMenuTarget::Note(id),
+            x: ev.client_x(),
+            y: ev.client_y(),
+        }));
     };
 
     view! {
@@ -1545,6 +2365,7 @@ fn NoteCard(
             on:pointermove=move_dragged_note
             on:pointerup=finish_drag
             on:pointercancel=finish_drag
+            on:contextmenu=open_note_context_menu
             aria-label=move || note_snapshot(notes, id)
                 .map(|note| {
                     if note.text.trim().is_empty() {
@@ -1835,7 +2656,17 @@ fn NoteCard(
 
 #[component]
 pub fn Board() -> impl IntoView {
-    let initial_board = load_board();
+    let initial_workspace = load_workspace();
+    let initial_space_id = initial_workspace.active_space_id;
+    let initial_board = initial_workspace
+        .spaces
+        .iter()
+        .find(|space| space.id == initial_space_id)
+        .map(|space| space.board.clone())
+        .unwrap_or_else(empty_board);
+    let initial_next_id = next_note_id(&initial_board);
+    let spaces = RwSignal::new(initial_workspace.spaces);
+    let active_space_id = RwSignal::new(initial_space_id);
     let notes = RwSignal::new(initial_board.notes);
     let groups = RwSignal::new(initial_board.groups);
     let history = RwSignal::new(History::default());
@@ -1846,7 +2677,7 @@ pub fn Board() -> impl IntoView {
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
     let drag_snapshot = RwSignal::new(None::<BoardData>);
     let drag_origin = RwSignal::new(None::<(f64, f64)>);
-    let initial_view = load_view();
+    let initial_view = load_view(initial_space_id);
     let pan = RwSignal::new(initial_view.pan);
     let zoom = RwSignal::new(initial_view.zoom);
     let pan_pointer = RwSignal::new(None::<i32>);
@@ -1865,25 +2696,48 @@ pub fn Board() -> impl IntoView {
     let group_resize_corner = RwSignal::new(None::<(i8, i8)>);
     let group_resize_snapshot = RwSignal::new(None::<BoardData>);
     let restore_message = RwSignal::new(None::<String>);
-    let next_id = RwSignal::new(
-        notes
+    let space_menu_open = RwSignal::new(false);
+    let rename_space_id = RwSignal::new(None::<u64>);
+    let rename_value = RwSignal::new(String::new());
+    let pending_delete_space = RwSignal::new(None::<u64>);
+    let context_menu = RwSignal::new(None::<ContextMenuState>);
+    let due_date_request = RwSignal::new(None::<u64>);
+    let next_space_id = RwSignal::new(
+        spaces
             .get_untracked()
             .iter()
-            .map(|note| note.id)
+            .map(|space| space.id)
             .max()
             .unwrap_or(0)
-            + 1,
+            .saturating_add(1),
     );
+    let next_id = RwSignal::new(initial_next_id);
+    let board_actions = BoardActions {
+        notes,
+        groups,
+        history,
+        selection,
+        next_id,
+        pan,
+        zoom,
+        editing,
+        edit_snapshot,
+        group_editing,
+        group_edit_snapshot,
+        due_date_request,
+        restore_message,
+    };
 
     Effect::new(move |_| {
-        save_board(&BoardData {
+        let active_id = active_space_id.get();
+        persist_space_board(spaces, active_id, BoardData {
             notes: notes.get(),
             groups: groups.get(),
         });
     });
 
     Effect::new(move |_| {
-        save_view(ViewState {
+        save_view(active_space_id.get(), ViewState {
             pan: pan.get(),
             zoom: zoom.get(),
         });
@@ -2005,50 +2859,38 @@ pub fn Board() -> impl IntoView {
 
     let zoom_in = move |_| zoom.update(|value| *value = (*value * 1.2).min(2.5));
     let zoom_out = move |_| zoom.update(|value| *value = (*value / 1.2).max(0.35));
-    let reset_view = move |_| {
-        pan.set((0.0, 0.0));
-        zoom.set(1.0);
+    let reset_view = move |_| board_actions.reset_view();
+
+    let undo = move |_| board_actions.undo();
+    let redo = move |_| board_actions.redo();
+    let group_selected = move |_: MouseEvent| board_actions.group_selected();
+    let ungroup_selected = move |_: MouseEvent| board_actions.ungroup_selected();
+    let delete_selected = move |_: MouseEvent| board_actions.delete_selected();
+
+    let space_actions = SpaceActions {
+        spaces,
+        active_space_id,
+        notes,
+        groups,
+        next_id,
+        selection,
+        history,
+        editing,
+        edit_snapshot,
+        group_editing,
+        group_edit_snapshot,
+        pan,
+        zoom,
+        restore_message,
+        space_menu_open,
+        pending_delete_space,
     };
 
-    let undo = move |_| undo_board(notes, groups, history, editing, edit_snapshot);
-    let redo = move |_| redo_board(notes, groups, history, editing, edit_snapshot);
-
-    let group_selected = move |_: MouseEvent| {
-        create_group(
-            notes,
-            groups,
-            history,
-            selection,
-            editing,
-            edit_snapshot,
-            group_editing,
-            group_edit_snapshot,
-        );
+    let create_space = move |_| space_actions.create(next_space_id);
+    let begin_rename_space = move |_| {
+        space_actions.begin_rename(rename_space_id, rename_value, active_space_id.get_untracked());
     };
-    let ungroup_selected = move |_: MouseEvent| {
-        ungroup_selection(
-            notes,
-            groups,
-            history,
-            selection,
-            editing,
-            edit_snapshot,
-            group_editing,
-            group_edit_snapshot,
-        );
-    };
-    let delete_selected = move |_: MouseEvent| {
-        delete_selected_notes(
-            notes,
-            groups,
-            history,
-            selection,
-            editing,
-            edit_snapshot,
-            group_editing,
-            group_edit_snapshot,
-        );
-    };
+    let archive_current_space = move |_| space_actions.archive_current();
 
     let add_to_group = move |ev: Event| {
         let Some(select) = ev
@@ -2074,38 +2916,7 @@ pub fn Board() -> impl IntoView {
         select.set_value("");
     };
 
-    let add_note = move |_| {
-        commit_pending_edit(notes, groups, history, editing, edit_snapshot);
-        let id = next_id.get_untracked();
-        next_id.update(|next| *next += 1);
-        mutate_notes(notes, groups, history, |items| {
-            let (x, y) = viewport_note_position(pan.get_untracked(), zoom.get_untracked());
-            items.push(Note {
-                id,
-                text: String::new(),
-                color: match id % 5 {
-                    0 => NoteColor::Yellow,
-                    1 => NoteColor::Pink,
-                    2 => NoteColor::Blue,
-                    3 => NoteColor::Green,
-                    _ => NoteColor::Lavender,
-                },
-                status: NoteStatus::Todo,
-                due_date: None,
-                x,
-                y,
-                rotation: match id % 5 {
-                    0 | 3 => -2,
-                    1 | 4 => 2,
-                    _ => 1,
-                },
-                group_id: None,
-            });
-        });
-        edit_snapshot.set(Some((id, board_snapshot(notes, groups))));
-        editing.set(Some(id));
-        restore_message.set(None);
-    };
+    let add_note = move |_| board_actions.create_note();
 
     let restore_file = move |ev: Event| {
         let Some(input) = ev
@@ -2128,18 +2939,10 @@ pub fn Board() -> impl IntoView {
                 .result()
                 .ok()
                 .and_then(|value| value.as_string());
-            match result.and_then(|raw| {
-                serde_json::from_str::<BoardData>(&raw).ok().or_else(|| {
-                    serde_json::from_str::<Vec<Note>>(&raw)
-                        .ok()
-                        .map(|notes| BoardData {
-                            notes,
-                            groups: Vec::new(),
-                        })
-                })
-            }) {
+            match result.and_then(|raw| parse_board(&raw)) {
                 Some(restored) => {
                     let before = board_snapshot(notes, groups);
+                    next_id.set(next_note_id(&restored));
                     notes.set(restored.notes);
                     groups.set(restored.groups);
                     record_snapshot(notes, groups, history, before);
@@ -2157,6 +2960,16 @@ pub fn Board() -> impl IntoView {
     };
 
     let keyboard_listener = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
+        if ev.key() == "Escape" && !keyboard_target_is_editable(&ev) {
+            if pending_delete_space.get_untracked().is_some() {
+                pending_delete_space.set(None);
+            } else if context_menu.get_untracked().is_some() {
+                context_menu.set(None);
+            } else if space_menu_open.get_untracked() {
+                space_menu_open.set(false);
+            }
+            return;
+        }
         if keyboard_target_is_editable(&ev) {
             return;
         }
@@ -2222,7 +3035,10 @@ pub fn Board() -> impl IntoView {
     on_cleanup(move || keyboard_listener.remove());
 
     view! {
-        <main class="relative h-[100dvh] min-h-screen overflow-hidden bg-paper">
+        <main
+            class="relative h-[100dvh] min-h-screen overflow-hidden bg-paper"
+            on:pointerdown=move |_| context_menu.set(None)
+        >
             <div
                 id="task-space-board"
                 class=move || if pan_pointer.get().is_some() {
@@ -2237,11 +3053,24 @@ pub fn Board() -> impl IntoView {
                         "background-image: radial-gradient(color-mix(in srgb, var(--color-ink-soft) 18%, transparent) 1px, transparent 1.5px); background-size: {grid_size}px {grid_size}px; background-position: calc(50% + {pan_x}px) calc(50% + {pan_y}px);"
                     )
                 }
-                on:pointerdown=start_pan
+                on:pointerdown=move |ev: PointerEvent| {
+                    space_menu_open.set(false);
+                    start_pan(ev);
+                }
                 on:pointermove=move_pan
                 on:pointerup=finish_pan
                 on:pointercancel=finish_pan
                 on:wheel=zoom_or_pan
+                on:contextmenu=move |ev: MouseEvent| {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    space_menu_open.set(false);
+                    context_menu.set(Some(ContextMenuState {
+                        target: ContextMenuTarget::Board,
+                        x: ev.client_x(),
+                        y: ev.client_y(),
+                    }));
+                }
             >
                 <div class="pointer-events-none absolute inset-0 opacity-40" style="background:linear-gradient(110deg, transparent 0%, rgb(255 255 255 / .2) 47%, transparent 50%);"></div>
                 {move || if notes.get().is_empty() {
@@ -2286,6 +3115,7 @@ pub fn Board() -> impl IntoView {
                             view! {
                                 <GroupFrame
                                     id=id
+                                    context_menu=context_menu
                                     notes=notes
                                     groups=groups
                                     history=history
@@ -2313,6 +3143,8 @@ pub fn Board() -> impl IntoView {
                             view! {
                                 <NoteCard
                                     id=id
+                                    context_menu=context_menu
+                                    due_date_request=due_date_request
                                     notes=notes
                                     groups=groups
                                     history=history
@@ -2333,19 +3165,375 @@ pub fn Board() -> impl IntoView {
                 </div>
             </div>
 
-            <header class="pointer-events-none absolute inset-x-3 top-3 z-10 flex items-start justify-between gap-3 sm:inset-x-5 sm:top-5">
-                <div class="pointer-events-auto flex items-center gap-3 rounded-md border border-ink-soft/15 bg-paper/90 px-3 py-2 shadow-md backdrop-blur-sm">
-                    <a href="/" class="flex items-center gap-2" aria-label="Task Space home">
+            {move || context_menu.get().map(|menu| {
+                let menu_style = format!(
+                    "left:max(.75rem,min({}px,calc(100vw - 14.75rem)));top:max(.75rem,min({}px,calc(100dvh - 29rem)));",
+                    menu.x,
+                    menu.y,
+                );
+                match menu.target {
+                    ContextMenuTarget::Board => view! {
+                        <div
+                            role="menu"
+                            aria-label="Board actions"
+                            class="pointer-events-auto fixed z-[70] w-56 max-w-[calc(100vw-1.5rem)] max-h-[min(28rem,calc(100dvh-1.5rem))] overflow-y-auto rounded-md border border-ink/20 bg-paper p-2 text-ink shadow-xl"
+                            style=menu_style
+                            on:pointerdown=move |ev: PointerEvent| ev.stop_propagation()
+                            on:click=move |ev: MouseEvent| ev.stop_propagation()
+                        >
+                            <div class="border-b border-ink-soft/15 px-2 pb-2 font-handwriting text-xl">"board actions"</div>
+                            <div class="mt-1 space-y-0.5">
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.undo(); context_menu.set(None); } disabled=move || history.get().undo.is_empty() class="context-menu-item">"undo"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.redo(); context_menu.set(None); } disabled=move || history.get().redo.is_empty() class="context-menu-item">"redo"</button>
+                                <div class="my-1 border-t border-ink-soft/15"></div>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.create_note(); context_menu.set(None); } class="context-menu-item context-menu-item-accent">"+ new note"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.group_selected(); context_menu.set(None); } disabled=move || selection.get().len() < 2 class="context-menu-item">"group selected"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.ungroup_selected(); context_menu.set(None); } disabled=move || !selection.get().iter().any(|id| notes.get().iter().any(|note| note.id == *id && note.group_id.is_some())) class="context-menu-item">"ungroup selected"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.delete_selected(); context_menu.set(None); } disabled=move || selection.get().is_empty() class="context-menu-item context-menu-item-danger">"delete selected"</button>
+                                {move || if groups.get().is_empty() || selection.get().is_empty() {
+                                    ().into_any()
+                                } else {
+                                    view! {
+                                        <div class="mt-1 border-t border-ink-soft/15 pt-1">
+                                            <div class="px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-ink-soft">"add selected to"</div>
+                                            {move || groups.get().into_iter().map(|group| {
+                                                let group_id = group.id;
+                                                view! {
+                                                    <button type="button" role="menuitem" on:click=move |_| { board_actions.add_selection_to_group(group_id); context_menu.set(None); } class="context-menu-item">{group.label}</button>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }}
+                                <div class="my-1 border-t border-ink-soft/15"></div>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.reset_view(); context_menu.set(None); } class="context-menu-item">"reset view"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { export_board(&notes.get_untracked(), &groups.get_untracked()); context_menu.set(None); } class="context-menu-item">"export board"</button>
+                            </div>
+                        </div>
+                    }.into_any(),
+                    ContextMenuTarget::Note(id) => view! {
+                        <div
+                            role="menu"
+                            aria-label="Note actions"
+                            class="pointer-events-auto fixed z-[70] w-56 max-w-[calc(100vw-1.5rem)] max-h-[min(28rem,calc(100dvh-1.5rem))] overflow-y-auto rounded-md border border-ink/20 bg-paper p-2 text-ink shadow-xl"
+                            style=menu_style
+                            on:pointerdown=move |ev: PointerEvent| ev.stop_propagation()
+                            on:click=move |ev: MouseEvent| ev.stop_propagation()
+                        >
+                            <div class="border-b border-ink-soft/15 px-2 pb-2 font-handwriting text-xl">"note actions"</div>
+                            <div class="mt-1 space-y-0.5">
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.edit_note(id); context_menu.set(None); } class="context-menu-item">"edit note"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.cycle_status(id); context_menu.set(None); } class="context-menu-item">{move || note_snapshot(notes, id).map(|note| format!("mark {}", note.status.next().label())).unwrap_or_else(|| "change status".into())}</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.open_due_date_picker(id); context_menu.set(None); } class="context-menu-item">"choose due date"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.clear_due_date(id); context_menu.set(None); } disabled=move || !note_snapshot(notes, id).is_some_and(|note| note.due_date.is_some()) class="context-menu-item">"clear due date"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.cycle_color(id); context_menu.set(None); } class="context-menu-item">"change colour"</button>
+                                {move || if groups.get().is_empty() {
+                                    ().into_any()
+                                } else {
+                                    view! {
+                                        <div class="mt-1 border-t border-ink-soft/15 pt-1">
+                                            <div class="px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-ink-soft">"move to group"</div>
+                                            {move || groups.get().into_iter().map(|group| {
+                                                let group_id = group.id;
+                                                view! {
+                                                    <button type="button" role="menuitem" on:click=move |_| { board_actions.add_selection_to_group(group_id); context_menu.set(None); } class="context-menu-item">{group.label}</button>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }}
+                                <div class="my-1 border-t border-ink-soft/15"></div>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.delete_note(id); context_menu.set(None); } class="context-menu-item context-menu-item-danger">"delete note"</button>
+                            </div>
+                        </div>
+                    }.into_any(),
+                    ContextMenuTarget::Group(id) => view! {
+                        <div
+                            role="menu"
+                            aria-label="Group actions"
+                            class="pointer-events-auto fixed z-[70] w-56 max-w-[calc(100vw-1.5rem)] max-h-[min(28rem,calc(100dvh-1.5rem))] overflow-y-auto rounded-md border border-ink/20 bg-paper p-2 text-ink shadow-xl"
+                            style=menu_style
+                            on:pointerdown=move |ev: PointerEvent| ev.stop_propagation()
+                            on:click=move |ev: MouseEvent| ev.stop_propagation()
+                        >
+                            <div class="border-b border-ink-soft/15 px-2 pb-2 font-handwriting text-xl">"group actions"</div>
+                            <div class="mt-1 space-y-0.5">
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.rename_group(id); context_menu.set(None); } class="context-menu-item">"rename group"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { board_actions.ungroup_group(id); context_menu.set(None); } class="context-menu-item context-menu-item-danger">"remove group"</button>
+                            </div>
+                        </div>
+                    }.into_any(),
+                    ContextMenuTarget::Space(id) => view! {
+                        <div
+                            role="menu"
+                            aria-label="Space actions"
+                            class="pointer-events-auto fixed z-[70] w-56 max-w-[calc(100vw-1.5rem)] max-h-[min(28rem,calc(100dvh-1.5rem))] overflow-y-auto rounded-md border border-ink/20 bg-paper p-2 text-ink shadow-xl"
+                            style=menu_style
+                            on:pointerdown=move |ev: PointerEvent| ev.stop_propagation()
+                            on:click=move |ev: MouseEvent| ev.stop_propagation()
+                        >
+                            <div class="border-b border-ink-soft/15 px-2 pb-2 font-handwriting text-xl">"space actions"</div>
+                            <div class="mt-1 space-y-0.5">
+                                <button type="button" role="menuitem" on:click=move |_| { space_actions.create(next_space_id); context_menu.set(None); } class="context-menu-item context-menu-item-accent">"+ new space"</button>
+                                {move || spaces.get().into_iter().find(|space| space.id == id).map(|space| {
+                                    let archived = space.archived;
+                                    view! {
+                                        {if archived {
+                                            view! {
+                                                <button type="button" role="menuitem" on:click=move |_| { space_actions.restore(id); context_menu.set(None); } class="context-menu-item">"restore space"</button>
+                                                {move || if pending_delete_space.get() == Some(id) {
+                                                    view! { <button type="button" role="menuitem" on:click=move |_| { space_actions.confirm_delete(); context_menu.set(None); } class="context-menu-item context-menu-item-danger">"delete forever"</button> }.into_any()
+                                                } else {
+                                                    view! { <button type="button" role="menuitem" on:click=move |_| space_actions.request_delete(id) class="context-menu-item context-menu-item-danger">"delete forever"</button> }.into_any()
+                                                }}
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <button type="button" role="menuitem" on:click=move |_| { space_actions.switch(id); context_menu.set(None); } disabled=move || active_space_id.get() == id class="context-menu-item">"switch to space"</button>
+                                                <button type="button" role="menuitem" on:click=move |_| { space_actions.begin_rename(rename_space_id, rename_value, id); context_menu.set(None); } class="context-menu-item">"rename space"</button>
+                                                <button type="button" role="menuitem" on:click=move |_| { space_actions.archive_current(); context_menu.set(None); } disabled=move || active_space_id.get() != id class="context-menu-item context-menu-item-danger">"archive space"</button>
+                                            }.into_any()
+                                        }}
+                                    }
+                                })}
+                            </div>
+                        </div>
+                    }.into_any(),
+                }
+            })}
+
+            <header class="pointer-events-none absolute inset-x-3 top-3 z-10 flex flex-col items-stretch gap-2 sm:inset-x-5 sm:top-5 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
+                <div class="pointer-events-auto flex min-w-0 max-w-full flex-wrap items-center gap-2 rounded-md border border-ink-soft/15 bg-paper/90 px-2.5 py-2 shadow-md backdrop-blur-sm sm:gap-3 sm:px-3">
+                    <a href="/" class="flex shrink-0 items-center gap-2 whitespace-nowrap" aria-label="Task Space home">
                         <img src="/smbl-logo.png" alt="SMBL" class="h-6 w-auto"/>
-                        <span class="font-handwriting text-3xl leading-none">"Task Space"</span>
+                        <span class="font-handwriting text-2xl leading-none sm:text-3xl">"Task Space"</span>
                     </a>
                     <span class="hidden h-6 w-px bg-ink-soft/20 sm:block"></span>
-                    <span class="hidden text-xs text-ink-soft sm:block">
+                    <div class="relative min-w-0">
+                        <button
+                            type="button"
+                            on:click=move |ev: MouseEvent| {
+                                ev.stop_propagation();
+                                space_menu_open.update(|open| *open = !*open);
+                            }
+                            aria-label="Switch space"
+                            aria-haspopup="menu"
+                            aria-expanded=move || space_menu_open.get().to_string()
+                            title="Switch space"
+                            class="flex max-w-[42vw] min-w-0 items-center gap-1 rounded-[3px] px-2 py-1 font-handwriting text-lg leading-none hover:bg-white/60 focus:outline-none focus:ring-2 focus:ring-ink/30 sm:max-w-44 sm:text-xl"
+                        >
+                            <span class="truncate">
+                                {move || spaces
+                                    .get()
+                                    .into_iter()
+                                    .find(|space| space.id == active_space_id.get())
+                                    .map(|space| space.name)
+                                    .unwrap_or_else(|| "my space".into())}
+                            </span>
+                            <span class="font-sans text-xs opacity-60" aria-hidden="true">"⌄"</span>
+                        </button>
+                        {move || if space_menu_open.get() {
+                            view! {
+                                <div
+                                    role="menu"
+                                    class="absolute left-0 top-10 z-50 max-h-[calc(100dvh-5.5rem)] w-72 max-w-[calc(100vw-1.5rem)] overflow-y-auto rounded-md border border-ink/20 bg-paper p-3 text-ink shadow-xl max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-16 max-sm:w-auto max-sm:max-w-none"
+                                    on:pointerdown=move |ev: PointerEvent| ev.stop_propagation()
+                                    on:click=move |ev: MouseEvent| ev.stop_propagation()
+                                >
+                                    <div class="flex items-center justify-between gap-2 border-b border-ink-soft/15 pb-2">
+                                        <span class="font-handwriting text-xl">"spaces"</span>
+                                        <button
+                                            type="button"
+                                            on:click=create_space
+                                            class="rounded-[3px] bg-marker px-2 py-1 text-xs font-medium hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                        >
+                                            "+ new space"
+                                        </button>
+                                    </div>
+                            <div class="mt-2 space-y-1">
+                                {move || spaces
+                                            .get()
+                                            .into_iter()
+                                            .filter(|space| !space.archived)
+                                            .map(|space| {
+                                                let space_actions = space_actions;
+                                                let is_active = space.id == active_space_id.get();
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        role="menuitem"
+                                                        on:contextmenu=move |ev: MouseEvent| {
+                                                            ev.prevent_default();
+                                                            ev.stop_propagation();
+                                                            context_menu.set(Some(ContextMenuState {
+                                                                target: ContextMenuTarget::Space(space.id),
+                                                                x: ev.client_x(),
+                                                                y: ev.client_y(),
+                                                            }));
+                                                        }
+                                                        on:click=move |ev: MouseEvent| {
+                                                            ev.stop_propagation();
+                                                            space_actions.switch(space.id);
+                                                        }
+                                                        class=if is_active {
+                                                            "flex w-full items-center justify-between rounded-[3px] bg-note-yellow px-2 py-1.5 text-left text-sm text-note-ink-yellow focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                        } else {
+                                                            "flex w-full items-center justify-between rounded-[3px] px-2 py-1.5 text-left text-sm hover:bg-paper-shelf focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                        }
+                                                    >
+                                                        <span class="truncate">{space.name}</span>
+                                                        <span class="ml-2 shrink-0 text-[10px] opacity-60">
+                                                            {format!("{}", space.board.notes.len())}
+                                                        </span>
+                                                    </button>
+                                                }
+                                            })
+                                            .collect_view()}
+                                    </div>
+                                    <div class="mt-3 border-t border-ink-soft/15 pt-2">
+                                        {move || if rename_space_id.get() == Some(active_space_id.get()) {
+                                            view! {
+                                                <div class="space-y-2">
+                                                    <input
+                                                        prop:value=rename_value.get_untracked()
+                                                        maxlength="48"
+                                                        autofocus=true
+                                                        aria-label="Space name"
+                                                        class="w-full rounded-[3px] border border-ink-soft/25 bg-blank px-2 py-1.5 text-sm outline-none focus:border-ink focus:ring-2 focus:ring-ink/30"
+                                                        on:input=move |ev: Event| {
+                                                            if let Some(input) = ev.target().and_then(|target| target.dyn_into::<HtmlInputElement>().ok()) {
+                                                                rename_value.set(input.value());
+                                                            }
+                                                        }
+                                                        on:keydown=move |ev: KeyboardEvent| {
+                                                            if ev.key() == "Enter" {
+                                                                ev.prevent_default();
+                                                                space_actions.save_name(rename_space_id, rename_value);
+                                                            } else if ev.key() == "Escape" {
+                                                                ev.prevent_default();
+                                                                space_actions.cancel_name(rename_space_id);
+                                                            }
+                                                        }
+                                                    />
+                                                    <div class="flex justify-end gap-1">
+                                                        <button
+                                                            type="button"
+                                                            on:click=move |_| space_actions.cancel_name(rename_space_id)
+                                                            class="rounded-[3px] px-2 py-1.5 text-xs text-ink-soft hover:bg-paper-shelf hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                        >
+                                                            "cancel"
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            on:click=move |_| space_actions.save_name(rename_space_id, rename_value)
+                                                            class="rounded-[3px] bg-note-green px-2 py-1.5 text-xs text-note-ink-green hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                        >
+                                                            "save"
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            }
+                                            .into_any()
+                                        } else {
+                                            view! {
+                                                <div class="flex items-center gap-1">
+                                                    <button
+                                                        type="button"
+                                                        on:click=begin_rename_space
+                                                        class="flex-1 rounded-[3px] px-2 py-1.5 text-left text-xs text-ink-soft hover:bg-paper-shelf hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                    >
+                                                        "rename space"
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        on:click=archive_current_space
+                                                        class="rounded-[3px] px-2 py-1.5 text-xs text-ink-soft hover:bg-note-pink hover:text-note-ink-pink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                    >
+                                                        "archive"
+                                                    </button>
+                                                </div>
+                                            }
+                                            .into_any()
+                                        }}
+                                    </div>
+                                    {move || {
+                                        let archived = spaces
+                                            .get()
+                                            .into_iter()
+                                            .filter(|space| space.archived)
+                                            .collect::<Vec<_>>();
+                                        if archived.is_empty() {
+                                            ().into_any()
+                                        } else {
+                                            view! {
+                                                <div class="mt-3 border-t border-ink-soft/15 pt-2">
+                                                    <span class="font-handwriting text-lg text-ink-soft">"archived"</span>
+                                                    <div class="mt-1 space-y-1">
+                                                        {archived.into_iter().map(|space| {
+                                                            let space_actions = space_actions;
+                                                            view! {
+                                                            <div
+                                                                class="flex min-w-0 items-center gap-1 text-xs"
+                                                                on:contextmenu=move |ev: MouseEvent| {
+                                                                    ev.prevent_default();
+                                                                    ev.stop_propagation();
+                                                                    context_menu.set(Some(ContextMenuState {
+                                                                        target: ContextMenuTarget::Space(space.id),
+                                                                        x: ev.client_x(),
+                                                                        y: ev.client_y(),
+                                                                    }));
+                                                                }
+                                                            >
+                                                                    <span class="min-w-0 flex-1 truncate text-ink-soft">{space.name}</span>
+                                                                    <button
+                                                                        type="button"
+                                                                        on:click=move |_| space_actions.restore(space.id)
+                                                                        class="rounded-[3px] px-1.5 py-1 text-ink-soft hover:bg-note-green hover:text-note-ink-green focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                                    >
+                                                                        "restore"
+                                                                    </button>
+                                                                    {if pending_delete_space.get() == Some(space.id) {
+                                                                        view! {
+                                                                            <button
+                                                                                type="button"
+                                                                                on:click=move |_| space_actions.confirm_delete()
+                                                                                class="rounded-[3px] bg-note-pink px-1.5 py-1 text-note-ink-pink focus:outline-none focus:ring-2 focus:ring-note-ink-pink/40"
+                                                                            >
+                                                                                "delete forever"
+                                                                            </button>
+                                                                        }.into_any()
+                                                                    } else {
+                                                                        view! {
+                                                                            <button
+                                                                                type="button"
+                                                                                on:click=move |_| space_actions.request_delete(space.id)
+                                                                                class="rounded-[3px] px-1.5 py-1 text-ink-soft hover:bg-note-pink hover:text-note-ink-pink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                                                            >
+                                                                                "delete"
+                                                                            </button>
+                                                                        }.into_any()
+                                                                    }}
+                                                                </div>
+                                                            }
+                                                        }).collect_view()}
+                                                    </div>
+                                                </div>
+                                            }.into_any()
+                                        }
+                                    }}
+                                </div>
+                            }
+                            .into_any()
+                        } else {
+                            ().into_any()
+                        }}
+                    </div>
+                    <span class="hidden shrink-0 text-xs text-ink-soft sm:block">
                         {move || format!("{} {}", notes.get().len(), if notes.get().len() == 1 { "note" } else { "notes" })}
                     </span>
                 </div>
 
-                <div class="pointer-events-auto flex items-center gap-1 rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:gap-2 sm:p-1.5">
+                <div class="pointer-events-auto flex min-w-0 max-w-full shrink-0 items-center gap-1 overflow-x-auto whitespace-nowrap rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:gap-2 sm:p-1.5">
                     <button
                         type="button"
                         on:click=undo
@@ -2525,6 +3713,106 @@ mod tests {
 
         assert_eq!(restored.notes[0].status, NoteStatus::InProgress);
         assert_eq!(restored.notes[0].due_date.as_deref(), Some("2026-09-02"));
+    }
+
+    #[test]
+    fn spaces_round_trip_with_name_archive_state_and_board() {
+        let workspace = WorkspaceData {
+            spaces: vec![Space {
+                id: 7,
+                name: "research".into(),
+                archived: true,
+                board: BoardData {
+                    notes: vec![Note {
+                        id: 4,
+                        text: "read paper".into(),
+                        color: NoteColor::Blue,
+                        status: NoteStatus::Todo,
+                        due_date: None,
+                        x: 12.0,
+                        y: 24.0,
+                        rotation: -1,
+                        group_id: None,
+                    }],
+                    groups: Vec::new(),
+                },
+            }],
+            active_space_id: 7,
+        };
+
+        let raw = serde_json::to_string(&workspace).expect("workspace should serialize");
+        let restored: WorkspaceData =
+            serde_json::from_str(&raw).expect("workspace should deserialize");
+
+        assert_eq!(restored, workspace);
+    }
+
+    #[test]
+    fn moving_a_note_to_a_group_places_it_inside_without_using_its_old_position() {
+        let group = Group {
+            id: 1,
+            label: "Work".into(),
+            origin: Some((0.0, 0.0)),
+            size: Some((488.0, 276.0)),
+        };
+        let notes = vec![
+            Note {
+                id: 1,
+                text: "already here".into(),
+                color: NoteColor::Yellow,
+                status: NoteStatus::Todo,
+                due_date: None,
+                x: 24.0,
+                y: 52.0,
+                rotation: 0,
+                group_id: Some(1),
+            },
+            Note {
+                id: 2,
+                text: "move me".into(),
+                color: NoteColor::Blue,
+                status: NoteStatus::Todo,
+                due_date: None,
+                x: 900.0,
+                y: 900.0,
+                rotation: 0,
+                group_id: None,
+            },
+        ];
+
+        let positions = positions_for_group(&group, &notes, &[2]);
+
+        assert_eq!(positions, vec![(2, 256.0, 52.0)]);
+    }
+
+    #[test]
+    fn moving_a_note_that_is_already_in_the_group_does_not_reposition_it() {
+        let group = Group {
+            id: 1,
+            label: "Work".into(),
+            origin: Some((0.0, 0.0)),
+            size: Some((256.0, 276.0)),
+        };
+        let notes = vec![Note {
+            id: 1,
+            text: "stay here".into(),
+            color: NoteColor::Yellow,
+            status: NoteStatus::Todo,
+            due_date: None,
+            x: 24.0,
+            y: 52.0,
+            rotation: 0,
+            group_id: Some(1),
+        }];
+
+        assert!(positions_for_group(&group, &notes, &[1]).is_empty());
+    }
+
+    #[test]
+    fn space_names_are_trimmed_and_have_a_safe_fallback() {
+        assert_eq!(normalize_space_name("  personal  "), "personal");
+        assert_eq!(normalize_space_name("   "), "untitled space");
+        assert_eq!(normalize_space_name(&"x".repeat(60)).len(), 48);
     }
 
     #[test]
