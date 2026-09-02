@@ -26,3 +26,23 @@ cd api/waitlist && npm run dev        # optional: local miniflare on :8787
 
 ## Status
 Work in progress
+
+## Data boundary before auth and sync
+
+The browser is currently the source of truth. Workspace documents are stored in
+IndexedDB; the old `localStorage` workspace key is retained only as a migration
+and recovery fallback. The shared document schema lives in `crates/core` so the
+eventual account and sync layers can consume the same shape.
+
+- A **space** owns its name, archive state, notes, groups, note positions, due
+  dates, statuses, and deletion tombstones.
+- **Workspace** metadata owns the space list, the active space, schema version,
+  and the stable local device identifier used during account migration.
+- **Device-only UI state** owns pan, zoom, open menus, selection, editing state,
+  undo/redo history, and the currently open date picker. It is intentionally not
+  part of a workspace export or future sync document.
+
+Workspace exports include every space and can be restored with confirmation.
+Older board-only exports remain importable into the current space. Deletions are
+kept as tombstones at the persistence boundary so a future sync layer can merge
+them instead of silently resurrecting removed content.

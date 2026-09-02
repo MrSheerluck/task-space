@@ -2,8 +2,14 @@ use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use task_core::{
+    BoardData, Group, Note, NoteColor, NoteStatus, Space, Tombstone, TombstoneKind, WorkspaceData,
+    CURRENT_SCHEMA_VERSION,
+};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, Element, FileReader, HtmlAnchorElement, HtmlInputElement, HtmlSelectElement,
     HtmlTextAreaElement, Url,
@@ -11,7 +17,8 @@ use web_sys::{
 
 const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
-const WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
+const LEGACY_WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
+const DEVICE_ID_STORAGE_KEY: &str = "task-space.device-id.v1";
 const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
 const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
@@ -23,53 +30,94 @@ const BOTTOM_PADDING: f64 = 24.0;
 const MIN_GROUP_WIDTH: f64 = NOTE_WIDTH + HORIZONTAL_PADDING * 2.0;
 const MIN_GROUP_HEIGHT: f64 = NOTE_HEIGHT + TOP_PADDING + BOTTOM_PADDING;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct Note {
-    id: u64,
-    text: String,
-    color: NoteColor,
-    #[serde(default)]
-    status: NoteStatus,
-    #[serde(default)]
-    due_date: Option<String>,
-    x: f64,
-    y: f64,
-    rotation: i8,
-    #[serde(default)]
-    group_id: Option<u64>,
+#[wasm_bindgen(inline_js = r#"
+export function taskSpaceLoadWorkspace() {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space");
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("workspace")) {
+        request.result.createObjectStore("workspace");
+      }
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const storeName = Array.from(db.objectStoreNames).includes("workspace")
+        ? "workspace"
+        : db.objectStoreNames[0];
+      if (!storeName) {
+        resolve(null);
+        return;
+      }
+      const transaction = db.transaction(storeName, "readonly");
+      const store = transaction.objectStore(storeName);
+      const read = store.get("current");
+      read.onerror = () => reject(read.error || new Error("Could not read workspace"));
+      read.onsuccess = () => {
+        if (read.result != null) {
+          resolve(read.result);
+          return;
+        }
+        const all = store.getAll();
+        all.onerror = () => reject(all.error || new Error("Could not list workspace records"));
+        all.onsuccess = () => resolve(all.result ?? null);
+      };
+    };
+  });
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-enum NoteStatus {
-    #[default]
-    Todo,
-    InProgress,
-    Done,
+export function taskSpaceSaveWorkspace(raw) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space");
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("workspace")) {
+        request.result.createObjectStore("workspace");
+      }
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("workspace", "readwrite");
+      transaction.objectStore("workspace").put(raw, "current");
+      transaction.onerror = () => reject(transaction.error || new Error("Could not save workspace"));
+      transaction.oncomplete = () => resolve(true);
+    };
+  });
+}
+"#)]
+unsafe extern "C" {
+    #[wasm_bindgen(js_name = taskSpaceLoadWorkspace)]
+    fn indexed_db_load_workspace() -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceSaveWorkspace)]
+    fn indexed_db_save_workspace(raw: &str) -> js_sys::Promise;
 }
 
-impl NoteStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Todo => "to do",
-            Self::InProgress => "in progress",
-            Self::Done => "done",
-        }
+fn note_color_background(color: NoteColor) -> &'static str {
+    match color {
+        NoteColor::Yellow => "var(--color-note-yellow)",
+        NoteColor::Pink => "var(--color-note-pink)",
+        NoteColor::Blue => "var(--color-note-blue)",
+        NoteColor::Green => "var(--color-note-green)",
+        NoteColor::Lavender => "var(--color-note-lav)",
     }
+}
 
-    fn mark(self) -> &'static str {
-        match self {
-            Self::Todo => "○",
-            Self::InProgress => "◐",
-            Self::Done => "✓",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Todo => Self::InProgress,
-            Self::InProgress => Self::Done,
-            Self::Done => Self::Todo,
-        }
+fn note_color_ink(color: NoteColor) -> &'static str {
+    match color {
+        NoteColor::Yellow => "var(--color-note-ink-yellow)",
+        NoteColor::Pink => "var(--color-note-ink-pink)",
+        NoteColor::Blue => "var(--color-note-ink-blue)",
+        NoteColor::Green => "var(--color-note-ink-green)",
+        NoteColor::Lavender => "var(--color-note-ink-lav)",
     }
 }
 
@@ -195,38 +243,6 @@ fn set_note_due_date(
     });
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct Group {
-    id: u64,
-    label: String,
-    #[serde(default)]
-    origin: Option<(f64, f64)>,
-    #[serde(default)]
-    size: Option<(f64, f64)>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct BoardData {
-    notes: Vec<Note>,
-    #[serde(default)]
-    groups: Vec<Group>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct Space {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    archived: bool,
-    board: BoardData,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct WorkspaceData {
-    spaces: Vec<Space>,
-    active_space_id: u64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ContextMenuTarget {
     Board,
@@ -248,51 +264,17 @@ struct ViewState {
     zoom: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StorageStatus {
+    Saved,
+    Saving,
+    Error,
+}
+
 #[derive(Clone, Default)]
 struct History {
     undo: Vec<BoardData>,
     redo: Vec<BoardData>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-enum NoteColor {
-    Yellow,
-    Pink,
-    Blue,
-    Green,
-    Lavender,
-}
-
-impl NoteColor {
-    fn background(self) -> &'static str {
-        match self {
-            Self::Yellow => "var(--color-note-yellow)",
-            Self::Pink => "var(--color-note-pink)",
-            Self::Blue => "var(--color-note-blue)",
-            Self::Green => "var(--color-note-green)",
-            Self::Lavender => "var(--color-note-lav)",
-        }
-    }
-
-    fn ink(self) -> &'static str {
-        match self {
-            Self::Yellow => "var(--color-note-ink-yellow)",
-            Self::Pink => "var(--color-note-ink-pink)",
-            Self::Blue => "var(--color-note-ink-blue)",
-            Self::Green => "var(--color-note-ink-green)",
-            Self::Lavender => "var(--color-note-ink-lav)",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Yellow => Self::Pink,
-            Self::Pink => Self::Blue,
-            Self::Blue => Self::Green,
-            Self::Green => Self::Lavender,
-            Self::Lavender => Self::Yellow,
-        }
-    }
 }
 
 fn note_position(index: usize) -> (f64, f64) {
@@ -322,8 +304,10 @@ fn parse_board(raw: &str) -> Option<BoardData> {
             serde_json::from_value::<Vec<Note>>(value.clone())
                 .ok()
                 .map(|notes| BoardData {
+                    schema_version: CURRENT_SCHEMA_VERSION,
                     notes,
                     groups: Vec::new(),
+                    tombstones: Vec::new(),
                 })
         })?;
 
@@ -344,6 +328,72 @@ fn parse_board(raw: &str) -> Option<BoardData> {
     }
 
     Some(board)
+}
+
+fn parse_workspace(raw: &str) -> Option<WorkspaceData> {
+    let workspace = serde_json::from_str::<WorkspaceData>(raw).ok()?;
+    (!workspace.spaces.is_empty()).then(|| normalize_workspace(workspace))
+}
+
+fn workspace_from_board(board: BoardData) -> WorkspaceData {
+    let now = now_millis();
+    WorkspaceData {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        device_id: load_device_id(),
+        tombstones: Vec::new(),
+        spaces: vec![Space {
+            id: 1,
+            name: "my space".into(),
+            archived: false,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            board,
+        }],
+        active_space_id: 1,
+    }
+}
+
+fn parse_indexed_db_value(value: JsValue) -> Option<WorkspaceData> {
+    let raw = value.as_string().or_else(|| {
+        js_sys::JSON::stringify(&value)
+            .ok()
+            .and_then(|json| json.as_string())
+    })?;
+    parse_workspace(&raw)
+        .or_else(|| parse_board(&raw).filter(|board| !board.notes.is_empty() || !board.groups.is_empty()).map(workspace_from_board))
+        .or_else(|| parse_indexed_db_json(&raw))
+}
+
+fn parse_indexed_db_json(raw: &str) -> Option<WorkspaceData> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    parse_indexed_db_json_value(value)
+}
+
+fn parse_indexed_db_json_value(value: serde_json::Value) -> Option<WorkspaceData> {
+    if let Some(raw) = value.as_str() {
+        return parse_indexed_db_json(raw);
+    }
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .cloned()
+            .find_map(parse_indexed_db_json_value);
+    }
+    if let Ok(workspace) = serde_json::from_value::<WorkspaceData>(value.clone())
+        && !workspace.spaces.is_empty()
+    {
+        return Some(normalize_workspace(workspace));
+    }
+    if let Ok(board) = serde_json::from_value::<BoardData>(value.clone())
+        && (!board.notes.is_empty() || !board.groups.is_empty())
+    {
+        return Some(workspace_from_board(board));
+    }
+    let object = value.as_object()?;
+    ["value", "data", "workspace", "board"]
+        .into_iter()
+        .find_map(|key| object.get(key).cloned().and_then(parse_indexed_db_json_value))
 }
 
 fn load_board() -> BoardData {
@@ -369,8 +419,10 @@ fn load_board() -> BoardData {
                 })
         })
         .unwrap_or(BoardData {
+            schema_version: CURRENT_SCHEMA_VERSION,
             notes: Vec::new(),
             groups: Vec::new(),
+            tombstones: Vec::new(),
         });
 
     for index in 1..board.notes.len() {
@@ -395,27 +447,79 @@ fn load_board() -> BoardData {
 
 fn empty_board() -> BoardData {
     BoardData {
+        schema_version: CURRENT_SCHEMA_VERSION,
         notes: Vec::new(),
         groups: Vec::new(),
+        tombstones: Vec::new(),
     }
 }
 
-fn load_workspace() -> WorkspaceData {
-    let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
-    let mut workspace = storage
-        .as_ref()
-        .and_then(|storage| storage.get_item(WORKSPACE_STORAGE_KEY).ok().flatten())
-        .and_then(|raw| serde_json::from_str::<WorkspaceData>(&raw).ok())
-        .filter(|workspace| !workspace.spaces.is_empty())
-        .unwrap_or_else(|| WorkspaceData {
-            spaces: vec![Space {
-                id: 1,
-                name: "my space".into(),
-                archived: false,
-                board: load_board(),
-            }],
-            active_space_id: 1,
-        });
+fn now_millis() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
+fn load_device_id() -> String {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return "device-local".into();
+    };
+    if let Ok(Some(device_id)) = storage.get_item(DEVICE_ID_STORAGE_KEY) {
+        return device_id;
+    }
+    let device_id = format!(
+        "device-{}-{}",
+        now_millis(),
+        (js_sys::Math::random() * 1_000_000_000.0) as u64
+    );
+    let _ = storage.set_item(DEVICE_ID_STORAGE_KEY, &device_id);
+    device_id
+}
+
+fn workspace_snapshot(
+    spaces: Vec<Space>,
+    active_space_id: u64,
+    tombstones: Vec<Tombstone>,
+) -> WorkspaceData {
+    WorkspaceData {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        device_id: load_device_id(),
+        tombstones,
+        spaces,
+        active_space_id,
+    }
+}
+
+fn normalize_workspace(mut workspace: WorkspaceData) -> WorkspaceData {
+    workspace.schema_version = CURRENT_SCHEMA_VERSION;
+    if workspace.device_id.is_empty() {
+        workspace.device_id = load_device_id();
+    }
+    let now = now_millis();
+    for space in &mut workspace.spaces {
+        if space.created_at == 0 {
+            space.created_at = now;
+        }
+        if space.updated_at == 0 {
+            space.updated_at = space.created_at;
+        }
+        space.board.schema_version = CURRENT_SCHEMA_VERSION;
+        for note in &mut space.board.notes {
+            if note.created_at == 0 {
+                note.created_at = now;
+            }
+            if note.updated_at == 0 {
+                note.updated_at = note.created_at;
+            }
+        }
+        for group in &mut space.board.groups {
+            if group.created_at == 0 {
+                group.created_at = now;
+            }
+            if group.updated_at == 0 {
+                group.updated_at = group.created_at;
+            }
+        }
+    }
 
     if !workspace
         .spaces
@@ -433,30 +537,243 @@ fn load_workspace() -> WorkspaceData {
     workspace
 }
 
-fn save_workspace(workspace: &WorkspaceData) {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    if let Ok(raw) = serde_json::to_string(workspace) {
-        let _ = storage.set_item(WORKSPACE_STORAGE_KEY, &raw);
+fn hydrate_workspace_from_indexed_db(
+    initial_workspace: WorkspaceData,
+    initial_board: BoardData,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    workspace_tombstones: RwSignal<Vec<Tombstone>>,
+    next_space_id: RwSignal<u64>,
+    next_id: RwSignal<u64>,
+    selection: RwSignal<Vec<u64>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+    pan: RwSignal<(f64, f64)>,
+    zoom: RwSignal<f64>,
+    storage_hydrated: RwSignal<bool>,
+) {
+    spawn_local(async move {
+        if let Ok(value) = JsFuture::from(indexed_db_load_workspace()).await {
+            if let Some(imported) = parse_indexed_db_value(value)
+            {
+                let local_changed = spaces.get_untracked() != initial_workspace.spaces
+                    || active_space_id.get_untracked() != initial_workspace.active_space_id
+                    || notes.get_untracked() != initial_board.notes
+                    || groups.get_untracked() != initial_board.groups;
+                if !local_changed
+                    && let Some(imported_space) = imported
+                        .spaces
+                        .iter()
+                        .find(|space| space.id == imported.active_space_id)
+                {
+                    let imported_board = imported_space.board.clone();
+                    let imported_view = load_view(imported.active_space_id);
+                    spaces.set(imported.spaces);
+                    active_space_id.set(imported.active_space_id);
+                    workspace_tombstones.set(imported.tombstones);
+                    next_space_id.set(
+                        spaces
+                            .get_untracked()
+                            .iter()
+                            .map(|space| space.id)
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_add(1),
+                    );
+                    next_id.set(next_note_id(&imported_board));
+                    notes.set(imported_board.notes);
+                    groups.set(imported_board.groups);
+                    selection.set(Vec::new());
+                    history.set(History::default());
+                    editing.set(None);
+                    edit_snapshot.set(None);
+                    pan.set(imported_view.pan);
+                    zoom.set(imported_view.zoom);
+                }
+            }
+        }
+        storage_hydrated.set(true);
+    });
+}
+
+fn load_workspace() -> WorkspaceData {
+    let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
+    let workspace = storage
+        .as_ref()
+        .and_then(|storage| storage.get_item(LEGACY_WORKSPACE_STORAGE_KEY).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<WorkspaceData>(&raw).ok())
+        .filter(|workspace| !workspace.spaces.is_empty())
+        .unwrap_or_else(|| WorkspaceData {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            device_id: load_device_id(),
+            tombstones: Vec::new(),
+            spaces: vec![Space {
+                id: 1,
+                name: "my space".into(),
+                archived: false,
+                created_at: now_millis(),
+                updated_at: now_millis(),
+                deleted_at: None,
+                board: load_board(),
+            }],
+            active_space_id: 1,
+        });
+    normalize_workspace(workspace)
+}
+
+fn save_workspace(
+    workspace: &WorkspaceData,
+    storage_status: Option<RwSignal<StorageStatus>>,
+) -> bool {
+    let workspace = normalize_workspace(workspace.clone());
+    if let Ok(raw) = serde_json::to_string(&workspace) {
+        queue_indexed_db_save(raw, storage_status);
+        true
+    } else {
+        false
     }
+}
+
+fn write_workspace_exact(
+    workspace: &WorkspaceData,
+    storage_status: Option<RwSignal<StorageStatus>>,
+) -> bool {
+    let workspace = normalize_workspace(workspace.clone());
+    let Ok(raw) = serde_json::to_string(&workspace) else {
+        return false;
+    };
+    queue_indexed_db_save(raw, storage_status);
+    true
+}
+
+fn queue_indexed_db_save(raw: String, storage_status: Option<RwSignal<StorageStatus>>) {
+    spawn_local(async move {
+        let saved = JsFuture::from(indexed_db_save_workspace(&raw)).await.is_ok();
+        if let Some(storage_status) = storage_status {
+            storage_status.set(if saved {
+                StorageStatus::Saved
+            } else {
+                StorageStatus::Error
+            });
+        }
+        if saved {
+            if let Some(storage) =
+                web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+            {
+                let _ = storage.remove_item(LEGACY_WORKSPACE_STORAGE_KEY);
+            }
+        }
+    });
+}
+
+fn note_content_changed(before: &Note, after: &Note) -> bool {
+    before.id != after.id
+        || before.text != after.text
+        || before.color != after.color
+        || before.status != after.status
+        || before.due_date != after.due_date
+        || before.x != after.x
+        || before.y != after.y
+        || before.rotation != after.rotation
+        || before.group_id != after.group_id
+        || before.deleted_at != after.deleted_at
+}
+
+fn group_content_changed(before: &Group, after: &Group) -> bool {
+    before.id != after.id
+        || before.label != after.label
+        || before.origin != after.origin
+        || before.size != after.size
+        || before.deleted_at != after.deleted_at
 }
 
 fn persist_space_board(
     spaces: RwSignal<Vec<Space>>,
     active_space_id: u64,
     board: BoardData,
-) {
+    workspace_tombstones: RwSignal<Vec<Tombstone>>,
+    storage_status: RwSignal<StorageStatus>,
+) -> bool {
+    let mut board = board;
+    let now = now_millis();
     spaces.update(|items| {
         if let Some(space) = items.iter_mut().find(|space| space.id == active_space_id) {
+            let previous = space.board.clone();
+            board.tombstones = previous.tombstones.clone();
+            board.tombstones.retain(|tombstone| match tombstone.kind {
+                TombstoneKind::Note => board.notes.iter().all(|note| note.id != tombstone.id),
+                TombstoneKind::Group => board.groups.iter().all(|group| group.id != tombstone.id),
+                TombstoneKind::Space => false,
+            });
+            for old_note in &previous.notes {
+                if board.notes.iter().all(|note| note.id != old_note.id)
+                    && board.tombstones.iter().all(|tombstone| {
+                        tombstone.kind != TombstoneKind::Note || tombstone.id != old_note.id
+                    })
+                {
+                    board.tombstones.push(Tombstone {
+                        kind: TombstoneKind::Note,
+                        id: old_note.id,
+                        deleted_at: now,
+                    });
+                }
+            }
+            for old_group in &previous.groups {
+                if board.groups.iter().all(|group| group.id != old_group.id)
+                    && board.tombstones.iter().all(|tombstone| {
+                        tombstone.kind != TombstoneKind::Group || tombstone.id != old_group.id
+                    })
+                {
+                    board.tombstones.push(Tombstone {
+                        kind: TombstoneKind::Group,
+                        id: old_group.id,
+                        deleted_at: now,
+                    });
+                }
+            }
+            for note in &mut board.notes {
+                if note.created_at == 0 {
+                    note.created_at = now;
+                }
+                if previous
+                    .notes
+                    .iter()
+                    .find(|old| old.id == note.id)
+                    .is_none_or(|old| note_content_changed(old, note))
+                {
+                    note.updated_at = now;
+                }
+            }
+            for group in &mut board.groups {
+                if group.created_at == 0 {
+                    group.created_at = now;
+                }
+                if previous
+                    .groups
+                    .iter()
+                    .find(|old| old.id == group.id)
+                    .is_none_or(|old| group_content_changed(old, group))
+                {
+                    group.updated_at = now;
+                }
+            }
+            if previous != board {
+                space.updated_at = now;
+            }
             space.board = board;
         }
     });
-    save_workspace(&WorkspaceData {
-        spaces: spaces.get_untracked(),
-        active_space_id,
-    });
+    save_workspace(
+        &workspace_snapshot(
+            spaces.get_untracked(),
+            active_space_id,
+            workspace_tombstones.get_untracked(),
+        ),
+        Some(storage_status),
+    )
 }
 
 fn next_note_id(board: &BoardData) -> u64 {
@@ -480,8 +797,10 @@ fn normalize_space_name(value: &str) -> String {
 
 fn board_snapshot(notes: RwSignal<Vec<Note>>, groups: RwSignal<Vec<Group>>) -> BoardData {
     BoardData {
+        schema_version: CURRENT_SCHEMA_VERSION,
         notes: notes.get_untracked(),
         groups: groups.get_untracked(),
+        tombstones: Vec::new(),
     }
 }
 
@@ -664,9 +983,25 @@ struct SpaceActions {
     restore_message: RwSignal<Option<String>>,
     space_menu_open: RwSignal<bool>,
     pending_delete_space: RwSignal<Option<u64>>,
+    workspace_tombstones: RwSignal<Vec<Tombstone>>,
+    storage_status: RwSignal<StorageStatus>,
 }
 
 impl SpaceActions {
+    fn save_workspace(self, active_space_id: u64) {
+        self.storage_status.set(StorageStatus::Saving);
+        let saved = save_workspace(&workspace_snapshot(
+            self.spaces.get_untracked(),
+            active_space_id,
+            self.workspace_tombstones.get_untracked(),
+        ), Some(self.storage_status));
+        self.storage_status.set(if saved {
+            StorageStatus::Saved
+        } else {
+            StorageStatus::Error
+        });
+    }
+
     fn create(self, next_space_id: RwSignal<u64>) {
         commit_pending_edit(
             self.notes,
@@ -686,6 +1021,8 @@ impl SpaceActions {
             self.spaces,
             self.active_space_id.get_untracked(),
             board_snapshot(self.notes, self.groups),
+            self.workspace_tombstones,
+            self.storage_status,
         );
         let space_id = next_space_id.get_untracked();
         next_space_id.update(|next| *next = next.saturating_add(1));
@@ -694,14 +1031,14 @@ impl SpaceActions {
                 id: space_id,
                 name: "new space".into(),
                 archived: false,
+                created_at: now_millis(),
+                updated_at: now_millis(),
+                deleted_at: None,
                 board: empty_board(),
             });
         });
         self.switch(space_id);
-        save_workspace(&WorkspaceData {
-            spaces: self.spaces.get_untracked(),
-            active_space_id: space_id,
-        });
+        self.save_workspace(space_id);
         self.space_menu_open.set(false);
     }
 
@@ -754,10 +1091,13 @@ impl SpaceActions {
             self.spaces,
             current_id,
             board_snapshot(self.notes, self.groups),
+            self.workspace_tombstones,
+            self.storage_status,
         );
         self.spaces.update(|items| {
             if let Some(space) = items.iter_mut().find(|space| space.id == current_id) {
                 space.archived = true;
+                space.updated_at = now_millis();
             }
         });
         if let Some(next_space_id) = self
@@ -768,10 +1108,7 @@ impl SpaceActions {
             .map(|space| space.id)
         {
             self.switch(next_space_id);
-            save_workspace(&WorkspaceData {
-                spaces: self.spaces.get_untracked(),
-                active_space_id: next_space_id,
-            });
+            self.save_workspace(next_space_id);
         }
         self.space_menu_open.set(false);
     }
@@ -799,6 +1136,8 @@ impl SpaceActions {
             self.spaces,
             self.active_space_id.get_untracked(),
             board_snapshot(self.notes, self.groups),
+            self.workspace_tombstones,
+            self.storage_status,
         );
         if activate_space(
             space_id,
@@ -822,16 +1161,19 @@ impl SpaceActions {
     }
 
     fn restore(self, space_id: u64) {
+        self.workspace_tombstones.update(|items| {
+            items.retain(|tombstone| {
+                tombstone.kind != TombstoneKind::Space || tombstone.id != space_id
+            });
+        });
         self.spaces.update(|items| {
             if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
                 space.archived = false;
+                space.updated_at = now_millis();
             }
         });
         self.pending_delete_space.set(None);
-        save_workspace(&WorkspaceData {
-            spaces: self.spaces.get_untracked(),
-            active_space_id: self.active_space_id.get_untracked(),
-        });
+        self.save_workspace(self.active_space_id.get_untracked());
     }
 
     fn save_name(self, rename_space_id: RwSignal<Option<u64>>, rename_value: RwSignal<String>) {
@@ -842,12 +1184,10 @@ impl SpaceActions {
         self.spaces.update(|items| {
             if let Some(space) = items.iter_mut().find(|space| space.id == id) {
                 space.name = name;
+                space.updated_at = now_millis();
             }
         });
-        save_workspace(&WorkspaceData {
-            spaces: self.spaces.get_untracked(),
-            active_space_id: self.active_space_id.get_untracked(),
-        });
+        self.save_workspace(self.active_space_id.get_untracked());
         rename_space_id.set(None);
     }
 
@@ -892,9 +1232,27 @@ impl SpaceActions {
                 self.group_editing,
                 self.group_edit_snapshot,
             );
-            persist_space_board(self.spaces, current_id, board_snapshot(self.notes, self.groups));
+            persist_space_board(
+                self.spaces,
+                current_id,
+                board_snapshot(self.notes, self.groups),
+                self.workspace_tombstones,
+                self.storage_status,
+            );
         }
-        self.spaces.update(|items| items.retain(|space| space.id != space_id));
+        self.workspace_tombstones.update(|items| {
+            if items.iter().all(|tombstone| {
+                tombstone.kind != TombstoneKind::Space || tombstone.id != space_id
+            }) {
+                items.push(Tombstone {
+                    kind: TombstoneKind::Space,
+                    id: space_id,
+                    deleted_at: now_millis(),
+                });
+            }
+        });
+        self.spaces
+            .update(|items| items.retain(|space| space.id != space_id));
         if space_id == current_id {
             if let Some(next_space_id) = self
                 .spaces
@@ -904,16 +1262,10 @@ impl SpaceActions {
                 .map(|space| space.id)
             {
                 self.switch(next_space_id);
-                save_workspace(&WorkspaceData {
-                    spaces: self.spaces.get_untracked(),
-                    active_space_id: next_space_id,
-                });
+                self.save_workspace(next_space_id);
             }
         } else {
-            save_workspace(&WorkspaceData {
-                spaces: self.spaces.get_untracked(),
-                active_space_id: current_id,
-            });
+            self.save_workspace(current_id);
         }
         self.pending_delete_space.set(None);
         self.space_menu_open.set(false);
@@ -970,6 +1322,9 @@ impl BoardActions {
                     _ => 1,
                 },
                 group_id: None,
+                created_at: now_millis(),
+                updated_at: now_millis(),
+                deleted_at: None,
             });
         });
         self.edit_snapshot
@@ -1176,15 +1531,32 @@ impl BoardActions {
     }
 }
 
-fn export_board(notes: &[Note], groups: &[Group]) {
-    let Ok(raw) = serde_json::to_string_pretty(&BoardData {
-        notes: notes.to_vec(),
-        groups: groups.to_vec(),
-    }) else {
-        return;
-    };
+fn workspace_with_current_board(
+    spaces: Vec<Space>,
+    active_space_id: u64,
+    notes: &[Note],
+    groups: &[Group],
+    tombstones: &[Tombstone],
+) -> WorkspaceData {
+    let mut workspace = workspace_snapshot(spaces, active_space_id, tombstones.to_vec());
+    if let Some(space) = workspace
+        .spaces
+        .iter_mut()
+        .find(|space| space.id == active_space_id)
+    {
+        space.board = BoardData {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            notes: notes.to_vec(),
+            groups: groups.to_vec(),
+            tombstones: space.board.tombstones.clone(),
+        };
+    }
+    workspace
+}
+
+fn download_json(raw: &str, filename: &str) {
     let parts = Array::new();
-    parts.push(&JsValue::from_str(&raw));
+    parts.push(&JsValue::from_str(raw));
     let Ok(blob) = Blob::new_with_str_sequence(&parts) else {
         return;
     };
@@ -1201,9 +1573,16 @@ fn export_board(notes: &[Note], groups: &[Group]) {
         return;
     };
     anchor.set_href(&url);
-    anchor.set_download("task-space-board.json");
+    anchor.set_download(filename);
     anchor.click();
     let _ = Url::revoke_object_url(&url);
+}
+
+fn export_workspace(workspace: &WorkspaceData) {
+    let Ok(raw) = serde_json::to_string_pretty(workspace) else {
+        return;
+    };
+    download_json(&raw, "task-space-workspace.json");
 }
 
 fn board_position(
@@ -1550,6 +1929,9 @@ fn create_group(
             label: "new group".into(),
             origin: None,
             size: None,
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            deleted_at: None,
         })
     });
     notes.update(|items| {
@@ -2355,8 +2737,8 @@ fn NoteCard(
                     "left:{}px;top:{}px;background-color:{};color:{};transform:rotate({}deg) {}",
                     note.x,
                     note.y,
-                    note.color.background(),
-                    note.color.ink(),
+                    note_color_background(note.color),
+                    note_color_ink(note.color),
                     note.rotation,
                     if dragged.get() == Some(id) { "scale(1.02)" } else { "scale(1)" }
                 )
@@ -2631,7 +3013,7 @@ fn NoteCard(
                                 aria-label="Change note colour"
                                 title="Change note colour"
                                 style=move || note_snapshot(notes, id)
-                                    .map(|note| format!("background-color:{}", note.color.background()))
+                                    .map(|note| format!("background-color:{}", note_color_background(note.color)))
                                     .unwrap_or_default()
                                 class="h-3 w-3 rounded-full border border-current/30 opacity-75 hover:scale-110 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30"
                             ></button>
@@ -2657,6 +3039,7 @@ fn NoteCard(
 #[component]
 pub fn Board() -> impl IntoView {
     let initial_workspace = load_workspace();
+    let initial_workspace_for_hydration = initial_workspace.clone();
     let initial_space_id = initial_workspace.active_space_id;
     let initial_board = initial_workspace
         .spaces
@@ -2664,8 +3047,10 @@ pub fn Board() -> impl IntoView {
         .find(|space| space.id == initial_space_id)
         .map(|space| space.board.clone())
         .unwrap_or_else(empty_board);
+    let initial_board_for_hydration = initial_board.clone();
     let initial_next_id = next_note_id(&initial_board);
     let spaces = RwSignal::new(initial_workspace.spaces);
+    let workspace_tombstones = RwSignal::new(initial_workspace.tombstones);
     let active_space_id = RwSignal::new(initial_space_id);
     let notes = RwSignal::new(initial_board.notes);
     let groups = RwSignal::new(initial_board.groups);
@@ -2702,6 +3087,8 @@ pub fn Board() -> impl IntoView {
     let pending_delete_space = RwSignal::new(None::<u64>);
     let context_menu = RwSignal::new(None::<ContextMenuState>);
     let due_date_request = RwSignal::new(None::<u64>);
+    let storage_status = RwSignal::new(StorageStatus::Saving);
+    let storage_hydrated = RwSignal::new(false);
     let next_space_id = RwSignal::new(
         spaces
             .get_untracked()
@@ -2712,6 +3099,26 @@ pub fn Board() -> impl IntoView {
             .saturating_add(1),
     );
     let next_id = RwSignal::new(initial_next_id);
+
+    hydrate_workspace_from_indexed_db(
+        initial_workspace_for_hydration,
+        initial_board_for_hydration,
+        spaces,
+        active_space_id,
+        notes,
+        groups,
+        workspace_tombstones,
+        next_space_id,
+        next_id,
+        selection,
+        history,
+        editing,
+        edit_snapshot,
+        pan,
+        zoom,
+        storage_hydrated,
+    );
+
     let board_actions = BoardActions {
         notes,
         groups,
@@ -2729,10 +3136,27 @@ pub fn Board() -> impl IntoView {
     };
 
     Effect::new(move |_| {
+        if !storage_hydrated.get() {
+            return;
+        }
         let active_id = active_space_id.get();
-        persist_space_board(spaces, active_id, BoardData {
-            notes: notes.get(),
-            groups: groups.get(),
+        storage_status.set(StorageStatus::Saving);
+        let saved = persist_space_board(
+            spaces,
+            active_id,
+            BoardData {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                notes: notes.get(),
+                groups: groups.get(),
+                tombstones: Vec::new(),
+            },
+            workspace_tombstones,
+            storage_status,
+        );
+        storage_status.set(if saved {
+            StorageStatus::Saved
+        } else {
+            StorageStatus::Error
         });
     });
 
@@ -2884,6 +3308,8 @@ pub fn Board() -> impl IntoView {
         restore_message,
         space_menu_open,
         pending_delete_space,
+        workspace_tombstones,
+        storage_status,
     };
 
     let create_space = move |_| space_actions.create(next_space_id);
@@ -2939,18 +3365,81 @@ pub fn Board() -> impl IntoView {
                 .result()
                 .ok()
                 .and_then(|value| value.as_string());
-            match result.and_then(|raw| parse_board(&raw)) {
-                Some(restored) => {
-                    let before = board_snapshot(notes, groups);
-                    next_id.set(next_note_id(&restored));
-                    notes.set(restored.notes);
-                    groups.set(restored.groups);
-                    record_snapshot(notes, groups, history, before);
-                    edit_snapshot.set(None);
-                    editing.set(None);
-                    restore_message.set(Some("board restored".into()));
+            let Some(raw) = result else {
+                restore_message.set(Some("couldn't read that file".into()));
+                return;
+            };
+
+            if let Some(mut imported) = parse_workspace(&raw) {
+                let confirmed = web_sys::window()
+                    .and_then(|window| window.confirm_with_message(
+                        "Replace the spaces on this device with the imported workspace?",
+                    ).ok())
+                    .unwrap_or(false);
+                if !confirmed {
+                    restore_message.set(Some("restore cancelled".into()));
+                    return;
                 }
-                None => restore_message.set(Some("that file is not a Task Space board".into())),
+                imported.device_id = load_device_id();
+                imported = normalize_workspace(imported);
+                let imported_space_id = imported.active_space_id;
+                let imported_device_id = imported.device_id.clone();
+                let imported_tombstones = imported.tombstones.clone();
+                let Some(imported_space) = imported
+                    .spaces
+                    .iter()
+                    .find(|space| space.id == imported_space_id)
+                else {
+                    restore_message.set(Some("that workspace has no active space".into()));
+                    return;
+                };
+                let imported_board = imported_space.board.clone();
+                let imported_view = load_view(imported_space_id);
+                let imported_next_space_id = imported
+                    .spaces
+                    .iter()
+                    .map(|space| space.id)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                spaces.set(imported.spaces);
+                active_space_id.set(imported_space_id);
+                workspace_tombstones.set(imported_tombstones.clone());
+                next_space_id.set(imported_next_space_id);
+                next_id.set(next_note_id(&imported_board));
+                notes.set(imported_board.notes);
+                groups.set(imported_board.groups);
+                selection.set(Vec::new());
+                history.set(History::default());
+                editing.set(None);
+                edit_snapshot.set(None);
+                pan.set(imported_view.pan);
+                zoom.set(imported_view.zoom);
+                storage_status.set(StorageStatus::Saving);
+                let saved = write_workspace_exact(&WorkspaceData {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    device_id: imported_device_id,
+                    tombstones: imported_tombstones,
+                    spaces: spaces.get_untracked(),
+                    active_space_id: imported_space_id,
+                }, Some(storage_status));
+                storage_status.set(if saved {
+                    StorageStatus::Saved
+                } else {
+                    StorageStatus::Error
+                });
+                restore_message.set(Some("workspace restored".into()));
+            } else if let Some(restored) = parse_board(&raw) {
+                let before = board_snapshot(notes, groups);
+                next_id.set(next_note_id(&restored));
+                notes.set(restored.notes);
+                groups.set(restored.groups);
+                record_snapshot(notes, groups, history, before);
+                edit_snapshot.set(None);
+                editing.set(None);
+                restore_message.set(Some("board restored into current space".into()));
+            } else {
+                restore_message.set(Some("that file is not a Task Space backup".into()));
             }
         }) as Box<dyn FnMut(_)>);
         reader.set_onload(Some(onload.as_ref().unchecked_ref()));
@@ -3207,7 +3696,7 @@ pub fn Board() -> impl IntoView {
                                 }}
                                 <div class="my-1 border-t border-ink-soft/15"></div>
                                 <button type="button" role="menuitem" on:click=move |_| { board_actions.reset_view(); context_menu.set(None); } class="context-menu-item">"reset view"</button>
-                                <button type="button" role="menuitem" on:click=move |_| { export_board(&notes.get_untracked(), &groups.get_untracked()); context_menu.set(None); } class="context-menu-item">"export board"</button>
+                                <button type="button" role="menuitem" on:click=move |_| { export_workspace(&workspace_with_current_board(spaces.get_untracked(), active_space_id.get_untracked(), &notes.get_untracked(), &groups.get_untracked(), &workspace_tombstones.get_untracked())); context_menu.set(None); } class="context-menu-item">"export workspace"</button>
                             </div>
                         </div>
                     }.into_any(),
@@ -3614,14 +4103,14 @@ pub fn Board() -> impl IntoView {
                     <button
                         type="button"
                         on:click=move |_| {
-                            export_board(&notes.get_untracked(), &groups.get_untracked())
+                            export_workspace(&workspace_with_current_board(spaces.get_untracked(), active_space_id.get_untracked(), &notes.get_untracked(), &groups.get_untracked(), &workspace_tombstones.get_untracked()))
                         }
                         class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30 sm:px-3"
                     >
                         "export"
                     </button>
                     <label class="cursor-pointer rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus-within:ring-2 focus-within:ring-ink/30 sm:px-3">
-                        "restore"
+                        "restore workspace"
                         <input type="file" accept="application/json,.json" class="sr-only" on:change=restore_file/>
                     </label>
                 </div>
@@ -3658,8 +4147,17 @@ pub fn Board() -> impl IntoView {
                     {move || restore_message.get().map(|message| view! {
                         <span class="rounded-[3px] bg-note-green px-2.5 py-1.5 text-note-ink-green shadow-sm">{message}</span>
                     })}
-                    <span class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
-                        "saved on this device"
+                    <span
+                        class=move || match storage_status.get() {
+                            StorageStatus::Error => "rounded-[3px] border border-note-ink-pink/30 bg-note-pink px-2.5 py-1.5 text-note-ink-pink shadow-sm backdrop-blur-sm",
+                            _ => "rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm",
+                        }
+                    >
+                        {move || match storage_status.get() {
+                            StorageStatus::Saved => "saved on this device",
+                            StorageStatus::Saving => "saving locally…",
+                            StorageStatus::Error => "couldn't save locally",
+                        }}
                     </span>
                 </div>
             </div>
@@ -3705,8 +4203,10 @@ mod tests {
                 y: 0.0,
                 rotation: 0,
                 group_id: None,
+                ..Default::default()
             }],
             groups: Vec::new(),
+            ..Default::default()
         };
         let raw = serde_json::to_string(&board).expect("board should serialize");
         let restored = parse_board(&raw).expect("board should deserialize");
@@ -3733,11 +4233,17 @@ mod tests {
                         y: 24.0,
                         rotation: -1,
                         group_id: None,
+                        ..Default::default()
                     }],
                     groups: Vec::new(),
+                    ..Default::default()
                 },
+                ..Default::default()
             }],
             active_space_id: 7,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            device_id: "test-device".into(),
+            tombstones: Vec::new(),
         };
 
         let raw = serde_json::to_string(&workspace).expect("workspace should serialize");
@@ -3754,6 +4260,7 @@ mod tests {
             label: "Work".into(),
             origin: Some((0.0, 0.0)),
             size: Some((488.0, 276.0)),
+            ..Default::default()
         };
         let notes = vec![
             Note {
@@ -3766,6 +4273,7 @@ mod tests {
                 y: 52.0,
                 rotation: 0,
                 group_id: Some(1),
+                ..Default::default()
             },
             Note {
                 id: 2,
@@ -3777,6 +4285,7 @@ mod tests {
                 y: 900.0,
                 rotation: 0,
                 group_id: None,
+                ..Default::default()
             },
         ];
 
@@ -3792,6 +4301,7 @@ mod tests {
             label: "Work".into(),
             origin: Some((0.0, 0.0)),
             size: Some((256.0, 276.0)),
+            ..Default::default()
         };
         let notes = vec![Note {
             id: 1,
@@ -3803,6 +4313,7 @@ mod tests {
             y: 52.0,
             rotation: 0,
             group_id: Some(1),
+            ..Default::default()
         }];
 
         assert!(positions_for_group(&group, &notes, &[1]).is_empty());
@@ -3822,6 +4333,7 @@ mod tests {
             label: "Work".into(),
             origin: Some((100.0, 120.0)),
             size: None,
+            ..Default::default()
         };
         let notes = vec![
             Note {
@@ -3834,6 +4346,7 @@ mod tests {
                 y: 172.0,
                 rotation: 0,
                 group_id: Some(1),
+                ..Default::default()
             },
             Note {
                 id: 2,
@@ -3845,6 +4358,7 @@ mod tests {
                 y: 0.0,
                 rotation: 0,
                 group_id: None,
+                ..Default::default()
             },
         ];
 
