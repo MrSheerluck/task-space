@@ -13,7 +13,7 @@ const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
-const NOTE_WIDTH: f64 = 176.0;
+const NOTE_WIDTH: f64 = 208.0;
 const NOTE_HEIGHT: f64 = 200.0;
 const HORIZONTAL_PADDING: f64 = 24.0;
 const TOP_PADDING: f64 = 52.0;
@@ -26,12 +26,171 @@ struct Note {
     id: u64,
     text: String,
     color: NoteColor,
-    done: bool,
+    #[serde(default)]
+    status: NoteStatus,
+    #[serde(default)]
+    due_date: Option<String>,
     x: f64,
     y: f64,
     rotation: i8,
     #[serde(default)]
     group_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+enum NoteStatus {
+    #[default]
+    Todo,
+    InProgress,
+    Done,
+}
+
+impl NoteStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Todo => "to do",
+            Self::InProgress => "in progress",
+            Self::Done => "done",
+        }
+    }
+
+    fn mark(self) -> &'static str {
+        match self {
+            Self::Todo => "○",
+            Self::InProgress => "◐",
+            Self::Done => "✓",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Todo => Self::InProgress,
+            Self::InProgress => Self::Done,
+            Self::Done => Self::Todo,
+        }
+    }
+}
+
+fn due_date_label(due_date: Option<&str>, overdue: bool) -> String {
+    let Some(date) = due_date else {
+        return "add due".into();
+    };
+    let mut parts = date.split('-');
+    let (Some(_year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return date.into();
+    };
+    let month = match month {
+        "01" => "Jan",
+        "02" => "Feb",
+        "03" => "Mar",
+        "04" => "Apr",
+        "05" => "May",
+        "06" => "Jun",
+        "07" => "Jul",
+        "08" => "Aug",
+        "09" => "Sep",
+        "10" => "Oct",
+        "11" => "Nov",
+        "12" => "Dec",
+        _ => return date.into(),
+    };
+    if overdue {
+        format!("overdue · {month} {day}")
+    } else {
+        format!("due {month} {day}")
+    }
+}
+
+fn today_date() -> String {
+    let today = js_sys::Date::new_0();
+    format!(
+        "{:04}-{:02}-{:02}",
+        today.get_full_year(),
+        today.get_month() + 1,
+        today.get_date()
+    )
+}
+
+fn is_overdue(due_date: Option<&str>, status: NoteStatus) -> bool {
+    status != NoteStatus::Done
+        && due_date.is_some_and(|date| {
+            parse_due_date(date).is_some() && date < today_date().as_str()
+        })
+}
+
+fn parse_due_date(due_date: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = due_date.split('-');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn first_weekday(year: i32, month: u32) -> u32 {
+    // Sakamoto's algorithm; Sunday is zero, matching the calendar headings.
+    let month_offsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let adjusted_year = year - i32::from(month < 3);
+    ((adjusted_year + adjusted_year / 4 - adjusted_year / 100
+        + adjusted_year / 400
+        + month_offsets[(month - 1) as usize]
+        + 1)
+        % 7) as u32
+}
+
+fn calendar_days(year: i32, month: u32) -> Vec<Option<u32>> {
+    let mut days = vec![None; first_weekday(year, month) as usize];
+    days.extend((1..=days_in_month(year, month)).map(Some));
+    days
+}
+
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "Month",
+    }
+}
+
+fn shift_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let index = year * 12 + month as i32 - 1 + delta;
+    (index.div_euclid(12), index.rem_euclid(12) as u32 + 1)
+}
+
+fn set_note_due_date(
+    id: u64,
+    due_date: Option<String>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    history: RwSignal<History>,
+    editing: RwSignal<Option<u64>>,
+    edit_snapshot: RwSignal<Option<(u64, BoardData)>>,
+) {
+    commit_pending_edit(notes, groups, history, editing, edit_snapshot);
+    mutate_notes(notes, groups, history, |items| {
+        if let Some(note) = items.iter_mut().find(|note| note.id == id) {
+            note.due_date = due_date;
+        }
+    });
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -117,7 +276,42 @@ fn viewport_note_position(pan: (f64, f64), zoom: f64) -> (f64, f64) {
     // next note at the camera centre, with a small adjustment to centre the
     // card itself in the viewport.
     let zoom = zoom.max(0.01);
-    (-pan.0 / zoom - 88.0 / zoom, -pan.1 / zoom - 80.0 / zoom)
+    (
+        -pan.0 / zoom - NOTE_WIDTH / 2.0 / zoom,
+        -pan.1 / zoom - NOTE_HEIGHT / 2.0 / zoom,
+    )
+}
+
+fn parse_board(raw: &str) -> Option<BoardData> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let mut board = serde_json::from_value::<BoardData>(value.clone())
+        .ok()
+        .or_else(|| {
+            serde_json::from_value::<Vec<Note>>(value.clone())
+                .ok()
+                .map(|notes| BoardData {
+                    notes,
+                    groups: Vec::new(),
+                })
+        })?;
+
+    // v2 stored a boolean `done` field. Preserve completed notes when loading
+    // that format while new saves use the three-state status field.
+    let saved_notes = value
+        .get("notes")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    if let Some(saved_notes) = saved_notes {
+        for (note, saved) in board.notes.iter_mut().zip(saved_notes) {
+            if saved.get("status").is_none()
+                && saved.get("done").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                note.status = NoteStatus::Done;
+            }
+        }
+    }
+
+    Some(board)
 }
 
 fn load_board() -> BoardData {
@@ -125,33 +319,21 @@ fn load_board() -> BoardData {
     let current = storage
         .as_ref()
         .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
-        .and_then(|raw| {
-            serde_json::from_str::<BoardData>(&raw).ok().or_else(|| {
-                serde_json::from_str::<Vec<Note>>(&raw)
-                    .ok()
-                    .map(|notes| BoardData {
-                        notes,
-                        groups: Vec::new(),
-                    })
-            })
-        });
+        .and_then(|raw| parse_board(&raw));
     let mut board = current
         .or_else(|| {
             storage
                 .as_ref()
                 .and_then(|storage| storage.get_item(LEGACY_STORAGE_KEY).ok().flatten())
-                .and_then(|raw| serde_json::from_str::<Vec<Note>>(&raw).ok())
-                .map(|mut notes| {
+                .and_then(|raw| parse_board(&raw))
+                .map(|mut board| {
                     // v1 stored positions as percentages. Put those notes around
                     // the new canvas origin during the one-time migration.
-                    for note in &mut notes {
+                    for note in &mut board.notes {
                         note.x = note.x * 10.0 - 500.0;
                         note.y = note.y * 8.0 - 400.0;
                     }
-                    BoardData {
-                        notes,
-                        groups: Vec::new(),
-                    }
+                    board
                 })
         })
         .unwrap_or(BoardData {
@@ -541,8 +723,8 @@ fn notes_in_marquee(
         .filter_map(|note| {
             let note_left = rect.left() + rect.width() / 2.0 + pan.0 + note.x * zoom;
             let note_top = rect.top() + rect.height() / 2.0 + pan.1 + note.y * zoom;
-            let note_right = note_left + 176.0 * zoom;
-            let note_bottom = note_top + 200.0 * zoom;
+            let note_right = note_left + NOTE_WIDTH * zoom;
+            let note_bottom = note_top + NOTE_HEIGHT * zoom;
             if note_left < right && note_right > left && note_top < bottom && note_bottom > top {
                 Some(note.id)
             } else {
@@ -1053,7 +1235,7 @@ fn GroupFrame(
                                     commit_pending_group_edit(notes, groups, history, editing, edit_snapshot);
                                 }
                             }
-                            class="pointer-events-auto absolute -top-4 left-3 w-44 rounded-[3px] border border-ink-soft/25 bg-marker px-2 py-1 font-handwriting text-lg leading-none text-ink outline-none focus:ring-2 focus:ring-ink/30"
+                            class="pointer-events-auto absolute -top-4 left-3 w-52 rounded-[3px] border border-ink-soft/25 bg-marker px-2 py-1 font-handwriting text-lg leading-none text-ink outline-none focus:ring-2 focus:ring-ink/30"
                         />
                     }.into_any()
                 } else {
@@ -1091,14 +1273,60 @@ fn NoteCard(
     pan: RwSignal<(f64, f64)>,
     zoom: RwSignal<f64>,
 ) -> impl IntoView {
-    let toggle_done = move |ev: MouseEvent| {
+    let due_calendar_open = RwSignal::new(false);
+    let initial_calendar_month = note_snapshot(notes, id)
+        .and_then(|note| note.due_date)
+        .and_then(|date| parse_due_date(&date))
+        .map(|(year, month, _)| (year, month))
+        .unwrap_or_else(|| {
+            let today = js_sys::Date::new_0();
+            (today.get_full_year() as i32, today.get_month() + 1)
+        });
+    let calendar_month = RwSignal::new(initial_calendar_month);
+
+    let cycle_status = move |ev: MouseEvent| {
         ev.stop_propagation();
         commit_pending_edit(notes, groups, history, editing, edit_snapshot);
         mutate_notes(notes, groups, history, |items| {
             if let Some(note) = items.iter_mut().find(|note| note.id == id) {
-                note.done = !note.done;
+                note.status = note.status.next();
             }
         });
+    };
+    let clear_due_date = move |ev: MouseEvent| {
+        ev.stop_propagation();
+        set_note_due_date(
+            id,
+            None,
+            notes,
+            groups,
+            history,
+            editing,
+            edit_snapshot,
+        );
+        due_calendar_open.set(false);
+    };
+    let toggle_due_calendar = move |ev: MouseEvent| {
+        ev.stop_propagation();
+        if !due_calendar_open.get_untracked() {
+            if let Some((year, month, _)) = note_snapshot(notes, id)
+                .and_then(|note| note.due_date)
+                .and_then(|date| parse_due_date(&date))
+            {
+                calendar_month.set((year, month));
+            }
+        }
+        due_calendar_open.update(|open| *open = !*open);
+    };
+    let previous_month = move |ev: MouseEvent| {
+        ev.stop_propagation();
+        let (year, month) = calendar_month.get_untracked();
+        calendar_month.set(shift_month(year, month, -1));
+    };
+    let next_month = move |ev: MouseEvent| {
+        ev.stop_propagation();
+        let (year, month) = calendar_month.get_untracked();
+        calendar_month.set(shift_month(year, month, 1));
     };
     let cycle_color = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -1137,6 +1365,7 @@ fn NoteCard(
         {
             return;
         }
+        due_calendar_open.set(false);
         if ev.shift_key() || ev.ctrl_key() || ev.meta_key() {
             selection.update(|selected| {
                 if let Some(index) = selected.iter().position(|selected_id| *selected_id == id) {
@@ -1253,7 +1482,7 @@ fn NoteCard(
                 .get_untracked()
                 .iter()
                 .find(|note| note.id == id)
-                .map(|note| (note.x + 88.0, note.y + 100.0))
+                .map(|note| (note.x + NOTE_WIDTH / 2.0, note.y + NOTE_HEIGHT / 2.0))
                 .and_then(|center| {
                     group_at_point(
                         &groups.get_untracked(),
@@ -1288,8 +1517,8 @@ fn NoteCard(
     view! {
         <article
             class=move || format!(
-                "task-space-note absolute w-44 min-h-40 p-3 pb-9 rounded-[3px] shadow-lg select-none touch-none transition-[transform,box-shadow] duration-100 {} {}",
-                if note_snapshot(notes, id).is_some_and(|note| note.done) { "opacity-70" } else { "" },
+                "group task-space-note absolute w-52 min-h-40 p-3 pb-9 rounded-[3px] shadow-lg select-none touch-none transition-[transform,box-shadow] duration-100 {} {}",
+                if note_snapshot(notes, id).is_some_and(|note| note.status == NoteStatus::Done) { "opacity-70" } else { "" },
                 if dragged.get() == Some(id) {
                     "z-20 cursor-grabbing shadow-2xl ring-2 ring-ink/10"
                 } else if selection.get().contains(&id) {
@@ -1390,7 +1619,7 @@ fn NoteCard(
                         type="button"
                         class=move || format!(
                             "w-full text-left font-handwriting text-2xl leading-tight {}",
-                            if note_snapshot(notes, id).is_some_and(|note| note.done) {
+                            if note_snapshot(notes, id).is_some_and(|note| note.status == NoteStatus::Done) {
                                 "line-through"
                             } else {
                                 ""
@@ -1414,42 +1643,186 @@ fn NoteCard(
                 ().into_any()
             } else {
                 view! {
-                    <div class="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-2 text-[11px] font-sans">
+                    <div class="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-1 border-t border-current/10 pt-1 text-[10px] font-sans">
                         <button
                             type="button"
-                            data-note-action="toggle-done"
-                            on:click=toggle_done
-                            class="rounded-sm border border-current/30 px-1.5 py-0.5 hover:bg-white/30 focus:outline-none focus:ring-2 focus:ring-current/30"
-                            title=move || if note_snapshot(notes, id).is_some_and(|note| note.done) {
-                                "Mark task open"
-                            } else {
-                                "Complete task"
-                            }
+                            data-note-action="set-status"
+                            on:click=cycle_status
+                            aria-label=move || note_snapshot(notes, id)
+                                .map(|note| format!("Status: {}. Click to change", note.status.label()))
+                                .unwrap_or_else(|| "Status: to do. Click to change".into())
+                            title="Click to change status"
+                            class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-sm px-1 font-handwriting text-sm leading-none opacity-80 hover:bg-white/20 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30"
                         >
-                            {move || if note_snapshot(notes, id).is_some_and(|note| note.done) {
-                                "open"
-                            } else {
-                                "done"
-                            }}
+                            <span class="text-base" aria-hidden="true">
+                                {move || note_snapshot(notes, id)
+                                    .map(|note| note.status.mark())
+                                    .unwrap_or("○")}
+                            </span>
+                            <span>
+                                {move || note_snapshot(notes, id)
+                                    .map(|note| note.status.label())
+                                    .unwrap_or("to do")}
+                            </span>
                         </button>
-                        <div class="flex items-center gap-2">
+                        <div class="flex shrink-0 items-center gap-1">
+                            <div class="relative flex items-center">
+                                <button
+                                    type="button"
+                                    data-note-action="set-due-date"
+                                    on:click=toggle_due_calendar
+                                    aria-label="Choose task due date"
+                                    title=move || if note_snapshot(notes, id).is_some_and(|note| is_overdue(note.due_date.as_deref(), note.status)) {
+                                        "Overdue task — choose a new due date"
+                                    } else {
+                                        "Choose due date"
+                                    }
+                                    class=move || {
+                                        let Some(note) = note_snapshot(notes, id) else {
+                                            return "flex h-5 items-center whitespace-nowrap rounded-sm px-1 font-sans text-[10px] leading-none opacity-75".to_string();
+                                        };
+                                        if note.due_date.is_some() && is_overdue(note.due_date.as_deref(), note.status) {
+                                            "flex h-5 items-center whitespace-nowrap rounded-sm border border-note-ink-pink/40 bg-note-pink px-1 font-semibold text-note-ink-pink shadow-sm hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-note-ink-pink/40".to_string()
+                                        } else if note.due_date.is_some() {
+                                            "flex h-5 items-center whitespace-nowrap rounded-sm border border-ink/15 bg-marker px-1 font-semibold text-ink shadow-sm hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/30".to_string()
+                                        } else {
+                                            "flex h-5 items-center whitespace-nowrap rounded-sm px-1 font-sans text-[10px] leading-none opacity-75 hover:bg-white/20 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30".to_string()
+                                        }
+                                    }
+                                >
+                                    {move || note_snapshot(notes, id)
+                                        .map(|note| due_date_label(
+                                            note.due_date.as_deref(),
+                                            is_overdue(note.due_date.as_deref(), note.status),
+                                        ))
+                                        .unwrap_or_else(|| "add due".into())}
+                                </button>
+                                {move || if note_snapshot(notes, id).is_some_and(|note| note.due_date.is_some()) {
+                                    view! {
+                                        <button
+                                            type="button"
+                                            data-note-action="clear-due-date"
+                                            on:click=clear_due_date
+                                            aria-label="Clear due date"
+                                            title="Clear due date"
+                                            class="relative z-10 ml-0.5 font-sans text-xs opacity-0 transition-opacity group-hover:opacity-60 hover:!opacity-100 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30"
+                                        >
+                                            "×"
+                                        </button>
+                                    }.into_any()
+                                } else {
+                                    ().into_any()
+                                }}
+                                {move || if due_calendar_open.get() {
+                                    let (year, month) = calendar_month.get();
+                                    let selected_date = note_snapshot(notes, id)
+                                        .and_then(|note| note.due_date);
+                                    view! {
+                                        <div
+                                            class="absolute bottom-7 right-0 z-40 w-56 rounded-[4px] border border-ink/20 bg-note-yellow p-3 text-note-ink-yellow shadow-xl"
+                                            on:click=move |ev: MouseEvent| ev.stop_propagation()
+                                        >
+                                            <div class="flex items-center justify-between gap-2 border-b border-current/20 pb-2">
+                                                <button
+                                                    type="button"
+                                                    data-note-action="previous-month"
+                                                    on:click=previous_month
+                                                    aria-label="Previous month"
+                                                    class="rounded-sm px-1 font-handwriting text-xl leading-none hover:bg-white/30 focus:outline-none focus:ring-2 focus:ring-current/30"
+                                                >
+                                                    "‹"
+                                                </button>
+                                                <span class="font-handwriting text-lg leading-none">
+                                                    {format!("{} {}", month_name(month), year)}
+                                                </span>
+                                                <button
+                                                    type="button"
+                                                    data-note-action="next-month"
+                                                    on:click=next_month
+                                                    aria-label="Next month"
+                                                    class="rounded-sm px-1 font-handwriting text-xl leading-none hover:bg-white/30 focus:outline-none focus:ring-2 focus:ring-current/30"
+                                                >
+                                                    "›"
+                                                </button>
+                                            </div>
+                                            <div class="mt-2 grid grid-cols-7 gap-1 text-center font-sans text-[9px] uppercase opacity-60">
+                                                <span>"sun"</span>
+                                                <span>"mon"</span>
+                                                <span>"tue"</span>
+                                                <span>"wed"</span>
+                                                <span>"thu"</span>
+                                                <span>"fri"</span>
+                                                <span>"sat"</span>
+                                            </div>
+                                            <div class="mt-1 grid grid-cols-7 gap-1 text-center font-sans text-xs">
+                                                {calendar_days(year, month)
+                                                    .into_iter()
+                                                    .map(|day| match day {
+                                                        Some(day) => {
+                                                            let date_value = format!("{year:04}-{month:02}-{day:02}");
+                                                            let aria_label = format!("Set due date to {date_value}");
+                                                            let date_value_for_handler = date_value.clone();
+                                                            let is_selected = selected_date.as_deref() == Some(date_value.as_str());
+                                                            view! {
+                                                                <button
+                                                                    type="button"
+                                                                    data-note-action="choose-due-date"
+                                                                    on:click=move |ev: MouseEvent| {
+                                                                        ev.stop_propagation();
+                                                                        set_note_due_date(
+                                                                            id,
+                                                                            Some(date_value_for_handler.clone()),
+                                                                            notes,
+                                                                            groups,
+                                                                            history,
+                                                                            editing,
+                                                                            edit_snapshot,
+                                                                        );
+                                                                        due_calendar_open.set(false);
+                                                                    }
+                                                                    aria-label=aria_label
+                                                                    class=if is_selected {
+                                                                        "rounded-sm bg-note-ink-yellow px-1 py-1 font-semibold text-note-yellow focus:outline-none focus:ring-2 focus:ring-current/30"
+                                                                    } else {
+                                                                        "rounded-sm px-1 py-1 hover:bg-white/40 focus:bg-white/40 focus:outline-none focus:ring-2 focus:ring-current/30"
+                                                                    }
+                                                                >
+                                                                    {day}
+                                                                </button>
+                                                            }
+                                                            .into_any()
+                                                        }
+                                                        None => view! { <span class="py-1"></span> }.into_any(),
+                                                    })
+                                                    .collect_view()}
+                                            </div>
+                                        </div>
+                                    }
+                                    .into_any()
+                                } else {
+                                    ().into_any()
+                                }}
+                            </div>
                             <button
                                 type="button"
                                 data-note-action="cycle-color"
                                 on:click=cycle_color
-                                class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
+                                aria-label="Change note colour"
                                 title="Change note colour"
-                            >
-                                "colour"
-                            </button>
+                                style=move || note_snapshot(notes, id)
+                                    .map(|note| format!("background-color:{}", note.color.background()))
+                                    .unwrap_or_default()
+                                class="h-3 w-3 rounded-full border border-current/30 opacity-75 hover:scale-110 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30"
+                            ></button>
                             <button
                                 type="button"
                                 data-note-action="delete-note"
                                 on:click=delete_note
-                                class="hover:underline focus:outline-none focus:ring-2 focus:ring-current/30"
+                                aria-label="Delete task"
                                 title="Delete task"
+                                class="px-1 font-sans text-xs opacity-0 transition-opacity group-hover:opacity-60 hover:!opacity-100 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-current/30"
                             >
-                                "delete"
+                                "×"
                             </button>
                         </div>
                     </div>
@@ -1717,7 +2090,8 @@ pub fn Board() -> impl IntoView {
                     3 => NoteColor::Green,
                     _ => NoteColor::Lavender,
                 },
-                done: false,
+                status: NoteStatus::Todo,
+                due_date: None,
                 x,
                 y,
                 rotation: match id % 5 {
@@ -2110,6 +2484,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn calendar_handles_month_lengths_and_year_boundaries() {
+        assert_eq!(days_in_month(2028, 2), 29);
+        assert_eq!(days_in_month(2027, 2), 28);
+        assert_eq!(first_weekday(2026, 9), 2);
+        assert_eq!(calendar_days(2026, 9).len(), 32);
+        assert_eq!(shift_month(2026, 1, -1), (2025, 12));
+        assert_eq!(shift_month(2026, 12, 1), (2027, 1));
+    }
+
+    #[test]
+    fn legacy_done_notes_load_as_completed() {
+        let board = parse_board(
+            r#"{"notes":[{"id":1,"text":"ship it","color":"Yellow","done":true,"x":0.0,"y":0.0,"rotation":0}],"groups":[]}"#,
+        )
+        .expect("legacy board should load");
+
+        assert_eq!(board.notes[0].status, NoteStatus::Done);
+        assert_eq!(board.notes[0].due_date, None);
+    }
+
+    #[test]
+    fn status_and_due_date_round_trip() {
+        let board = BoardData {
+            notes: vec![Note {
+                id: 1,
+                text: "follow up".into(),
+                color: NoteColor::Pink,
+                status: NoteStatus::InProgress,
+                due_date: Some("2026-09-02".into()),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0,
+                group_id: None,
+            }],
+            groups: Vec::new(),
+        };
+        let raw = serde_json::to_string(&board).expect("board should serialize");
+        let restored = parse_board(&raw).expect("board should deserialize");
+
+        assert_eq!(restored.notes[0].status, NoteStatus::InProgress);
+        assert_eq!(restored.notes[0].due_date.as_deref(), Some("2026-09-02"));
+    }
+
+    #[test]
     fn anchored_group_frame_moves_with_its_cards() {
         let group = Group {
             id: 1,
@@ -2122,7 +2540,8 @@ mod tests {
                 id: 1,
                 text: "inside".into(),
                 color: NoteColor::Yellow,
-                done: false,
+                status: NoteStatus::Todo,
+                due_date: None,
                 x: 124.0,
                 y: 172.0,
                 rotation: 0,
@@ -2132,7 +2551,8 @@ mod tests {
                 id: 2,
                 text: "outside".into(),
                 color: NoteColor::Blue,
-                done: false,
+                status: NoteStatus::Todo,
+                due_date: None,
                 x: 0.0,
                 y: 0.0,
                 rotation: 0,
@@ -2180,7 +2600,7 @@ mod tests {
         );
         assert_eq!(
             resized_group_frame(initial, (500.0, 500.0), (-1, -1)),
-            (276.0, 244.0, 224.0, 276.0)
+            (244.0, 244.0, 256.0, 276.0)
         );
     }
 
