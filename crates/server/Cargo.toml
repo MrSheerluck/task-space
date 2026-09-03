@@ -6,3 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+axum = "0.8"
+futures-util = "0.3"
+task-core = { path = "../core" }
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }

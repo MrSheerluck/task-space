@@ -34,6 +34,15 @@ IndexedDB; the old `localStorage` workspace key is retained only as a migration
 and recovery fallback. The shared document schema lives in `crates/core` so the
 eventual account and sync layers can consume the same shape.
 
+The Yrs migration layer is now present in `crates/core` and the browser stores a
+per-space Yrs snapshot beside the JSON workspace record. JSON remains the
+readable export/migration projection while editor mutations are moved to
+incremental Yrs updates. The server crate contains the transport-neutral merge
+engine, account-scoped SSE/HTTP routes, state-vector pulls, and idempotent
+mutation handling. `crates/server/migrations/0001_sync.sql` defines the durable
+PostgreSQL snapshot and update log that will replace the in-memory store before
+production auth is enabled.
+
 - A **space** owns its name, archive state, notes, groups, note positions, due
   dates, statuses, and deletion tombstones.
 - **Workspace** metadata owns the space list, the active space, schema version,

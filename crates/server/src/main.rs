@@ -1,3 +1,3 @@
 fn main() {
-    println!("task-space server placeholder, axum will come later");
+    println!("task-space server sync engine is ready; HTTP transport is next");
 }

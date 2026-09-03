@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+
 use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
+use task_core::crdt::SpaceDoc;
+use task_core::sync::EncodedUpdate;
 use task_core::{
-    BoardData, Group, Note, NoteColor, NoteStatus, Space, Tombstone, TombstoneKind, WorkspaceData,
-    CURRENT_SCHEMA_VERSION,
+    BoardData, CURRENT_SCHEMA_VERSION, Group, Note, NoteColor, NoteStatus, Space, Tombstone,
+    TombstoneKind, WorkspaceData,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
@@ -19,6 +23,7 @@ const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const LEGACY_WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
 const DEVICE_ID_STORAGE_KEY: &str = "task-space.device-id.v1";
+const SYNC_SEQUENCE_STORAGE_KEY: &str = "task-space.sync-sequence.v1";
 const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
 const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
@@ -37,10 +42,16 @@ export function taskSpaceLoadWorkspace() {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space");
+    const request = indexedDB.open("task-space", 3);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
+      }
+      if (!request.result.objectStoreNames.contains("crdt")) {
+        request.result.createObjectStore("crdt");
+      }
+      if (!request.result.objectStoreNames.contains("crdt-updates")) {
+        request.result.createObjectStore("crdt-updates");
       }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
@@ -76,10 +87,16 @@ export function taskSpaceSaveWorkspace(raw) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space");
+    const request = indexedDB.open("task-space", 3);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
+      }
+      if (!request.result.objectStoreNames.contains("crdt")) {
+        request.result.createObjectStore("crdt");
+      }
+      if (!request.result.objectStoreNames.contains("crdt-updates")) {
+        request.result.createObjectStore("crdt-updates");
       }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
@@ -92,6 +109,135 @@ export function taskSpaceSaveWorkspace(raw) {
     };
   });
 }
+
+export function taskSpaceLoadCrdt(spaceId) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 3);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("workspace")) {
+        request.result.createObjectStore("workspace");
+      }
+      if (!request.result.objectStoreNames.contains("crdt")) {
+        request.result.createObjectStore("crdt");
+      }
+      if (!request.result.objectStoreNames.contains("crdt-updates")) {
+        request.result.createObjectStore("crdt-updates");
+      }
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("crdt", "readonly");
+      const read = transaction.objectStore("crdt").get(`space:${spaceId}`);
+      read.onerror = () => reject(read.error || new Error("Could not read CRDT document"));
+      read.onsuccess = () => resolve(read.result ?? null);
+    };
+  });
+}
+
+export function taskSpaceSaveCrdt(spaceId, encodedSnapshot) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 3);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("workspace")) {
+        request.result.createObjectStore("workspace");
+      }
+      if (!request.result.objectStoreNames.contains("crdt")) {
+        request.result.createObjectStore("crdt");
+      }
+      if (!request.result.objectStoreNames.contains("crdt-updates")) {
+        request.result.createObjectStore("crdt-updates");
+      }
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("crdt", "readwrite");
+      transaction.objectStore("crdt").put(encodedSnapshot, `space:${spaceId}`);
+      transaction.onerror = () => reject(transaction.error || new Error("Could not save CRDT document"));
+      transaction.oncomplete = () => resolve(true);
+    };
+  });
+}
+
+export function taskSpaceQueueCrdtUpdate(spaceId, mutationId, encodedUpdate) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 3);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("workspace")) {
+        request.result.createObjectStore("workspace");
+      }
+      if (!request.result.objectStoreNames.contains("crdt")) {
+        request.result.createObjectStore("crdt");
+      }
+      if (!request.result.objectStoreNames.contains("crdt-updates")) {
+        request.result.createObjectStore("crdt-updates");
+      }
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("crdt-updates", "readwrite");
+      transaction.objectStore("crdt-updates").put(
+        { spaceId, mutationId, update: encodedUpdate },
+        `${spaceId}:${mutationId}`,
+      );
+      transaction.onerror = () => reject(transaction.error || new Error("Could not queue CRDT update"));
+      transaction.oncomplete = () => resolve(true);
+    };
+  });
+}
+
+export function taskSpaceLoadCrdtUpdates() {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 3);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("crdt-updates")) {
+        resolve([]);
+        return;
+      }
+      const read = db.transaction("crdt-updates", "readonly").objectStore("crdt-updates").getAll();
+      read.onerror = () => reject(read.error || new Error("Could not read CRDT update queue"));
+      read.onsuccess = () => resolve(read.result ?? []);
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+export function taskSpaceAckCrdtUpdate(spaceId, mutationId) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 3);
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("crdt-updates", "readwrite");
+      transaction.objectStore("crdt-updates").delete(`${spaceId}:${mutationId}`);
+      transaction.onerror = () => reject(transaction.error || new Error("Could not acknowledge CRDT update"));
+      transaction.oncomplete = () => resolve(true);
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
 "#)]
 unsafe extern "C" {
     #[wasm_bindgen(js_name = taskSpaceLoadWorkspace)]
@@ -99,6 +245,19 @@ unsafe extern "C" {
 
     #[wasm_bindgen(js_name = taskSpaceSaveWorkspace)]
     fn indexed_db_save_workspace(raw: &str) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceLoadCrdt)]
+    fn indexed_db_load_crdt(space_id: u64) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceSaveCrdt)]
+    fn indexed_db_save_crdt(space_id: u64, encoded_snapshot: &str) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceQueueCrdtUpdate)]
+    fn indexed_db_queue_crdt_update(
+        space_id: u64,
+        mutation_id: &str,
+        encoded_update: &str,
+    ) -> js_sys::Promise;
 }
 
 fn note_color_background(color: NoteColor) -> &'static str {
@@ -163,9 +322,8 @@ fn today_date() -> String {
 
 fn is_overdue(due_date: Option<&str>, status: NoteStatus) -> bool {
     status != NoteStatus::Done
-        && due_date.is_some_and(|date| {
-            parse_due_date(date).is_some() && date < today_date().as_str()
-        })
+        && due_date
+            .is_some_and(|date| parse_due_date(date).is_some() && date < today_date().as_str())
 }
 
 fn parse_due_date(due_date: &str) -> Option<(i32, u32, u32)> {
@@ -361,7 +519,11 @@ fn parse_indexed_db_value(value: JsValue) -> Option<WorkspaceData> {
             .and_then(|json| json.as_string())
     })?;
     parse_workspace(&raw)
-        .or_else(|| parse_board(&raw).filter(|board| !board.notes.is_empty() || !board.groups.is_empty()).map(workspace_from_board))
+        .or_else(|| {
+            parse_board(&raw)
+                .filter(|board| !board.notes.is_empty() || !board.groups.is_empty())
+                .map(workspace_from_board)
+        })
         .or_else(|| parse_indexed_db_json(&raw))
 }
 
@@ -375,10 +537,7 @@ fn parse_indexed_db_json_value(value: serde_json::Value) -> Option<WorkspaceData
         return parse_indexed_db_json(raw);
     }
     if let Some(values) = value.as_array() {
-        return values
-            .iter()
-            .cloned()
-            .find_map(parse_indexed_db_json_value);
+        return values.iter().cloned().find_map(parse_indexed_db_json_value);
     }
     if let Ok(workspace) = serde_json::from_value::<WorkspaceData>(value.clone())
         && !workspace.spaces.is_empty()
@@ -393,7 +552,12 @@ fn parse_indexed_db_json_value(value: serde_json::Value) -> Option<WorkspaceData
     let object = value.as_object()?;
     ["value", "data", "workspace", "board"]
         .into_iter()
-        .find_map(|key| object.get(key).cloned().and_then(parse_indexed_db_json_value))
+        .find_map(|key| {
+            object
+                .get(key)
+                .cloned()
+                .and_then(parse_indexed_db_json_value)
+        })
 }
 
 fn load_board() -> BoardData {
@@ -554,11 +718,11 @@ fn hydrate_workspace_from_indexed_db(
     pan: RwSignal<(f64, f64)>,
     zoom: RwSignal<f64>,
     storage_hydrated: RwSignal<bool>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
 ) {
     spawn_local(async move {
         if let Ok(value) = JsFuture::from(indexed_db_load_workspace()).await {
-            if let Some(imported) = parse_indexed_db_value(value)
-            {
+            if let Some(imported) = parse_indexed_db_value(value) {
                 let local_changed = spaces.get_untracked() != initial_workspace.spaces
                     || active_space_id.get_untracked() != initial_workspace.active_space_id
                     || notes.get_untracked() != initial_board.notes
@@ -595,6 +759,37 @@ fn hydrate_workspace_from_indexed_db(
                 }
             }
         }
+
+        let active_id = active_space_id.get_untracked();
+        let current_board = spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == active_id)
+            .map(|space| space.board.clone())
+            .unwrap_or_else(empty_board);
+        let loaded_doc = JsFuture::from(indexed_db_load_crdt(active_id))
+            .await
+            .ok()
+            .and_then(|value| value.as_string())
+            .and_then(|encoded| EncodedUpdate::from_base64(encoded).ok())
+            .and_then(|encoded| encoded.to_bytes().ok())
+            .and_then(|bytes| SpaceDoc::from_update(&bytes).ok());
+        let had_loaded_doc = loaded_doc.is_some();
+        let doc = loaded_doc.unwrap_or_else(|| {
+            let doc = SpaceDoc::new();
+            doc.import_board(&current_board);
+            doc
+        });
+        let loaded_board = doc.board();
+        if had_loaded_doc {
+            notes.set(loaded_board.notes);
+            groups.set(loaded_board.groups);
+        }
+        let encoded_snapshot = EncodedUpdate::from_bytes(&doc.snapshot());
+        crdt_docs.update(|items| {
+            items.insert(active_id, doc);
+        });
+        queue_indexed_db_crdt_save(active_id, encoded_snapshot.as_str().to_owned());
         storage_hydrated.set(true);
     });
 }
@@ -603,7 +798,12 @@ fn load_workspace() -> WorkspaceData {
     let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
     let workspace = storage
         .as_ref()
-        .and_then(|storage| storage.get_item(LEGACY_WORKSPACE_STORAGE_KEY).ok().flatten())
+        .and_then(|storage| {
+            storage
+                .get_item(LEGACY_WORKSPACE_STORAGE_KEY)
+                .ok()
+                .flatten()
+        })
         .and_then(|raw| serde_json::from_str::<WorkspaceData>(&raw).ok())
         .filter(|workspace| !workspace.spaces.is_empty())
         .unwrap_or_else(|| WorkspaceData {
@@ -651,7 +851,9 @@ fn write_workspace_exact(
 
 fn queue_indexed_db_save(raw: String, storage_status: Option<RwSignal<StorageStatus>>) {
     spawn_local(async move {
-        let saved = JsFuture::from(indexed_db_save_workspace(&raw)).await.is_ok();
+        let saved = JsFuture::from(indexed_db_save_workspace(&raw))
+            .await
+            .is_ok();
         if let Some(storage_status) = storage_status {
             storage_status.set(if saved {
                 StorageStatus::Saved
@@ -667,6 +869,73 @@ fn queue_indexed_db_save(raw: String, storage_status: Option<RwSignal<StorageSta
             }
         }
     });
+}
+
+fn queue_indexed_db_crdt_save(space_id: u64, encoded_snapshot: String) {
+    spawn_local(async move {
+        let _ = JsFuture::from(indexed_db_save_crdt(space_id, &encoded_snapshot)).await;
+    });
+}
+
+fn next_sync_mutation_id() -> String {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return format!("{}:{}", load_device_id(), now_millis());
+    };
+    let sequence = storage
+        .get_item(SYNC_SEQUENCE_STORAGE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let _ = storage.set_item(SYNC_SEQUENCE_STORAGE_KEY, &sequence.to_string());
+    format!("{}:{}", load_device_id(), sequence)
+}
+
+fn persist_space_crdt(
+    space_id: u64,
+    board: &BoardData,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) {
+    crdt_docs.update(|items| {
+        items.entry(space_id).or_default();
+    });
+    let previous_state_vector = crdt_docs
+        .get_untracked()
+        .get(&space_id)
+        .map(SpaceDoc::state_vector)
+        .unwrap_or_default();
+    crdt_docs.update(|items| {
+        let doc = items.entry(space_id).or_default();
+        doc.import_board(board);
+    });
+    let snapshot = crdt_docs
+        .get_untracked()
+        .get(&space_id)
+        .map(SpaceDoc::snapshot)
+        .unwrap_or_default();
+    queue_indexed_db_crdt_save(
+        space_id,
+        EncodedUpdate::from_bytes(&snapshot).as_str().to_owned(),
+    );
+
+    if let Some(doc) = crdt_docs.get_untracked().get(&space_id) {
+        if let Ok(update) = doc.encode_update(&previous_state_vector)
+            && !update.is_empty()
+        {
+            let mutation_id = next_sync_mutation_id();
+            let encoded = EncodedUpdate::from_bytes(&update);
+            spawn_local(async move {
+                let _ = JsFuture::from(indexed_db_queue_crdt_update(
+                    space_id,
+                    &mutation_id,
+                    encoded.as_str(),
+                ))
+                .await;
+            });
+        }
+    }
 }
 
 fn note_content_changed(before: &Note, after: &Note) -> bool {
@@ -990,11 +1259,14 @@ struct SpaceActions {
 impl SpaceActions {
     fn save_workspace(self, active_space_id: u64) {
         self.storage_status.set(StorageStatus::Saving);
-        let saved = save_workspace(&workspace_snapshot(
-            self.spaces.get_untracked(),
-            active_space_id,
-            self.workspace_tombstones.get_untracked(),
-        ), Some(self.storage_status));
+        let saved = save_workspace(
+            &workspace_snapshot(
+                self.spaces.get_untracked(),
+                active_space_id,
+                self.workspace_tombstones.get_untracked(),
+            ),
+            Some(self.storage_status),
+        );
         self.storage_status.set(if saved {
             StorageStatus::Saved
         } else {
@@ -1241,9 +1513,10 @@ impl SpaceActions {
             );
         }
         self.workspace_tombstones.update(|items| {
-            if items.iter().all(|tombstone| {
-                tombstone.kind != TombstoneKind::Space || tombstone.id != space_id
-            }) {
+            if items
+                .iter()
+                .all(|tombstone| tombstone.kind != TombstoneKind::Space || tombstone.id != space_id)
+            {
                 items.push(Tombstone {
                     kind: TombstoneKind::Space,
                     id: space_id,
@@ -1301,7 +1574,8 @@ impl BoardActions {
         let id = self.next_id.get_untracked();
         self.next_id.update(|next| *next += 1);
         mutate_notes(self.notes, self.groups, self.history, |items| {
-            let (x, y) = viewport_note_position(self.pan.get_untracked(), self.zoom.get_untracked());
+            let (x, y) =
+                viewport_note_position(self.pan.get_untracked(), self.zoom.get_untracked());
             items.push(Note {
                 id,
                 text: String::new(),
@@ -1463,7 +1737,8 @@ impl BoardActions {
             self.edit_snapshot,
         );
         let before = board_snapshot(self.notes, self.groups);
-        self.notes.update(|items| items.retain(|note| note.id != id));
+        self.notes
+            .update(|items| items.retain(|note| note.id != id));
         let used_groups = self
             .notes
             .get_untracked()
@@ -1472,7 +1747,8 @@ impl BoardActions {
             .collect::<Vec<_>>();
         self.groups
             .update(|items| items.retain(|group| used_groups.contains(&group.id)));
-        self.selection.update(|selected| selected.retain(|selected_id| *selected_id != id));
+        self.selection
+            .update(|selected| selected.retain(|selected_id| *selected_id != id));
         record_snapshot(self.notes, self.groups, self.history, before);
     }
 
@@ -1491,7 +1767,12 @@ impl BoardActions {
     }
 
     fn rename_group(self, id: u64) {
-        if self.groups.get_untracked().iter().any(|group| group.id == id) {
+        if self
+            .groups
+            .get_untracked()
+            .iter()
+            .any(|group| group.id == id)
+        {
             commit_pending_group_edit(
                 self.notes,
                 self.groups,
@@ -1521,7 +1802,8 @@ impl BoardActions {
                 }
             }
         });
-        self.groups.update(|items| items.retain(|group| group.id != id));
+        self.groups
+            .update(|items| items.retain(|group| group.id != id));
         record_snapshot(self.notes, self.groups, self.history, before);
     }
 
@@ -1667,23 +1949,17 @@ fn note_rect(x: f64, y: f64) -> (f64, f64, f64, f64) {
 }
 
 fn rects_overlap(first: (f64, f64, f64, f64), second: (f64, f64, f64, f64)) -> bool {
-    first.0 < second.2
-        && first.2 > second.0
-        && first.1 < second.3
-        && first.3 > second.1
+    first.0 < second.2 && first.2 > second.0 && first.1 < second.3 && first.3 > second.1
 }
 
-fn positions_for_group(
-    group: &Group,
-    notes: &[Note],
-    moving_ids: &[u64],
-) -> Vec<(u64, f64, f64)> {
-    let (frame_left, frame_top, frame_width, frame_height) = group_bounds(group, notes).unwrap_or((
-        group.origin.map_or(0.0, |origin| origin.0),
-        group.origin.map_or(0.0, |origin| origin.1),
-        group.size.map_or(MIN_GROUP_WIDTH, |size| size.0),
-        group.size.map_or(MIN_GROUP_HEIGHT, |size| size.1),
-    ));
+fn positions_for_group(group: &Group, notes: &[Note], moving_ids: &[u64]) -> Vec<(u64, f64, f64)> {
+    let (frame_left, frame_top, frame_width, frame_height) =
+        group_bounds(group, notes).unwrap_or((
+            group.origin.map_or(0.0, |origin| origin.0),
+            group.origin.map_or(0.0, |origin| origin.1),
+            group.size.map_or(MIN_GROUP_WIDTH, |size| size.0),
+            group.size.map_or(MIN_GROUP_HEIGHT, |size| size.1),
+        ));
     let inner_width = (frame_width - HORIZONTAL_PADDING * 2.0).max(NOTE_WIDTH);
     let inner_height = (frame_height - TOP_PADDING - BOTTOM_PADDING).max(NOTE_HEIGHT);
     let column_step = NOTE_WIDTH + HORIZONTAL_PADDING;
@@ -2470,15 +2746,7 @@ fn NoteCard(
     };
     let clear_due_date = move |ev: MouseEvent| {
         ev.stop_propagation();
-        set_note_due_date(
-            id,
-            None,
-            notes,
-            groups,
-            history,
-            editing,
-            edit_snapshot,
-        );
+        set_note_due_date(id, None, notes, groups, history, editing, edit_snapshot);
         due_calendar_open.set(false);
     };
     let toggle_due_calendar = move |ev: MouseEvent| {
@@ -2673,7 +2941,9 @@ fn NoteCard(
                         .get_untracked()
                         .into_iter()
                         .find(|group| group.id == group_id)
-                        .map(|group| positions_for_group(&group, &notes.get_untracked(), &moved_ids))
+                        .map(|group| {
+                            positions_for_group(&group, &notes.get_untracked(), &moved_ids)
+                        })
                 })
                 .unwrap_or_default();
             notes.update(|items| {
@@ -3089,6 +3359,7 @@ pub fn Board() -> impl IntoView {
     let due_date_request = RwSignal::new(None::<u64>);
     let storage_status = RwSignal::new(StorageStatus::Saving);
     let storage_hydrated = RwSignal::new(false);
+    let crdt_docs = RwSignal::new(HashMap::<u64, SpaceDoc>::new());
     let next_space_id = RwSignal::new(
         spaces
             .get_untracked()
@@ -3117,6 +3388,7 @@ pub fn Board() -> impl IntoView {
         pan,
         zoom,
         storage_hydrated,
+        crdt_docs,
     );
 
     let board_actions = BoardActions {
@@ -3141,18 +3413,28 @@ pub fn Board() -> impl IntoView {
         }
         let active_id = active_space_id.get();
         storage_status.set(StorageStatus::Saving);
+        let board = BoardData {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            notes: notes.get(),
+            groups: groups.get(),
+            tombstones: Vec::new(),
+        };
         let saved = persist_space_board(
             spaces,
             active_id,
-            BoardData {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                notes: notes.get(),
-                groups: groups.get(),
-                tombstones: Vec::new(),
-            },
+            board,
             workspace_tombstones,
             storage_status,
         );
+        if saved
+            && let Some(board) = spaces
+                .get_untracked()
+                .iter()
+                .find(|space| space.id == active_id)
+                .map(|space| space.board.clone())
+        {
+            persist_space_crdt(active_id, &board, crdt_docs);
+        }
         storage_status.set(if saved {
             StorageStatus::Saved
         } else {
@@ -3161,10 +3443,13 @@ pub fn Board() -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        save_view(active_space_id.get(), ViewState {
-            pan: pan.get(),
-            zoom: zoom.get(),
-        });
+        save_view(
+            active_space_id.get(),
+            ViewState {
+                pan: pan.get(),
+                zoom: zoom.get(),
+            },
+        );
     });
 
     let start_pan = move |ev: PointerEvent| {
@@ -3314,7 +3599,11 @@ pub fn Board() -> impl IntoView {
 
     let create_space = move |_| space_actions.create(next_space_id);
     let begin_rename_space = move |_| {
-        space_actions.begin_rename(rename_space_id, rename_value, active_space_id.get_untracked());
+        space_actions.begin_rename(
+            rename_space_id,
+            rename_value,
+            active_space_id.get_untracked(),
+        );
     };
     let archive_current_space = move |_| space_actions.archive_current();
 
@@ -3371,11 +3660,14 @@ pub fn Board() -> impl IntoView {
             };
 
             if let Some(mut imported) = parse_workspace(&raw) {
-                let confirmed = web_sys::window()
-                    .and_then(|window| window.confirm_with_message(
+                let confirmed =
+                    web_sys::window()
+                        .and_then(|window| {
+                            window.confirm_with_message(
                         "Replace the spaces on this device with the imported workspace?",
-                    ).ok())
-                    .unwrap_or(false);
+                    ).ok()
+                        })
+                        .unwrap_or(false);
                 if !confirmed {
                     restore_message.set(Some("restore cancelled".into()));
                     return;
@@ -3416,13 +3708,16 @@ pub fn Board() -> impl IntoView {
                 pan.set(imported_view.pan);
                 zoom.set(imported_view.zoom);
                 storage_status.set(StorageStatus::Saving);
-                let saved = write_workspace_exact(&WorkspaceData {
-                    schema_version: CURRENT_SCHEMA_VERSION,
-                    device_id: imported_device_id,
-                    tombstones: imported_tombstones,
-                    spaces: spaces.get_untracked(),
-                    active_space_id: imported_space_id,
-                }, Some(storage_status));
+                let saved = write_workspace_exact(
+                    &WorkspaceData {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        device_id: imported_device_id,
+                        tombstones: imported_tombstones,
+                        spaces: spaces.get_untracked(),
+                        active_space_id: imported_space_id,
+                    },
+                    Some(storage_status),
+                );
                 storage_status.set(if saved {
                     StorageStatus::Saved
                 } else {

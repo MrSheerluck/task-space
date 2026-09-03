@@ -6,6 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod crdt;
+pub mod sync;
+
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub type EntityId = u64;
 

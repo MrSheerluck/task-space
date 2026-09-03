@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+yrs = "0.27"
 
 [dev-dependencies]
 serde_json = "1"
