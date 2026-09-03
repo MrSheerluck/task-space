@@ -1,3 +1,3 @@
 fn main() {
-    println!("task-space server sync engine is ready; HTTP transport is next");
+    println!("task-space server sync and billing boundaries are ready; production adapters are next");
 }

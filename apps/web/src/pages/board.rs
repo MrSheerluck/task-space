@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use gloo_net::http::Request;
 use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::leptos_dom::helpers::window_event_listener;
@@ -8,6 +9,9 @@ use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
 use task_core::crdt::SpaceDoc;
 use task_core::sync::EncodedUpdate;
+use task_core::sync::{
+    SYNC_PROTOCOL_VERSION, SyncEvent, SyncPullRequest, SyncPullResponse, SyncPushRequest,
+};
 use task_core::{
     BoardData, CURRENT_SCHEMA_VERSION, Group, Note, NoteColor, NoteStatus, Space, Tombstone,
     TombstoneKind, WorkspaceData,
@@ -24,6 +28,7 @@ const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const LEGACY_WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
 const DEVICE_ID_STORAGE_KEY: &str = "task-space.device-id.v1";
 const SYNC_SEQUENCE_STORAGE_KEY: &str = "task-space.sync-sequence.v1";
+const SYNC_ENABLED_STORAGE_KEY: &str = "task-space.sync-enabled.v1";
 const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
 const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
@@ -238,6 +243,26 @@ export function taskSpaceAckCrdtUpdate(spaceId, mutationId) {
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
   });
 }
+
+const taskSpaceSyncSources = new Map();
+
+export function taskSpaceStartSyncEvents(url, onUpdate, onOpen) {
+  taskSpaceStopSyncEvents(url);
+  const source = new EventSource(url);
+  const update = (event) => onUpdate(event.data);
+  source.addEventListener("space-update", update);
+  source.onopen = () => onOpen();
+  taskSpaceSyncSources.set(url, { source, update });
+  return true;
+}
+
+export function taskSpaceStopSyncEvents(url) {
+  const existing = taskSpaceSyncSources.get(url);
+  if (!existing) return;
+  existing.source.removeEventListener("space-update", existing.update);
+  existing.source.close();
+  taskSpaceSyncSources.delete(url);
+}
 "#)]
 unsafe extern "C" {
     #[wasm_bindgen(js_name = taskSpaceLoadWorkspace)]
@@ -258,6 +283,19 @@ unsafe extern "C" {
         mutation_id: &str,
         encoded_update: &str,
     ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceLoadCrdtUpdates)]
+    fn indexed_db_load_crdt_updates() -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceAckCrdtUpdate)]
+    fn indexed_db_ack_crdt_update(space_id: u64, mutation_id: &str) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceStartSyncEvents)]
+    fn start_sync_events(
+        url: &str,
+        on_update: &js_sys::Function,
+        on_open: &js_sys::Function,
+    ) -> bool;
 }
 
 fn note_color_background(color: NoteColor) -> &'static str {
@@ -936,6 +974,217 @@ fn persist_space_crdt(
             });
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct QueuedCrdtUpdate {
+    #[serde(rename = "spaceId")]
+    space_id: u64,
+    mutation_id: String,
+    update: String,
+}
+
+fn parse_queued_crdt_updates(value: JsValue) -> Vec<QueuedCrdtUpdate> {
+    let Ok(raw) = js_sys::JSON::stringify(&value) else {
+        return Vec::new();
+    };
+    let Some(raw) = raw.as_string() else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+async fn drain_sync_queue() {
+    let Ok(value) = JsFuture::from(indexed_db_load_crdt_updates()).await else {
+        return;
+    };
+    for queued in parse_queued_crdt_updates(value) {
+        let Ok(update) = EncodedUpdate::from_base64(queued.update) else {
+            continue;
+        };
+        let request = SyncPushRequest {
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            space_id: queued.space_id,
+            mutation_id: queued.mutation_id.clone(),
+            update,
+        };
+        let Ok(builder) = Request::post("/sync/push").json(&request) else {
+            return;
+        };
+        let Ok(response) = builder.send().await else {
+            return;
+        };
+        if response.status() >= 300 {
+            return;
+        }
+        let _ = JsFuture::from(indexed_db_ack_crdt_update(
+            queued.space_id,
+            &queued.mutation_id,
+        ))
+        .await;
+    }
+}
+
+fn apply_remote_sync_event(
+    raw: String,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) {
+    let Ok(event) = serde_json::from_str::<SyncEvent>(&raw) else {
+        return;
+    };
+    let Ok(update) = event.update.to_bytes() else {
+        return;
+    };
+    let mut next_board = None;
+    crdt_docs.update(|items| {
+        let doc = items.entry(event.space_id).or_default();
+        if doc.apply_update(&update).is_ok() {
+            next_board = Some(doc.board());
+        }
+    });
+    let Some(board) = next_board else {
+        return;
+    };
+    spaces.update(|items| {
+        if let Some(space) = items.iter_mut().find(|space| space.id == event.space_id) {
+            space.board = board.clone();
+            space.updated_at = now_millis();
+        }
+    });
+    if active_space_id.get_untracked() == event.space_id {
+        notes.set(board.notes);
+        groups.set(board.groups);
+    }
+    save_crdt_doc_snapshot(event.space_id, crdt_docs);
+}
+
+fn save_crdt_doc_snapshot(space_id: u64, crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>) {
+    let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() else {
+        return;
+    };
+    queue_indexed_db_crdt_save(
+        space_id,
+        EncodedUpdate::from_bytes(&doc.snapshot())
+            .as_str()
+            .to_owned(),
+    );
+}
+
+async fn pull_active_space(
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) {
+    let space_id = active_space_id.get_untracked();
+    let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() else {
+        return;
+    };
+    let request = SyncPullRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        space_id,
+        state_vector: EncodedUpdate::from_bytes(&doc.state_vector()),
+    };
+    let Ok(builder) = Request::post("/sync/pull").json(&request) else {
+        return;
+    };
+    let Ok(response) = builder.send().await else {
+        return;
+    };
+    if response.status() >= 300 {
+        return;
+    }
+    let Ok(payload) = response.json::<SyncPullResponse>().await else {
+        return;
+    };
+    let Ok(update) = payload.update.to_bytes() else {
+        return;
+    };
+    if update.is_empty() {
+        return;
+    }
+    let mut next_board = None;
+    crdt_docs.update(|items| {
+        if let Some(doc) = items.get(&space_id)
+            && doc.apply_update(&update).is_ok()
+        {
+            next_board = Some(doc.board());
+        }
+    });
+    let Some(board) = next_board else {
+        return;
+    };
+    spaces.update(|items| {
+        if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
+            space.board = board.clone();
+            space.updated_at = now_millis();
+        }
+    });
+    notes.set(board.notes);
+    groups.set(board.groups);
+    save_crdt_doc_snapshot(space_id, crdt_docs);
+}
+
+fn sync_is_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(SYNC_ENABLED_STORAGE_KEY).ok().flatten())
+        .is_some_and(|value| value == "true")
+}
+
+fn start_authenticated_sync(
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) {
+    spawn_local(async move {
+        drain_sync_queue().await;
+        pull_active_space(spaces, active_space_id, notes, groups, crdt_docs).await;
+
+        let update_spaces = spaces;
+        let update_active = active_space_id;
+        let update_notes = notes;
+        let update_groups = groups;
+        let update_docs = crdt_docs;
+        let on_update = Closure::<dyn FnMut(String)>::new(move |raw| {
+            apply_remote_sync_event(
+                raw,
+                update_spaces,
+                update_active,
+                update_notes,
+                update_groups,
+                update_docs,
+            );
+        });
+        let reconnect_spaces = spaces;
+        let reconnect_active = active_space_id;
+        let reconnect_notes = notes;
+        let reconnect_groups = groups;
+        let reconnect_docs = crdt_docs;
+        let on_open = Closure::<dyn FnMut()>::new(move || {
+            spawn_local(pull_active_space(
+                reconnect_spaces,
+                reconnect_active,
+                reconnect_notes,
+                reconnect_groups,
+                reconnect_docs,
+            ));
+        });
+        let _ = start_sync_events(
+            "/sync/events",
+            on_update.as_ref().unchecked_ref(),
+            on_open.as_ref().unchecked_ref(),
+        );
+        on_update.forget();
+        on_open.forget();
+    });
 }
 
 fn note_content_changed(before: &Note, after: &Note) -> bool {
@@ -3359,6 +3608,7 @@ pub fn Board() -> impl IntoView {
     let due_date_request = RwSignal::new(None::<u64>);
     let storage_status = RwSignal::new(StorageStatus::Saving);
     let storage_hydrated = RwSignal::new(false);
+    let sync_started = RwSignal::new(false);
     let crdt_docs = RwSignal::new(HashMap::<u64, SpaceDoc>::new());
     let next_space_id = RwSignal::new(
         spaces
@@ -3390,6 +3640,13 @@ pub fn Board() -> impl IntoView {
         storage_hydrated,
         crdt_docs,
     );
+
+    Effect::new(move |_| {
+        if storage_hydrated.get() && sync_is_enabled() && !sync_started.get() {
+            sync_started.set(true);
+            start_authenticated_sync(spaces, active_space_id, notes, groups, crdt_docs);
+        }
+    });
 
     let board_actions = BoardActions {
         notes,

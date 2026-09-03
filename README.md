@@ -39,9 +39,18 @@ per-space Yrs snapshot beside the JSON workspace record. JSON remains the
 readable export/migration projection while editor mutations are moved to
 incremental Yrs updates. The server crate contains the transport-neutral merge
 engine, account-scoped SSE/HTTP routes, state-vector pulls, and idempotent
-mutation handling. `crates/server/migrations/0001_sync.sql` defines the durable
-PostgreSQL snapshot and update log that will replace the in-memory store before
-production auth is enabled.
+mutation handling. The browser has an IndexedDB-backed Yrs update queue,
+authenticated HTTP push/retry plumbing, SSE event application, and reconnect
+recovery. Sync is opt-in until an authenticated session enables it.
+`crates/server/migrations/0001_sync.sql` defines the durable PostgreSQL
+snapshot and update log that will replace the in-memory store before production
+auth is enabled. Billing preparation is also provider-neutral: server-owned
+entitlements, normalized webhook events, provider-event idempotency, stale
+event protection, and the authenticated `/account/entitlement` read boundary
+are in `crates/core/src/billing.rs`, `crates/server/src/billing.rs`, and
+`crates/server/migrations/0002_billing.sql`. A future Dodo adapter only needs to
+verify its signature, map its customer to an account, normalize the event, and
+apply it to the billing store.
 
 - A **space** owns its name, archive state, notes, groups, note positions, due
   dates, statuses, and deletion tombstones.

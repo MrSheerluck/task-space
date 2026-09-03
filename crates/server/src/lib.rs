@@ -19,6 +19,7 @@ use task_core::sync::{
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+pub mod billing;
 pub mod http;
 
 #[derive(Debug, Error)]

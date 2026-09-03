@@ -2,9 +2,15 @@ use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-
 #[component]
-fn MockNote(bg: &'static str, ink: &'static str, rot: &'static str, text: &'static str, done: bool, due: &'static str) -> impl IntoView {
+fn MockNote(
+    bg: &'static str,
+    ink: &'static str,
+    rot: &'static str,
+    text: &'static str,
+    done: bool,
+    due: &'static str,
+) -> impl IntoView {
     view! {
         <div
             class=format!(

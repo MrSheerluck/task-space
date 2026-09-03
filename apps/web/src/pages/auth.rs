@@ -1,7 +1,14 @@
 use leptos::prelude::*;
 
 #[component]
-fn AuthShell(title: &'static str, body: &'static str, page: &'static str, cta: &'static str, alt: &'static str, alt_href: &'static str) -> impl IntoView {
+fn AuthShell(
+    title: &'static str,
+    body: &'static str,
+    page: &'static str,
+    cta: &'static str,
+    alt: &'static str,
+    alt_href: &'static str,
+) -> impl IntoView {
     view! {
         <main class="min-h-screen grid place-items-center px-6">
             <div class="w-full max-w-sm">

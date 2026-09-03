@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod billing;
 pub mod crdt;
 pub mod sync;
 

@@ -1779,6 +1779,7 @@ dependencies = [
 name = "task-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures-util",
  "task-core",
