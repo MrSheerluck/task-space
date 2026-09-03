@@ -20,7 +20,10 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 pub mod billing;
+pub mod dodo;
 pub mod http;
+pub mod postgres;
+pub mod workos;
 
 #[derive(Debug, Error)]
 pub enum SyncStoreError {

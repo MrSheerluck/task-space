@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use super::account::{AccountState, load_account_state, sign_out, start_checkout};
+use super::api::api_url;
 use gloo_net::http::Request;
 use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
@@ -7,6 +9,7 @@ use leptos::leptos_dom::helpers::window_event_listener;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
+use task_core::billing::Entitlement;
 use task_core::crdt::SpaceDoc;
 use task_core::sync::EncodedUpdate;
 use task_core::sync::{
@@ -20,7 +23,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, Element, FileReader, HtmlAnchorElement, HtmlInputElement, HtmlSelectElement,
-    HtmlTextAreaElement, Url,
+    HtmlTextAreaElement, RequestCredentials, Url,
 };
 
 const STORAGE_KEY: &str = "task-space.board.v2";
@@ -28,7 +31,6 @@ const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const LEGACY_WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
 const DEVICE_ID_STORAGE_KEY: &str = "task-space.device-id.v1";
 const SYNC_SEQUENCE_STORAGE_KEY: &str = "task-space.sync-sequence.v1";
-const SYNC_ENABLED_STORAGE_KEY: &str = "task-space.sync-enabled.v1";
 const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
 const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
@@ -248,7 +250,7 @@ const taskSpaceSyncSources = new Map();
 
 export function taskSpaceStartSyncEvents(url, onUpdate, onOpen) {
   taskSpaceStopSyncEvents(url);
-  const source = new EventSource(url);
+  const source = new EventSource(url, { withCredentials: true });
   const update = (event) => onUpdate(event.data);
   source.addEventListener("space-update", update);
   source.onopen = () => onOpen();
@@ -984,6 +986,68 @@ struct QueuedCrdtUpdate {
     update: String,
 }
 
+#[derive(Serialize)]
+struct RegisterSpacePayload<'a> {
+    name: &'a str,
+}
+
+async fn register_sync_spaces(spaces: RwSignal<Vec<Space>>) {
+    for space in spaces.get_untracked() {
+        let Ok(builder) = Request::post(&api_url(&format!("/sync/spaces/{}", space.id)))
+            .credentials(RequestCredentials::Include)
+            .json(&RegisterSpacePayload { name: &space.name })
+        else {
+            return;
+        };
+        let Ok(response) = builder.send().await else {
+            return;
+        };
+        if response.status() >= 300 {
+            return;
+        }
+    }
+}
+
+async fn merge_remote_spaces(spaces: RwSignal<Vec<Space>>, next_space_id: RwSignal<u64>) {
+    let Ok(response) = Request::get(&api_url("/sync/spaces"))
+        .credentials(RequestCredentials::Include)
+        .send()
+        .await
+    else {
+        return;
+    };
+    if response.status() >= 300 {
+        return;
+    }
+    let Ok(remote_spaces) = response.json::<Vec<Space>>().await else {
+        return;
+    };
+    let highest_remote_id = remote_spaces.iter().map(|space| space.id).max();
+    spaces.update(|local_spaces| {
+        for remote in remote_spaces {
+            if local_spaces.iter().all(|local| local.id != remote.id) {
+                local_spaces.push(Space {
+                    id: remote.id,
+                    name: remote.name,
+                    archived: remote.archived,
+                    created_at: remote.created_at,
+                    updated_at: remote.updated_at,
+                    deleted_at: remote.deleted_at,
+                    // The CRDT snapshot is fetched with the normal pull path
+                    // when this space becomes active. Keeping this empty here
+                    // avoids treating a JSON projection as CRDT state.
+                    board: BoardData::default(),
+                });
+            }
+        }
+    });
+    if let Some(highest_remote_id) = highest_remote_id {
+        next_space_id.update(|next| {
+            *next = (*next).max(highest_remote_id.saturating_add(1));
+        });
+    }
+}
+
 fn parse_queued_crdt_updates(value: JsValue) -> Vec<QueuedCrdtUpdate> {
     let Ok(raw) = js_sys::JSON::stringify(&value) else {
         return Vec::new();
@@ -1008,7 +1072,10 @@ async fn drain_sync_queue() {
             mutation_id: queued.mutation_id.clone(),
             update,
         };
-        let Ok(builder) = Request::post("/sync/push").json(&request) else {
+        let Ok(builder) = Request::post(&api_url("/sync/push"))
+            .credentials(RequestCredentials::Include)
+            .json(&request)
+        else {
             return;
         };
         let Ok(response) = builder.send().await else {
@@ -1090,7 +1157,10 @@ async fn pull_active_space(
         space_id,
         state_vector: EncodedUpdate::from_bytes(&doc.state_vector()),
     };
-    let Ok(builder) = Request::post("/sync/pull").json(&request) else {
+    let Ok(builder) = Request::post(&api_url("/sync/pull"))
+        .credentials(RequestCredentials::Include)
+        .json(&request)
+    else {
         return;
     };
     let Ok(response) = builder.send().await else {
@@ -1130,21 +1200,17 @@ async fn pull_active_space(
     save_crdt_doc_snapshot(space_id, crdt_docs);
 }
 
-fn sync_is_enabled() -> bool {
-    web_sys::window()
-        .and_then(|window| window.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(SYNC_ENABLED_STORAGE_KEY).ok().flatten())
-        .is_some_and(|value| value == "true")
-}
-
 fn start_authenticated_sync(
     spaces: RwSignal<Vec<Space>>,
+    next_space_id: RwSignal<u64>,
     active_space_id: RwSignal<u64>,
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
 ) {
     spawn_local(async move {
+        merge_remote_spaces(spaces, next_space_id).await;
+        register_sync_spaces(spaces).await;
         drain_sync_queue().await;
         pull_active_space(spaces, active_space_id, notes, groups, crdt_docs).await;
 
@@ -1178,7 +1244,7 @@ fn start_authenticated_sync(
             ));
         });
         let _ = start_sync_events(
-            "/sync/events",
+            &api_url("/sync/events"),
             on_update.as_ref().unchecked_ref(),
             on_open.as_ref().unchecked_ref(),
         );
@@ -3609,6 +3675,9 @@ pub fn Board() -> impl IntoView {
     let storage_status = RwSignal::new(StorageStatus::Saving);
     let storage_hydrated = RwSignal::new(false);
     let sync_started = RwSignal::new(false);
+    let account_state = RwSignal::new(AccountState::Checking);
+    let sync_entitled = RwSignal::new(false);
+    let checkout_error = RwSignal::new(None::<String>);
     let crdt_docs = RwSignal::new(HashMap::<u64, SpaceDoc>::new());
     let next_space_id = RwSignal::new(
         spaces
@@ -3641,11 +3710,47 @@ pub fn Board() -> impl IntoView {
         crdt_docs,
     );
 
+    spawn_local(async move {
+        account_state.set(load_account_state().await);
+    });
+
     Effect::new(move |_| {
-        if storage_hydrated.get() && sync_is_enabled() && !sync_started.get() {
-            sync_started.set(true);
-            start_authenticated_sync(spaces, active_space_id, notes, groups, crdt_docs);
+        if storage_hydrated.get()
+            && account_state
+                .get()
+                .entitlement()
+                .is_some_and(Entitlement::can_sync)
+        {
+            sync_entitled.set(true);
         }
+    });
+
+    Effect::new(move |_| {
+        if storage_hydrated.get() && sync_entitled.get() && !sync_started.get() {
+            sync_started.set(true);
+            start_authenticated_sync(
+                spaces,
+                next_space_id,
+                active_space_id,
+                notes,
+                groups,
+                crdt_docs,
+            );
+        }
+    });
+
+    Effect::new(move |_| {
+        if !sync_started.get() {
+            return;
+        }
+        let _ = active_space_id.get();
+        spawn_local(pull_active_space(
+            spaces,
+            active_space_id,
+            notes,
+            groups,
+            crdt_docs,
+        ));
     });
 
     let board_actions = BoardActions {
@@ -3662,6 +3767,26 @@ pub fn Board() -> impl IntoView {
         group_edit_snapshot,
         due_date_request,
         restore_message,
+    };
+
+    let begin_checkout = move |interval: &'static str| {
+        checkout_error.set(None);
+        spawn_local(async move {
+            match start_checkout(interval).await {
+                Ok(url) => {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().set_href(&url);
+                    }
+                }
+                Err(message) => checkout_error.set(Some(message)),
+            }
+        });
+    };
+
+    let retry_account_check = move |_| {
+        spawn_local(async move {
+            account_state.set(load_account_state().await);
+        });
     };
 
     Effect::new(move |_| {
@@ -4001,6 +4126,10 @@ pub fn Board() -> impl IntoView {
     };
 
     let keyboard_listener = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
+        if matches!(account_state.get_untracked(), AccountState::SignedIn(entitlement) if !entitlement.can_sync())
+        {
+            return;
+        }
         if ev.key() == "Escape" && !keyboard_target_is_editable(&ev) {
             if pending_delete_space.get_untracked().is_some() {
                 pending_delete_space.set(None);
@@ -4665,6 +4794,44 @@ pub fn Board() -> impl IntoView {
                         "restore workspace"
                         <input type="file" accept="application/json,.json" class="sr-only" on:change=restore_file/>
                     </label>
+                    <span class="hidden h-5 w-px bg-ink-soft/20 sm:block"></span>
+                    {move || match account_state.get() {
+                        AccountState::SignedIn(entitlement) => view! {
+                            <span class=if entitlement.can_sync() {
+                                "rounded-[3px] bg-note-green/70 px-2 py-2 text-xs text-note-ink-green"
+                            } else {
+                                "rounded-[3px] bg-note-yellow/80 px-2 py-2 text-xs text-note-ink-yellow"
+                            }>
+                                {if entitlement.can_sync() { "pro" } else { "account" }}
+                            </span>
+                            {if !entitlement.can_sync() {
+                                view! {
+                                    <a href="#account-gate" class="rounded-[3px] bg-marker px-2 py-2 text-sm font-medium text-ink hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40">
+                                        "upgrade"
+                                    </a>
+                                }.into_any()
+                            } else {
+                                ().into_any()
+                            }}
+                            <button type="button" on:click=move |_| spawn_local(sign_out()) class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
+                                "sign out"
+                            </button>
+                        }.into_any(),
+                        AccountState::Checking => view! {
+                            <span class="px-2 py-2 text-xs text-ink-soft">"checking account…"</span>
+                        }.into_any(),
+                        AccountState::Guest => view! {
+                            <a href="/signin" class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
+                                "sign in"
+                            </a>
+                            <a href="/signup" class="rounded-[3px] bg-marker px-3 py-2 text-sm font-medium text-ink hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40">
+                                "sign up"
+                            </a>
+                        }.into_any(),
+                        AccountState::Unavailable => view! {
+                            <span class="px-2 py-2 text-xs text-ink-soft">"account check unavailable"</span>
+                        }.into_any(),
+                    }}
                 </div>
             </header>
 
@@ -4713,6 +4880,61 @@ pub fn Board() -> impl IntoView {
                     </span>
                 </div>
             </div>
+
+            {move || match account_state.get() {
+                AccountState::SignedIn(entitlement) if !entitlement.can_sync() => {
+                    let status_message = match entitlement.status {
+                        task_core::billing::SubscriptionStatus::Free =>
+                            "your account is ready, but sync is waiting for Pro",
+                        task_core::billing::SubscriptionStatus::PastDue =>
+                            "your payment needs attention before sync can continue",
+                        task_core::billing::SubscriptionStatus::Canceled
+                        | task_core::billing::SubscriptionStatus::Ended =>
+                            "your Pro subscription is not active right now",
+                        task_core::billing::SubscriptionStatus::Active =>
+                            "this account is not enabled for sync yet",
+                    };
+                    view! {
+                        <div id="account-gate" class="pointer-events-auto absolute inset-0 z-[80] grid place-items-center bg-paper/75 p-6 backdrop-blur-[2px]">
+                            <section class="w-full max-w-md rotate-[-0.5deg] rounded-[3px] border border-note-ink-yellow/30 bg-note-yellow p-6 text-note-ink-yellow shadow-xl">
+                                <p class="text-xs uppercase tracking-[0.16em] opacity-70">"signed in · local board paused"</p>
+                                <h2 class="mt-2 font-handwriting text-4xl">"one small step before sync"</h2>
+                                <p class="mt-2 text-sm leading-relaxed">{status_message}. Choose a plan to unlock this account, or sign out to keep using this board locally on this device.</p>
+                                <div class="mt-5 grid grid-cols-2 gap-2">
+                                    <button type="button" on:click=move |_| begin_checkout("month") class="rounded-[3px] bg-note-ink-yellow px-3 py-2 text-sm font-medium text-note-yellow hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
+                                        "Pro · $2 / month"
+                                    </button>
+                                    <button type="button" on:click=move |_| begin_checkout("year") class="rounded-[3px] border border-note-ink-yellow/40 px-3 py-2 text-sm font-medium hover:bg-note-yellow/50 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
+                                        "Pro · $20 / year"
+                                    </button>
+                                </div>
+                                {move || checkout_error.get().map(|message| view! {
+                                    <p class="mt-3 rounded-[3px] bg-note-pink/70 px-3 py-2 text-xs text-note-ink-pink">{message}</p>
+                                })}
+                                <button type="button" on:click=move |_| spawn_local(sign_out()) class="mt-4 w-full rounded-[3px] border border-note-ink-yellow/30 px-3 py-2 text-sm hover:bg-note-yellow/50 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
+                                    "sign out and use local version"
+                                </button>
+                            </section>
+                        </div>
+                    }.into_any()
+                }
+                AccountState::Unavailable => view! {
+                    <div class="pointer-events-auto absolute inset-0 z-[80] grid place-items-center bg-paper/75 p-6 backdrop-blur-[2px]">
+                        <section class="w-full max-w-md rotate-[-0.5deg] rounded-[3px] border border-ink-soft/20 bg-paper-shelf p-6 text-ink shadow-xl">
+                            <p class="text-xs uppercase tracking-[0.16em] text-ink-soft">"account check unavailable"</p>
+                            <h2 class="mt-2 font-handwriting text-4xl">"let's check before opening the desk"</h2>
+                            <p class="mt-2 text-sm leading-relaxed text-ink-soft">"We couldn't confirm whether this session is signed in. The board is paused until we know whether it is a local guest board or a subscribed account."</p>
+                            <button type="button" on:click=retry_account_check class="mt-5 w-full rounded-[3px] bg-marker px-3 py-2 text-sm font-medium text-ink hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40">
+                                "check again"
+                            </button>
+                            <button type="button" on:click=move |_| spawn_local(sign_out()) class="mt-2 w-full rounded-[3px] border border-ink-soft/20 px-3 py-2 text-sm text-ink-soft hover:bg-paper hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
+                                "sign out and use local version"
+                            </button>
+                        </section>
+                    </div>
+                }.into_any(),
+                _ => ().into_any(),
+            }}
         </main>
     }
 }

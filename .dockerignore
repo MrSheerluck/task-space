@@ -1,0 +1,16 @@
+# Local build output can be very large and is rebuilt inside the image.
+target/
+
+# Git metadata and local-only configuration must never enter build contexts.
+.git/
+.env
+.env.*
+
+# Editor, OS, and transient files.
+.DS_Store
+*.log
+.cache/
+tmp/
+
+# Frontend dependency caches are not needed for the prebuilt static image.
+apps/web/node_modules/

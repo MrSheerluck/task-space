@@ -6,22 +6,22 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{Extension, State};
-use axum::http::Request;
+use axum::extract::{Extension, Path, State};
+use axum::http::{Request, StatusCode, header::CACHE_CONTROL};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
-use task_core::billing::Entitlement;
+use serde::{Deserialize, Serialize};
 use task_core::sync::{
     SYNC_PROTOCOL_VERSION, SyncPullRequest, SyncPullResponse, SyncPushRequest, SyncPushResponse,
 };
 use tokio_stream::StreamExt;
 
-use crate::billing::{BillingStore, BillingStoreError};
-use crate::{SyncStore, SyncStoreError};
+use crate::dodo::{BillingInterval, DodoClient, DodoError};
+use crate::postgres::{PostgresBillingStore, PostgresStoreError, PostgresSyncStore};
 
 /// The identity supplied by authentication middleware. Sync handlers never
 /// accept an account id from a request body or query parameter.
@@ -63,9 +63,11 @@ pub trait SessionVerifier: Send + Sync {
 
 #[derive(Clone)]
 pub struct SyncHttpState {
-    pub store: SyncStore,
-    pub billing: BillingStore,
+    pub store: PostgresSyncStore,
+    pub billing: PostgresBillingStore,
+    pub payments: DodoClient,
     pub verifier: Arc<dyn SessionVerifier>,
+    pub session_cookie_name: String,
 }
 
 /// Routes for the authenticated sync surface. The verifier and store are
@@ -75,8 +77,11 @@ pub fn protected_sync_router(state: SyncHttpState) -> Router {
     Router::new()
         .route("/sync/pull", post(sync_pull))
         .route("/sync/push", post(sync_push))
+        .route("/sync/spaces", get(list_spaces))
+        .route("/sync/spaces/{space_id}", post(register_space))
         .route("/sync/events", get(sync_events))
         .route("/account/entitlement", get(account_entitlement))
+        .route("/billing/checkout", post(create_checkout))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -89,18 +94,33 @@ async fn require_session(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let authorization = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AuthError::MissingAuthorization)?;
-    let bearer_token = authorization
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.trim().is_empty())
-        .ok_or(AuthError::InvalidAuthorization)?;
-    let account = state.verifier.verify(bearer_token).await?;
+    let token = if let Some(header) = request.headers().get(axum::http::header::AUTHORIZATION) {
+        let authorization = header
+            .to_str()
+            .map_err(|_| AuthError::InvalidAuthorization)?;
+        authorization
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or(AuthError::InvalidAuthorization)?
+    } else {
+        request
+            .headers()
+            .get(axum::http::header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|cookies| cookie_value(cookies, &state.session_cookie_name))
+            .ok_or(AuthError::MissingAuthorization)?
+    };
+    let account = state.verifier.verify(&token).await?;
     request.extensions_mut().insert(account);
     Ok(next.run(request).await)
+}
+
+fn cookie_value(cookies: &str, cookie_name: &str) -> Option<String> {
+    cookies.split(';').find_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        (name == cookie_name && !value.trim().is_empty()).then(|| value.to_owned())
+    })
 }
 
 async fn sync_pull(
@@ -111,6 +131,7 @@ async fn sync_pull(
     state
         .store
         .pull(&account.account_id, &request)
+        .await
         .map(Json)
         .map_err(ApiError::from)
 }
@@ -123,6 +144,7 @@ async fn sync_push(
     let event = state
         .store
         .push(&account.account_id, &request)
+        .await
         .map_err(ApiError::from)?;
     Ok(Json(SyncPushResponse {
         protocol_version: SYNC_PROTOCOL_VERSION,
@@ -153,48 +175,117 @@ async fn sync_events(
     )
 }
 
-async fn account_entitlement(
+async fn list_spaces(
     State(state): State<SyncHttpState>,
     Extension(account): Extension<AuthenticatedAccount>,
-) -> Result<Json<Entitlement>, ApiError> {
+) -> Result<Json<Vec<task_core::Space>>, ApiError> {
     state
-        .billing
-        .entitlement(&account.account_id)
+        .store
+        .list_spaces(&account.account_id)
+        .await
         .map(Json)
         .map_err(ApiError::from)
 }
 
-#[derive(Debug)]
-enum ApiError {
-    Sync(SyncStoreError),
-    Billing(BillingStoreError),
+#[derive(Debug, Deserialize)]
+struct RegisterSpaceRequest {
+    name: String,
 }
 
-impl From<SyncStoreError> for ApiError {
-    fn from(error: SyncStoreError) -> Self {
-        Self::Sync(error)
+async fn register_space(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Path(space_id): Path<u64>,
+    Json(request): Json<RegisterSpaceRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.name.trim().is_empty() {
+        return Err(ApiError::Store(PostgresStoreError::InvalidInput(
+            "space name cannot be empty".to_owned(),
+        )));
+    }
+    state
+        .store
+        .register_space(&account.account_id, space_id, request.name.trim())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn account_entitlement(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+) -> Result<Response, ApiError> {
+    let entitlement = state
+        .billing
+        .entitlement(&account.account_id)
+        .await
+        .map_err(ApiError::from)?;
+    let mut response = Json(entitlement).into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckoutRequest {
+    interval: BillingInterval,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckoutResponse {
+    checkout_url: String,
+}
+
+async fn create_checkout(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Json(request): Json<CheckoutRequest>,
+) -> Result<Json<CheckoutResponse>, ApiError> {
+    let checkout_url = state
+        .payments
+        .create_checkout(&account.account_id, request.interval)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(CheckoutResponse { checkout_url }))
+}
+
+#[derive(Debug)]
+enum ApiError {
+    Store(PostgresStoreError),
+    Dodo(DodoError),
+}
+
+impl From<PostgresStoreError> for ApiError {
+    fn from(error: PostgresStoreError) -> Self {
+        Self::Store(error)
     }
 }
 
-impl From<BillingStoreError> for ApiError {
-    fn from(error: BillingStoreError) -> Self {
-        Self::Billing(error)
+impl From<DodoError> for ApiError {
+    fn from(error: DodoError) -> Self {
+        Self::Dodo(error)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::Sync(SyncStoreError::SpaceAccessDenied) => (
+            Self::Store(PostgresStoreError::SpaceAccessDenied) => (
                 axum::http::StatusCode::FORBIDDEN,
                 "space access denied".to_owned(),
             ),
-            Self::Sync(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
-            Self::Billing(BillingStoreError::LockPoisoned) => (
+            Self::Store(PostgresStoreError::Database(_)) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "billing store unavailable".to_owned(),
+                "database unavailable".to_owned(),
             ),
-            Self::Billing(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
+            Self::Store(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
+            Self::Dodo(DodoError::Api { .. }) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "payment provider unavailable".to_owned(),
+            ),
+            Self::Dodo(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
         };
         (status, message).into_response()
     }

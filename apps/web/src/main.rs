@@ -4,7 +4,7 @@ use leptos::mount::mount_to_body;
 use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
-use pages::auth::{ForgotPassword, SignIn, SignUp};
+use pages::auth::{ForgotPassword, ResetPassword, SignIn, SignUp, VerifyEmail};
 use pages::board::Board;
 use pages::home::Home;
 
@@ -29,6 +29,8 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/signin") view=SignIn/>
                 <Route path=path!("/signup") view=SignUp/>
                 <Route path=path!("/forgot-password") view=ForgotPassword/>
+                <Route path=path!("/reset-password") view=ResetPassword/>
+                <Route path=path!("/verify-email") view=VerifyEmail/>
             </Routes>
         </Router>
     }

@@ -1,7 +1,7 @@
 .PHONY: dev css fonts check
 
 dev: css ## serve the web app (trunk) with hot reload; tailwind watches in background
-	cd apps/web && (npx @tailwindcss/cli -i src/input.css -o src/main.css --watch &) && trunk serve
+	cd apps/web && (npx @tailwindcss/cli -i src/input.css -o src/main.css --watch --poll=500 &) && env -u TRUNK_NO_COLOR -u NO_COLOR trunk serve
 
 css: fonts ## build tailwind tokens once
 	cd apps/web && npx @tailwindcss/cli -i src/input.css -o src/main.css
