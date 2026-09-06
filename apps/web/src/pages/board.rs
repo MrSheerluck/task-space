@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use super::account::{AccountState, load_account_state, sign_out, start_checkout};
+use super::account::{
+    AccountState, CheckoutReturnState, checkout_return_state, load_account_state,
+    load_account_state_after_checkout, sign_out, start_billing_portal, start_checkout,
+};
 use super::api::api_url;
 use gloo_net::http::Request;
 use js_sys::Array;
@@ -3678,6 +3681,7 @@ pub fn Board() -> impl IntoView {
     let account_state = RwSignal::new(AccountState::Checking);
     let sync_entitled = RwSignal::new(false);
     let checkout_error = RwSignal::new(None::<String>);
+    let checkout_pending = RwSignal::new(false);
     let crdt_docs = RwSignal::new(HashMap::<u64, SpaceDoc>::new());
     let next_space_id = RwSignal::new(
         spaces
@@ -3711,7 +3715,7 @@ pub fn Board() -> impl IntoView {
     );
 
     spawn_local(async move {
-        account_state.set(load_account_state().await);
+        account_state.set(load_account_state_after_checkout().await);
     });
 
     Effect::new(move |_| {
@@ -3771,6 +3775,7 @@ pub fn Board() -> impl IntoView {
 
     let begin_checkout = move |interval: &'static str| {
         checkout_error.set(None);
+        checkout_pending.set(true);
         spawn_local(async move {
             match start_checkout(interval).await {
                 Ok(url) => {
@@ -3778,7 +3783,28 @@ pub fn Board() -> impl IntoView {
                         let _ = window.location().set_href(&url);
                     }
                 }
-                Err(message) => checkout_error.set(Some(message)),
+                Err(message) => {
+                    checkout_pending.set(false);
+                    checkout_error.set(Some(message));
+                }
+            }
+        });
+    };
+
+    let begin_billing_portal = move |_| {
+        checkout_error.set(None);
+        checkout_pending.set(true);
+        spawn_local(async move {
+            match start_billing_portal().await {
+                Ok(url) => {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().set_href(&url);
+                    }
+                }
+                Err(message) => {
+                    checkout_pending.set(false);
+                    checkout_error.set(Some(message));
+                }
             }
         });
     };
@@ -4796,7 +4822,10 @@ pub fn Board() -> impl IntoView {
                     </label>
                     <span class="hidden h-5 w-px bg-ink-soft/20 sm:block"></span>
                     {move || match account_state.get() {
-                        AccountState::SignedIn(entitlement) => view! {
+                        AccountState::SignedIn(entitlement) => {
+                            let has_dodo_customer = entitlement.provider.as_deref() == Some("dodo")
+                                && entitlement.provider_customer_id.is_some();
+                            view! {
                             <span class=if entitlement.can_sync() {
                                 "rounded-[3px] bg-note-green/70 px-2 py-2 text-xs text-note-ink-green"
                             } else {
@@ -4810,13 +4839,28 @@ pub fn Board() -> impl IntoView {
                                         "upgrade"
                                     </a>
                                 }.into_any()
+                            } else if has_dodo_customer {
+                                view! {
+                                    <button
+                                        type="button"
+                                        disabled=move || checkout_pending.get()
+                                        on:click=begin_billing_portal
+                                        class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink disabled:cursor-wait disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                    >
+                                        {move || if checkout_pending.get() { "opening billing…" } else { "manage billing" }}
+                                    </button>
+                                }.into_any()
                             } else {
                                 ().into_any()
                             }}
+                            {move || checkout_error.get().map(|message| view! {
+                                <span class="max-w-56 rounded-[3px] bg-note-pink/70 px-2 py-2 text-xs text-note-ink-pink">{message}</span>
+                            })}
                             <button type="button" on:click=move |_| spawn_local(sign_out()) class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
                                 "sign out"
                             </button>
-                        }.into_any(),
+                            }.into_any()
+                        },
                         AccountState::Checking => view! {
                             <span class="px-2 py-2 text-xs text-ink-soft">"checking account…"</span>
                         }.into_any(),
@@ -4883,6 +4927,8 @@ pub fn Board() -> impl IntoView {
 
             {move || match account_state.get() {
                 AccountState::SignedIn(entitlement) if !entitlement.can_sync() => {
+                    let has_dodo_customer = entitlement.provider.as_deref() == Some("dodo")
+                        && entitlement.provider_customer_id.is_some();
                     let status_message = match entitlement.status {
                         task_core::billing::SubscriptionStatus::Free =>
                             "your account is ready, but sync is waiting for Pro",
@@ -4901,13 +4947,40 @@ pub fn Board() -> impl IntoView {
                                 <h2 class="mt-2 font-handwriting text-4xl">"one small step before sync"</h2>
                                 <p class="mt-2 text-sm leading-relaxed">{status_message}. Choose a plan to unlock this account, or sign out to keep using this board locally on this device.</p>
                                 <div class="mt-5 grid grid-cols-2 gap-2">
-                                    <button type="button" on:click=move |_| begin_checkout("month") class="rounded-[3px] bg-note-ink-yellow px-3 py-2 text-sm font-medium text-note-yellow hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
-                                        "Pro · $2 / month"
+                                    <button type="button" disabled=move || checkout_pending.get() on:click=move |_| begin_checkout("month") class="rounded-[3px] bg-note-ink-yellow px-3 py-2 text-sm font-medium text-note-yellow hover:brightness-110 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
+                                        {move || if checkout_pending.get() { "opening checkout…" } else { "Pro · $2 / month" }}
                                     </button>
-                                    <button type="button" on:click=move |_| begin_checkout("year") class="rounded-[3px] border border-note-ink-yellow/40 px-3 py-2 text-sm font-medium hover:bg-note-yellow/50 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
-                                        "Pro · $20 / year"
+                                    <button type="button" disabled=move || checkout_pending.get() on:click=move |_| begin_checkout("year") class="rounded-[3px] border border-note-ink-yellow/40 px-3 py-2 text-sm font-medium hover:bg-note-yellow/50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50">
+                                        {move || if checkout_pending.get() { "opening checkout…" } else { "Pro · $20 / year" }}
                                     </button>
                                 </div>
+                                {if has_dodo_customer {
+                                    view! {
+                                        <button
+                                            type="button"
+                                            disabled=move || checkout_pending.get()
+                                            on:click=begin_billing_portal
+                                            class="mt-2 w-full rounded-[3px] border border-note-ink-yellow/30 px-3 py-2 text-sm hover:bg-note-yellow/50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-note-ink-yellow/50"
+                                        >
+                                            {move || if checkout_pending.get() { "opening billing…" } else { "manage existing billing" }}
+                                        </button>
+                                    }.into_any()
+                                } else {
+                                    ().into_any()
+                                }}
+                                {match checkout_return_state() {
+                                    CheckoutReturnState::Pending => view! {
+                                        <p class="mt-3 rounded-[3px] border border-note-ink-yellow/30 bg-note-yellow/50 px-3 py-2 text-xs">
+                                            "payment returned successfully; waiting for account confirmation…"
+                                        </p>
+                                    }.into_any(),
+                                    CheckoutReturnState::Failed => view! {
+                                        <p class="mt-3 rounded-[3px] bg-note-pink/70 px-3 py-2 text-xs text-note-ink-pink">
+                                            "payment was not completed. Try again or choose another supported payment method."
+                                        </p>
+                                    }.into_any(),
+                                    CheckoutReturnState::None => ().into_any(),
+                                }}
                                 {move || checkout_error.get().map(|message| view! {
                                     <p class="mt-3 rounded-[3px] bg-note-pink/70 px-3 py-2 text-xs text-note-ink-pink">{message}</p>
                                 })}

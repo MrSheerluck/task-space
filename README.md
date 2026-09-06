@@ -68,6 +68,8 @@ The server now exposes the provider integration points:
   subscription events.
 - `/billing/checkout` creates a hosted monthly or yearly Dodo checkout for the
   authenticated account and puts the internal account id in provider metadata.
+- `/billing/portal` creates a short-lived Dodo Customer Portal session only for
+  an authenticated account with an active Dodo entitlement.
 - `/sync/spaces/{space_id}` registers the local space before any update can be
   pushed, preventing arbitrary client ids from creating server documents.
 - `DODO_PRO_MONTHLY_PRODUCT_ID` and `DODO_PRO_YEARLY_PRODUCT_ID` map the two
@@ -78,10 +80,9 @@ the paper UI static and proxies auth, sync, entitlement, checkout, and webhook
 paths to the Rust API container. The API waits for PostgreSQL, runs the checked
 in migrations, and does not fall back to browser storage or an in-memory store.
 
-For a local end-to-end run, create `.env` from `.env.example`, fill in WorkOS
-and Dodo test-mode values, and add both `http://localhost:3000/auth/callback`
-and the production callback URL to the WorkOS client. Start the API and
-database, then start Trunk in a second terminal:
+For a local UI-only run, create `.env` from `.env.example`, fill in WorkOS and
+Dodo test-mode values, start the API and database, then start Trunk in a second
+terminal:
 
 ```sh
 docker compose -f deploy/docker-compose.yml up --build postgres task-space-api
@@ -110,6 +111,44 @@ above; WorkOS credentials and session tokens stay server-side. Add the matching
 production URLs when deploying. Dodo should send the subscription lifecycle
 events listed in its webhook dashboard; the browser should only enable sync
 after the verified webhook has updated the server entitlement.
+
+Hosted checkout can be opened from localhost, but Dodo cannot deliver a
+webhook to a private `localhost` address. For a complete auth and payment test,
+run the built frontend and API behind the same HTTPS ngrok origin instead:
+
+```sh
+docker compose --env-file .env -f deploy/docker-compose.yml up --build -d \
+  postgres task-space-api task-space
+ngrok http 8081
+```
+
+The `task-space` container exposes its Nginx frontend/API proxy only on
+`127.0.0.1:8081`, so ngrok receives the same routing layout used in production.
+After ngrok prints its HTTPS URL, use that one origin everywhere:
+
+- `WORKOS_REDIRECT_URI=https://<ngrok-host>/auth/callback`
+- `WORKOS_POST_LOGIN_REDIRECT_URI=https://<ngrok-host>/app`
+- `WORKOS_TOKEN_ISSUER=https://api.workos.com/user_management/<default-client-id>`
+  (the exact access-token `iss`; WorkOS uses the environment's default
+  application client id when multiple applications share one user base)
+- `DODO_PAYMENTS_RETURN_URL=https://<ngrok-host>/app`
+- WorkOS Redirect URI: `https://<ngrok-host>/auth/callback`
+- WorkOS Sign-up URL: `https://<ngrok-host>/signup`
+- WorkOS Sign-in URL: `https://<ngrok-host>/auth/sign-in`
+- WorkOS Sign-out URI: `https://<ngrok-host>/`
+- WorkOS Password reset URL: `https://<ngrok-host>/reset-password`
+- Dodo test-mode webhook URL: `https://<ngrok-host>/webhooks/dodo`
+
+Restart `task-space-api` after changing `.env`. The Dodo endpoint must use the
+signing secret stored in `DODO_PAYMENTS_WEBHOOK_KEY` and subscribe to all
+`subscription.*` lifecycle events used by the server. Keep the ngrok process
+running for the entire checkout: the hosted payment may succeed without the
+local entitlement changing if the webhook cannot reach the tunnel.
+
+When testing an INR checkout with an India billing address, use Dodo's India
+test cards rather than the U.S. `4242…` card. The current success Visa is listed
+in Dodo's test-mode documentation; production card data must never be used in
+test mode.
 
 For launch pricing, the recommended starting point is **$2/month or
 $20/year**. The yearly plan is roughly a 17% discount while $1/month leaves too

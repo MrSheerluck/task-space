@@ -37,6 +37,7 @@ pub struct WorkOsAuthConfig {
     pub redirect_uri: String,
     pub post_login_redirect_uri: String,
     pub issuer: String,
+    pub token_issuer: Option<String>,
     pub cookie_name: String,
 }
 
@@ -50,6 +51,9 @@ impl WorkOsAuthConfig {
                 .unwrap_or_else(|_| "/app".to_owned()),
             issuer: std::env::var("WORKOS_ISSUER")
                 .unwrap_or_else(|_| "https://api.workos.com".to_owned()),
+            token_issuer: std::env::var("WORKOS_TOKEN_ISSUER")
+                .ok()
+                .filter(|issuer| !issuer.trim().is_empty()),
             cookie_name: std::env::var("WORKOS_SESSION_COOKIE")
                 .unwrap_or_else(|_| "task_space_session".to_owned()),
         })
@@ -216,11 +220,18 @@ impl WorkOsAuth {
         }
         Url::parse(&config.issuer)
             .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+        if let Some(token_issuer) = config.token_issuer.as_deref() {
+            Url::parse(token_issuer)
+                .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+        }
 
         Ok(Self {
             inner: Arc::new(WorkOsAuthInner {
                 config,
-                client: Client::new(),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?,
                 pending_states: Mutex::new(HashMap::new()),
                 jwks: tokio::sync::RwLock::new(None),
             }),
@@ -508,8 +519,9 @@ impl WorkOsAuth {
         }
     }
 
-    async fn fetch_jwks(&self) -> Result<Vec<WorkOsJwk>, AuthError> {
-        if let Some(cached) = self.inner.jwks.read().await.as_ref()
+    async fn fetch_jwks(&self, force_refresh: bool) -> Result<Vec<WorkOsJwk>, AuthError> {
+        if !force_refresh
+            && let Some(cached) = self.inner.jwks.read().await.as_ref()
             && cached.fetched_at.elapsed() <= JWKS_TTL
         {
             return Ok(cached.keys.clone());
@@ -553,29 +565,110 @@ impl WorkOsAuth {
 #[async_trait::async_trait]
 impl SessionVerifier for WorkOsAuth {
     async fn verify(&self, bearer_token: &str) -> Result<AuthenticatedAccount, AuthError> {
-        let header = decode_header(bearer_token).map_err(|_| AuthError::VerificationFailed)?;
+        let header = match decode_header(bearer_token) {
+            Ok(header) => header,
+            Err(error) => {
+                eprintln!("auth verification failed: malformed JWT header ({error})");
+                return Err(AuthError::VerificationFailed);
+            }
+        };
         if header.alg != Algorithm::RS256 {
+            eprintln!(
+                "auth verification failed: unsupported JWT algorithm {:?}",
+                header.alg
+            );
             return Err(AuthError::VerificationFailed);
         }
-        let keys = self.fetch_jwks().await?;
-        let jwk = keys
+        let mut keys = match self.fetch_jwks(false).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                eprintln!("auth verification failed: could not fetch WorkOS JWKS ({error:?})");
+                return Err(AuthError::VerificationFailed);
+            }
+        };
+        let mut jwk = keys
             .iter()
             .find(|key| key.kid.as_deref() == header.kid.as_deref())
             .filter(|key| key.kty == "RSA")
-            .ok_or(AuthError::VerificationFailed)?;
-        let key = DecodingKey::from_rsa_components(
-            jwk.n.as_deref().ok_or(AuthError::VerificationFailed)?,
-            jwk.e.as_deref().ok_or(AuthError::VerificationFailed)?,
-        )
-        .map_err(|_| AuthError::VerificationFailed)?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_issuer(&[self.inner.config.issuer.as_str()]);
-        validation.validate_aud = false;
-        let token = decode::<WorkOsClaims>(bearer_token, &key, &validation)
-            .map_err(|_| AuthError::VerificationFailed)?;
-        if token.claims.client_id != self.inner.config.client_id
-            || token.claims.iss != self.inner.config.issuer
+            .cloned();
+        // WorkOS can rotate signing keys while our short-lived JWKS cache is
+        // still warm. Retry once with a fresh key set before rejecting an
+        // otherwise well-formed session.
+        if jwk.is_none()
+            && let Ok(fresh_keys) = self.fetch_jwks(true).await
         {
+            keys = fresh_keys;
+            jwk = keys
+                .iter()
+                .find(|key| key.kid.as_deref() == header.kid.as_deref())
+                .filter(|key| key.kty == "RSA")
+                .cloned();
+        }
+        let jwk = match jwk {
+            Some(jwk) => jwk,
+            None => {
+                eprintln!(
+                    "auth verification failed: no RSA JWKS key matched token kid (keys={})",
+                    keys.len()
+                );
+                return Err(AuthError::VerificationFailed);
+            }
+        };
+        let key = DecodingKey::from_rsa_components(
+            match jwk.n.as_deref() {
+                Some(value) => value,
+                None => {
+                    eprintln!("auth verification failed: JWKS key has no modulus");
+                    return Err(AuthError::VerificationFailed);
+                }
+            },
+            match jwk.e.as_deref() {
+                Some(value) => value,
+                None => {
+                    eprintln!("auth verification failed: JWKS key has no exponent");
+                    return Err(AuthError::VerificationFailed);
+                }
+            },
+        )
+        .map_err(|error| {
+            eprintln!("auth verification failed: invalid JWKS RSA key ({error})");
+            AuthError::VerificationFailed
+        })?;
+        let base_issuer = self.inner.config.issuer.trim_end_matches('/');
+        let trailing_slash_issuer = format!("{base_issuer}/");
+        let user_management_issuer = format!(
+            "{base_issuer}/user_management/{}",
+            self.inner.config.client_id
+        );
+        let mut allowed_issuers = vec![
+            base_issuer.to_owned(),
+            trailing_slash_issuer,
+            user_management_issuer,
+        ];
+        if let Some(token_issuer) = self.inner.config.token_issuer.as_deref() {
+            let token_issuer = token_issuer.trim_end_matches('/');
+            allowed_issuers.push(token_issuer.to_owned());
+            allowed_issuers.push(format!("{token_issuer}/"));
+        }
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&allowed_issuers);
+        validation.validate_aud = false;
+        let token = match decode::<WorkOsClaims>(bearer_token, &key, &validation) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("auth verification failed: JWT validation/claims failed ({error})");
+                return Err(AuthError::VerificationFailed);
+            }
+        };
+        let client_id_matches = token.claims.client_id == self.inner.config.client_id;
+        let issuer_matches = allowed_issuers
+            .iter()
+            .any(|issuer| issuer == &token.claims.iss);
+        if !client_id_matches || !issuer_matches {
+            eprintln!(
+                "auth verification failed: token claims do not match server configuration (client_id_match={client_id_matches}, issuer_match={issuer_matches})"
+            );
             return Err(AuthError::VerificationFailed);
         }
         let user_id = token.claims.sub;

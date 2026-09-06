@@ -82,6 +82,7 @@ pub fn protected_sync_router(state: SyncHttpState) -> Router {
         .route("/sync/events", get(sync_events))
         .route("/account/entitlement", get(account_entitlement))
         .route("/billing/checkout", post(create_checkout))
+        .route("/billing/portal", post(create_billing_portal))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -104,14 +105,33 @@ async fn require_session(
             .map(str::to_owned)
             .ok_or(AuthError::InvalidAuthorization)?
     } else {
-        request
+        match request
             .headers()
             .get(axum::http::header::COOKIE)
             .and_then(|value| value.to_str().ok())
             .and_then(|cookies| cookie_value(cookies, &state.session_cookie_name))
-            .ok_or(AuthError::MissingAuthorization)?
+        {
+            Some(token) => token,
+            None => {
+                eprintln!(
+                    "auth rejected: no {} cookie for {}",
+                    state.session_cookie_name,
+                    request.uri().path()
+                );
+                return Err(AuthError::MissingAuthorization);
+            }
+        }
     };
-    let account = state.verifier.verify(&token).await?;
+    let account = match state.verifier.verify(&token).await {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!(
+                "auth rejected: session verification failed for {}",
+                request.uri().path()
+            );
+            return Err(error);
+        }
+    };
     request.extensions_mut().insert(account);
     Ok(next.run(request).await)
 }
@@ -238,6 +258,11 @@ struct CheckoutResponse {
     checkout_url: String,
 }
 
+#[derive(Debug, Serialize)]
+struct BillingPortalResponse {
+    portal_url: String,
+}
+
 async fn create_checkout(
     State(state): State<SyncHttpState>,
     Extension(account): Extension<AuthenticatedAccount>,
@@ -247,14 +272,40 @@ async fn create_checkout(
         .payments
         .create_checkout(&account.account_id, request.interval)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|error| {
+            eprintln!("Dodo checkout failed for an authenticated account: {error}");
+            ApiError::from(error)
+        })?;
     Ok(Json(CheckoutResponse { checkout_url }))
+}
+
+async fn create_billing_portal(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+) -> Result<Json<BillingPortalResponse>, ApiError> {
+    let entitlement = state
+        .billing
+        .entitlement(&account.account_id)
+        .await
+        .map_err(ApiError::from)?;
+    let customer_id = entitlement
+        .provider_customer_id
+        .as_deref()
+        .filter(|_| entitlement.provider.as_deref() == Some("dodo"))
+        .ok_or(ApiError::BillingPortalUnavailable)?;
+    let portal_url = state
+        .payments
+        .create_customer_portal(customer_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(BillingPortalResponse { portal_url }))
 }
 
 #[derive(Debug)]
 enum ApiError {
     Store(PostgresStoreError),
     Dodo(DodoError),
+    BillingPortalUnavailable,
 }
 
 impl From<PostgresStoreError> for ApiError {
@@ -281,11 +332,19 @@ impl IntoResponse for ApiError {
                 "database unavailable".to_owned(),
             ),
             Self::Store(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
-            Self::Dodo(DodoError::Api { .. }) => (
+            Self::Dodo(DodoError::Api { status, .. }) => (
                 axum::http::StatusCode::BAD_GATEWAY,
-                "payment provider unavailable".to_owned(),
+                format!("payment provider rejected checkout (HTTP {status})"),
+            ),
+            Self::Dodo(DodoError::Request(_)) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "payment provider unavailable; please try again".to_owned(),
             ),
             Self::Dodo(error) => (axum::http::StatusCode::BAD_REQUEST, error.to_string()),
+            Self::BillingPortalUnavailable => (
+                axum::http::StatusCode::BAD_REQUEST,
+                "billing portal is unavailable for this account".to_owned(),
+            ),
         };
         (status, message).into_response()
     }

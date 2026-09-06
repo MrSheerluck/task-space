@@ -5,7 +5,7 @@
 //! are forwarded to `BillingStore`.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -74,8 +74,12 @@ pub enum DodoError {
     Postgres(#[from] PostgresStoreError),
     #[error("Dodo API request failed with status {status}: {body}")]
     Api { status: u16, body: String },
+    #[error("Dodo API could not be reached: {0}")]
+    Request(String),
     #[error("Dodo checkout response did not contain a checkout URL")]
     MissingCheckoutUrl,
+    #[error("Dodo customer portal response did not contain a portal URL")]
+    MissingPortalUrl,
 }
 
 #[derive(Clone, Debug)]
@@ -124,10 +128,23 @@ impl DodoClient {
                 "Dodo API key, return URL, and both product ids are required".to_owned(),
             ));
         }
-        Ok(Self {
-            client: reqwest::Client::new(),
-            config,
-        })
+        if !matches!(config.environment.as_str(), "test_mode" | "live_mode") {
+            return Err(DodoError::InvalidPayload(
+                "DODO_PAYMENTS_ENVIRONMENT must be test_mode or live_mode".to_owned(),
+            ));
+        }
+        let return_url = url::Url::parse(&config.return_url)
+            .map_err(|error| DodoError::InvalidPayload(format!("invalid return URL: {error}")))?;
+        if !matches!(return_url.scheme(), "http" | "https") {
+            return Err(DodoError::InvalidPayload(
+                "DODO_PAYMENTS_RETURN_URL must use http or https".to_owned(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|error| DodoError::Request(error.to_string()))?;
+        Ok(Self { client, config })
     }
 
     pub async fn create_checkout(
@@ -142,11 +159,7 @@ impl DodoClient {
         let base_url = match self.config.environment.as_str() {
             "test_mode" => "https://test.dodopayments.com",
             "live_mode" => "https://live.dodopayments.com",
-            _ => {
-                return Err(DodoError::InvalidPayload(
-                    "DODO_PAYMENTS_ENVIRONMENT must be test_mode or live_mode".to_owned(),
-                ));
-            }
+            _ => unreachable!("Dodo environment is validated during client construction"),
         };
         let response = self
             .client
@@ -159,7 +172,7 @@ impl DodoClient {
             }))
             .send()
             .await
-            .map_err(|error| DodoError::InvalidPayload(error.to_string()))?;
+            .map_err(|error| DodoError::Request(error.to_string()))?;
         let status = response.status();
         let body = response
             .text()
@@ -175,11 +188,57 @@ impl DodoClient {
             .map_err(|error| DodoError::InvalidPayload(error.to_string()))?;
         checkout.checkout_url.ok_or(DodoError::MissingCheckoutUrl)
     }
+
+    pub async fn create_customer_portal(&self, customer_id: &str) -> Result<String, DodoError> {
+        if !customer_id.starts_with("cus_")
+            || !customer_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(DodoError::InvalidPayload(
+                "invalid Dodo customer id".to_owned(),
+            ));
+        }
+        let base_url = match self.config.environment.as_str() {
+            "test_mode" => "https://test.dodopayments.com",
+            "live_mode" => "https://live.dodopayments.com",
+            _ => unreachable!("Dodo environment is validated during client construction"),
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{base_url}/customers/{customer_id}/customer-portal/session"
+            ))
+            .bearer_auth(&self.config.api_key)
+            .query(&[("return_url", self.config.return_url.as_str())])
+            .send()
+            .await
+            .map_err(|error| DodoError::Request(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| DodoError::InvalidPayload(error.to_string()))?;
+        if !status.is_success() {
+            return Err(DodoError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let portal: CustomerPortalResponse = serde_json::from_str(&body)
+            .map_err(|error| DodoError::InvalidPayload(error.to_string()))?;
+        portal.link.ok_or(DodoError::MissingPortalUrl)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct CheckoutSessionResponse {
     checkout_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomerPortalResponse {
+    link: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,8 +316,12 @@ impl DodoWebhook {
         let Some(event_type) = normalize_event_type(&payload.event_type) else {
             return Ok(None);
         };
-        let product_id = payload
-            .data
+        // Current subscription webhooks put the resource directly in `data`.
+        // Some Dodo webhook examples and older payloads wrap it in
+        // `data.object`; accepting both prevents valid signed events from being
+        // silently ignored during provider-side schema transitions.
+        let data = payload.data.get("object").unwrap_or(&payload.data);
+        let product_id = data
             .get("product_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
@@ -267,14 +330,13 @@ impl DodoWebhook {
         {
             return Ok(None);
         }
-        let account_id = payload
-            .data
+        let account_id = data
             .get("metadata")
             .and_then(|metadata| metadata.get("account_id"))
             .and_then(Value::as_str)
             .filter(|account_id| !account_id.trim().is_empty())
             .ok_or(DodoError::MissingAccountMetadata)?;
-        let status = normalize_status(&payload.event_type, &payload.data).ok_or_else(|| {
+        let status = normalize_status(&payload.event_type, data).ok_or_else(|| {
             DodoError::InvalidPayload("subscription status is missing".to_owned())
         })?;
         let occurred_at = payload
@@ -291,19 +353,16 @@ impl DodoWebhook {
             account_id: account_id.to_owned(),
             plan: SubscriptionPlan::Pro,
             status,
-            provider_customer_id: customer_id(&payload.data),
-            provider_subscription_id: payload
-                .data
+            provider_customer_id: customer_id(data),
+            provider_subscription_id: data
                 .get("subscription_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            current_period_end: payload
-                .data
+            current_period_end: data
                 .get("next_billing_date")
                 .and_then(Value::as_str)
                 .and_then(parse_timestamp),
-            cancel_at_period_end: payload
-                .data
+            cancel_at_period_end: data
                 .get("cancel_at_next_billing_date")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
@@ -489,6 +548,36 @@ mod tests {
         .unwrap()
     }
 
+    fn client_config() -> DodoClientConfig {
+        DodoClientConfig {
+            api_key: "dodo_test_example".to_owned(),
+            environment: "test_mode".to_owned(),
+            return_url: "http://localhost:8080/app".to_owned(),
+            pro_monthly_product_id: "prod-monthly".to_owned(),
+            pro_yearly_product_id: "prod-yearly".to_owned(),
+        }
+    }
+
+    #[test]
+    fn checkout_configuration_is_validated_at_startup() {
+        assert!(DodoClient::new(client_config()).is_ok());
+
+        let mut bad_environment = client_config();
+        bad_environment.environment = "test".to_owned();
+        assert!(matches!(
+            DodoClient::new(bad_environment),
+            Err(DodoError::InvalidPayload(message))
+                if message.contains("DODO_PAYMENTS_ENVIRONMENT")
+        ));
+
+        let mut bad_return_url = client_config();
+        bad_return_url.return_url = "/app".to_owned();
+        assert!(matches!(
+            DodoClient::new(bad_return_url),
+            Err(DodoError::InvalidPayload(message)) if message.contains("return URL")
+        ));
+    }
+
     fn signed_headers(body: &[u8]) -> HeaderMap {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -562,6 +651,33 @@ mod tests {
             event.provider_subscription_id.as_deref(),
             Some("sub-yearly")
         );
+    }
+
+    #[test]
+    fn accepts_object_wrapped_subscription_payloads() {
+        let body = br#"{
+            "type":"subscription.updated",
+            "timestamp":"2026-09-03T05:00:00Z",
+            "data":{"object":{
+                "product_id":"prod-monthly",
+                "subscription_id":"sub-wrapped",
+                "status":"active",
+                "customer_id":"cus-wrapped",
+                "metadata":{"account_id":"account-wrapped"}
+            }}
+        }"#;
+        let event = webhook()
+            .normalize(&signed_headers(body), body)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.account_id, "account-wrapped");
+        assert_eq!(event.status, SubscriptionStatus::Active);
+        assert_eq!(
+            event.provider_subscription_id.as_deref(),
+            Some("sub-wrapped")
+        );
+        assert_eq!(event.provider_customer_id.as_deref(), Some("cus-wrapped"));
     }
 
     #[test]
