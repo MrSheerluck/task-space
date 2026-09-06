@@ -1,4 +1,19 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: taskspace
+      POSTGRES_USER: taskspace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskspace -d taskspace"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped
@@ -15,6 +30,29 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
+    depends_on:
+      - task-space-api
+    # Unified frontend + API origin for local HTTPS tunnel testing (for
+    # example, `ngrok http 8081`). Keep it loopback-only on the host.
+    ports:
+      - "127.0.0.1:8081:80"
+
+  task-space-api:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgres://taskspace:${POSTGRES_PASSWORD:-change-me-local-only}@postgres:5432/taskspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Loopback binding supports local Trunk development on :8080 without
+    # exposing the authenticated API to the public network.
+    ports:
+      - "127.0.0.1:3000:3000"
 
   # journal: second SMBL product
   # (in its own compose once its source + domain + secrets are confirmed;
@@ -27,3 +65,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  postgres_data:

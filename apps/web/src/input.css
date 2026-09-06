@@ -57,3 +57,44 @@
     color: var(--color-ink);
   }
 }
+
+@layer components {
+  .context-menu-item {
+    width: 100%;
+    border-radius: 3px;
+    padding: 0.4rem 0.5rem;
+    text-align: left;
+    font-size: 0.8rem;
+    line-height: 1.25rem;
+    color: var(--color-ink-soft);
+  }
+
+  .context-menu-item:hover,
+  .context-menu-item:focus-visible {
+    background: rgb(255 255 255 / 0.65);
+    color: var(--color-ink);
+  }
+
+  .context-menu-item:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--color-ink) 30%, transparent);
+    outline-offset: 1px;
+  }
+
+  .context-menu-item-accent {
+    background: var(--color-marker);
+    color: var(--color-ink);
+    font-weight: 600;
+  }
+
+  .context-menu-item-danger:hover,
+  .context-menu-item-danger:focus-visible {
+    background: var(--color-note-pink);
+    color: var(--color-note-ink-pink);
+  }
+
+  .context-menu-item-disabled,
+  .context-menu-item:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+  }
+}

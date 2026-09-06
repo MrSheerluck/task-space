@@ -1,10 +1,17 @@
-use gloo_net::http::Request;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use super::account::{AccountState, load_account_state, sign_out};
 
 #[component]
-fn MockNote(bg: &'static str, ink: &'static str, rot: &'static str, text: &'static str, done: bool, due: &'static str) -> impl IntoView {
+fn MockNote(
+    bg: &'static str,
+    ink: &'static str,
+    rot: &'static str,
+    text: &'static str,
+    done: bool,
+    due: &'static str,
+) -> impl IntoView {
     view! {
         <div
             class=format!(
@@ -128,6 +135,11 @@ fn GithubLink(class: &'static str) -> impl IntoView {
 
 #[component]
 fn Header() -> impl IntoView {
+    let account_state = RwSignal::new(AccountState::Checking);
+    spawn_local(async move {
+        account_state.set(load_account_state().await);
+    });
+
     view! {
         <header class="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-6 py-4">
             <a href="/" class="flex items-center gap-2">
@@ -140,13 +152,51 @@ fn Header() -> impl IntoView {
                 <a href="#features" class="hidden sm:block hover:text-ink">
                     "features"
                 </a>
+                {move || match account_state.get() {
+                    AccountState::SignedIn(entitlement) => view! {
+                        <a href="/app" class="hover:text-ink">
+                            "open board"
+                        </a>
+                        {if entitlement.can_sync() {
+                            view! {
+                                <span class="hidden rounded-[3px] border border-note-ink-green/30 bg-note-green/60 px-2 py-1 text-xs text-note-ink-green sm:inline-block">
+                                    "pro member"
+                                </span>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <a href="/app" class="rounded-[3px] bg-marker px-3 py-1.5 font-medium text-ink hover:brightness-95">
+                                    "upgrade"
+                                </a>
+                            }.into_any()
+                        }}
+                        <button
+                            type="button"
+                            on:click=move |_| spawn_local(sign_out())
+                            class="hover:text-ink"
+                        >
+                            "sign out"
+                        </button>
+                    }.into_any(),
+                    AccountState::Checking => view! {
+                        <span class="text-xs text-ink-soft">"checking account…"</span>
+                    }.into_any(),
+                    AccountState::Guest => view! {
+                        <a href="/signin" class="hover:text-ink">
+                            "sign in"
+                        </a>
+                        <a
+                            href="/signup"
+                            class="bg-marker text-ink rounded-[3px] px-3 py-1.5 font-medium hover:brightness-95"
+                        >
+                            "start writing"
+                        </a>
+                    }.into_any(),
+                    AccountState::Unavailable => view! {
+                        <span class="text-xs text-ink-soft">"account check unavailable"</span>
+                    }.into_any(),
+                }}
                 <GithubLink class="hover:text-ink"/>
-                <a
-                    href="#waitlist"
-                    class="bg-marker text-ink rounded-[3px] px-3 py-1.5 font-medium hover:brightness-95"
-                >
-                    "join the waitlist"
-                </a>
             </nav>
         </header>
     }
@@ -168,110 +218,6 @@ fn Feature(icon: &'static str, title: &'static str, body: &'static str) -> impl 
         </div>
     }
 }
-
-#[component]
-fn WaitlistForm() -> impl IntoView {
-    let email = RwSignal::new(String::new());
-    let status = RwSignal::new(None::<&'static str>);
-
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let value = email.get_untracked().trim().to_string();
-        if !value.contains('@') {
-            status.set(Some("invalid"));
-            return;
-        }
-        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-            let _ = storage.set_item("task-space.waitlist", &value);
-        }
-        status.set(Some("sending"));
-        let url = format!("{WAITLIST_API}/waitlist");
-        spawn_local(async move {
-            let body = serde_json::json!({ "email": value, "source": "landing" });
-            let ok = match Request::post(&url).json(&body) {
-                Ok(request) => request.send().await.is_ok(),
-                Err(_) => false,
-            };
-            status.set(if ok { Some("server") } else { Some("local") });
-        });
-    };
-
-    view! {
-        <div id="waitlist">
-            <form
-                on:submit=submit
-                class="mt-6 flex flex-col sm:flex-row gap-3 max-w-md"
-            >
-                <input
-                    type="email"
-                    required
-                    placeholder="you@example.com"
-                    bind:value=email
-                    class="flex-1 rounded-[3px] border border-ink/25 bg-blank px-4 py-2.5 placeholder:text-ink-soft/60 focus:outline-none focus:border-ink"
-                />
-                <button
-                    type="submit"
-                    disabled=move || {
-                        status.get() == Some("sending") || status.get() == Some("server")
-                    }
-                    class=move || {
-                        format!(
-                            "rounded-[3px] px-5 py-2.5 font-medium shadow hover:brightness-95 {}",
-                            if status.get() == Some("sending") {
-                                "bg-paper-shelf text-ink-soft"
-                            } else if status.get() == Some("server") {
-                                "bg-note-green text-note-ink-green"
-                            } else {
-                                "bg-marker text-ink"
-                            }
-                        )
-                    }
-                >
-                    {move || match status.get() {
-                        Some("sending") => "waiting…",
-                        Some("server") => "done",
-                        _ => "join the waitlist",
-                    }}
-                </button>
-            </form>
-            <p class="mt-3 text-sm text-ink-soft">
-                "no account needed. no spam. we write once the board is ready."
-            </p>
-            {move || match status.get() {
-                Some("server") => {
-                    view! {
-                        <div class="mt-4 max-w-md rounded-[3px] bg-note-yellow text-note-ink-yellow px-4 py-2 rotate-[-0.5deg] shadow">
-                            "you're on the list. we'll ping you when Task Space opens."
-                        </div>
-                    }
-                    .into_any()
-                }
-                Some("local") => {
-                    view! {
-                        <div class="mt-4 max-w-md rounded-[3px] bg-note-pink text-note-ink-pink px-4 py-2 rotate-[-0.5deg] shadow">
-                            "couldn't reach the waitlist. your email is saved on this device for now."
-                        </div>
-                    }
-                    .into_any()
-                }
-                Some("invalid") => {
-                    view! {
-                        <div class="mt-4 max-w-md rounded-[3px] bg-note-pink text-note-ink-pink px-4 py-2 rotate-[-0.5deg] shadow">
-                            "that doesn't look like an email. try you@example.com"
-                        </div>
-                    }
-                    .into_any()
-                }
-                _ => ().into_any(),
-            }}
-        </div>
-    }
-}
-
-const WAITLIST_API: &str = match option_env!("WAITLIST_API") {
-    Some(url) => url,
-    None => "https://task-space-waitlist.mrsheerluck003.workers.dev",
-};
 
 #[component]
 fn Footer() -> impl IntoView {
@@ -317,10 +263,23 @@ pub fn Home() -> impl IntoView {
                             works offline, data stays in your browser, sync across devices
                             is optional, and only when you want it."
                         </p>
-                        <span class="sr-only" id="waitlist-heading">
-                            "join the waitlist"
-                        </span>
-                        <WaitlistForm/>
+                        <div class="mt-6 flex flex-wrap items-center gap-3">
+                            <a
+                                href="/app"
+                                class="rounded-[3px] bg-marker px-5 py-2.5 font-medium text-ink shadow hover:brightness-95"
+                            >
+                                "open my board"
+                            </a>
+                            <a
+                                href="/signup"
+                                class="rounded-[3px] border border-ink/20 bg-paper-shelf/70 px-5 py-2.5 font-medium text-ink-soft hover:bg-paper-shelf hover:text-ink"
+                            >
+                                "create an account"
+                            </a>
+                        </div>
+                        <p class="mt-3 text-sm text-ink-soft">
+                            "start locally for free. sign in only when you want sync across devices."
+                        </p>
                     </div>
                     <div class="flex justify-center">
                         <BoardMock/>
@@ -378,7 +337,7 @@ pub fn Home() -> impl IntoView {
                                 "pro"
                             </h3>
                             <p class="font-handwriting text-5xl mt-1">
-                                "€3 / mo · tbd"
+                                "$2 / mo · $20 / yr"
                             </p>
                             <ul class="mt-3 space-y-1 text-sm">
                                 <li>"sync your spaces across any browser (web app, installable)"</li>
@@ -386,10 +345,10 @@ pub fn Home() -> impl IntoView {
                                 <li>"runs offline everywhere, syncs when it can"</li>
                             </ul>
                             <a
-                                class="mt-5 inline-block rounded-[3px] bg-ink text-paper px-4 py-2 text-sm opacity-70 pointer-events-none"
-                                aria-disabled="true"
+                                href="/signup"
+                                class="mt-5 inline-block rounded-[3px] bg-ink px-4 py-2 text-sm text-paper hover:brightness-110"
                             >
-                                "coming soon"
+                                "choose Pro after sign up"
                             </a>
                         </div>
                     </div>
