@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use web_sys::{RequestCredentials, UrlSearchParams};
 
 use super::account::{load_account_state, remember_authenticated_session};
-use super::api::api_url;
+use super::api::{api_url, send_request_with_timeout};
 
 const PENDING_AUTH_STORAGE_KEY: &str = "task_space_pending_auth";
 
@@ -47,8 +47,7 @@ async fn post_auth<T: Serialize>(path: &str, payload: &T) -> Result<AuthApiRespo
         .credentials(RequestCredentials::Include)
         .json(payload)
         .map_err(|_| "the form could not be sent".to_owned())?;
-    let response = builder
-        .send()
+    let response = send_request_with_timeout(builder)
         .await
         .map_err(|_| "the server could not be reached".to_owned())?;
     let status = response.status();

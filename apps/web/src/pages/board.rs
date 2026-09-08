@@ -1,22 +1,26 @@
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use super::account::{
     AccountState, CheckoutReturnState, checkout_return_state, load_account_state,
-    load_account_state_after_checkout, sign_out, start_billing_portal, start_checkout,
+    load_account_state_after_checkout, refresh_session_once, sign_out, start_billing_portal,
+    start_checkout,
 };
-use super::api::api_url;
-use gloo_net::http::Request;
+use super::api::{api_url, send_request_with_timeout, send_with_timeout};
+use gloo_net::http::{Request, Response};
 use js_sys::Array;
 use leptos::ev::{Event, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
-use leptos::leptos_dom::helpers::window_event_listener;
+use leptos::leptos_dom::helpers::{window_event_listener, window_event_listener_untyped};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
-use task_core::billing::Entitlement;
 use task_core::crdt::SpaceDoc;
 use task_core::sync::EncodedUpdate;
 use task_core::sync::{
-    SYNC_PROTOCOL_VERSION, SyncEvent, SyncPullRequest, SyncPullResponse, SyncPushRequest,
+    MAX_SYNC_SNAPSHOT_BYTES, MAX_SYNC_STATE_VECTOR_BYTES, MAX_SYNC_UPDATE_BYTES,
+    SYNC_PROTOCOL_VERSION, SYNC_RECONCILE_PROTOCOL_VERSION, SpaceMetadataOperation, SyncEvent,
+    SyncMetadataRequest, SyncMetadataResponse, SyncPullRequest, SyncPullResponse,
+    SyncReconcileRequest, SyncReconcileResponse,
 };
 use task_core::{
     BoardData, CURRENT_SCHEMA_VERSION, Group, Note, NoteColor, NoteStatus, Space, Tombstone,
@@ -33,7 +37,8 @@ const STORAGE_KEY: &str = "task-space.board.v2";
 const LEGACY_STORAGE_KEY: &str = "task-space.board.v1";
 const LEGACY_WORKSPACE_STORAGE_KEY: &str = "task-space.workspace.v1";
 const DEVICE_ID_STORAGE_KEY: &str = "task-space.device-id.v1";
-const SYNC_SEQUENCE_STORAGE_KEY: &str = "task-space.sync-sequence.v1";
+const GUEST_PRINCIPAL_STORAGE_KEY: &str = "task-space.guest-principal.v1";
+const GUEST_LEGACY_MIGRATED_STORAGE_KEY: &str = "task-space.guest-legacy-migrated.v1";
 const VIEW_STORAGE_KEY_PREFIX: &str = "task-space.view.v2.";
 const LEGACY_VIEW_STORAGE_KEY: &str = "task-space.view.v1";
 const MAX_HISTORY: usize = 100;
@@ -45,15 +50,145 @@ const BOTTOM_PADDING: f64 = 24.0;
 const MIN_GROUP_WIDTH: f64 = NOTE_WIDTH + HORIZONTAL_PADDING * 2.0;
 const MIN_GROUP_HEIGHT: f64 = NOTE_HEIGHT + TOP_PADDING + BOTTOM_PADDING;
 
+#[derive(Clone, Copy)]
+struct SyncRuntime {
+    run_generation: u64,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+    status: RwSignal<SyncStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncStatus {
+    Disabled,
+    Checking,
+    Syncing,
+    Synced,
+    Offline,
+    AuthPaused,
+    BillingPaused,
+    Error,
+}
+
+impl SyncStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "local only",
+            Self::Checking => "checking account…",
+            Self::Syncing => "syncing…",
+            Self::Synced => "synced",
+            Self::Offline => "offline — changes saved locally",
+            Self::AuthPaused => "sign-in expired — changes saved locally",
+            Self::BillingPaused => "sync paused — changes saved locally",
+            Self::Error => "sync error — retry",
+        }
+    }
+}
+
+thread_local! {
+    static SYNC_PRINCIPAL: RefCell<String> = RefCell::new("guest".to_owned());
+    static SYNC_ACKED_STATE_VECTORS: RefCell<HashMap<(String, u64), Vec<u8>>> = RefCell::new(HashMap::new());
+    static SYNC_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static SYNC_DRAIN_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
+    static SYNC_DRAIN_PENDING: Cell<bool> = const { Cell::new(false) };
+    static SYNC_RUN_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static SYNC_RUNTIME: RefCell<Option<SyncRuntime>> = const { RefCell::new(None) };
+    static STORAGE_SCHEMA_BLOCKED: Cell<bool> = const { Cell::new(false) };
+    static LOCAL_GENERATIONS: RefCell<HashMap<(String, u64), u64>> = RefCell::new(HashMap::new());
+}
+
 #[wasm_bindgen(inline_js = r#"
+// 2026-09-08 static snippet cache-bust for the ngrok Wasm/SRI fix.
+let taskSpaceSyncPrincipal = "guest";
+const taskSpaceGuestLegacyMigratedKey = "task-space.guest-legacy-migrated.v1";
+
+function taskSpaceIsGuestPrincipal(principal) {
+  const value = String(principal || "guest");
+  return value === "guest" || value.startsWith("guest:");
+}
+
+function taskSpaceCanReadLegacyGuest() {
+  if (!taskSpaceIsGuestPrincipal(taskSpaceSyncPrincipal)) return false;
+  try {
+    return globalThis.localStorage?.getItem(taskSpaceGuestLegacyMigratedKey) !== "1";
+  } catch (_) {
+    return true;
+  }
+}
+
+function taskSpaceMarkLegacyGuestMigrated(principal) {
+  if (!taskSpaceIsGuestPrincipal(principal)) return;
+  try {
+    globalThis.localStorage?.setItem(taskSpaceGuestLegacyMigratedKey, "1");
+  } catch (_) {}
+}
+
+function taskSpaceKey(key) {
+  return taskSpaceKeyFor(taskSpaceSyncPrincipal, key);
+}
+
+function taskSpaceKeyFor(principal, key) {
+  return `${String(principal || "guest")}:${key}`;
+}
+
+export function taskSpaceSetSyncPrincipal(principal) {
+  taskSpaceSyncPrincipal = String(principal || "guest");
+  return taskSpaceSyncPrincipal;
+}
+
+function taskSpaceEnsureStores(db) {
+  if (!db.objectStoreNames.contains("workspace")) db.createObjectStore("workspace");
+  if (!db.objectStoreNames.contains("crdt")) db.createObjectStore("crdt");
+  if (!db.objectStoreNames.contains("crdt-updates")) db.createObjectStore("crdt-updates");
+  if (!db.objectStoreNames.contains("sync-state")) db.createObjectStore("sync-state");
+  if (!db.objectStoreNames.contains("metadata-updates")) db.createObjectStore("metadata-updates");
+  // One record per principal/space keeps the snapshot, acknowledged vector,
+  // generations, and outbox in one transaction. The older stores remain as
+  // migration fallbacks until all clients have opened version 6.
+  if (!db.objectStoreNames.contains("sync-records")) db.createObjectStore("sync-records");
+}
+
+function taskSpaceEmptySyncRecord(principal, spaceId) {
+  return {
+    principal: String(principal || "guest"),
+    spaceId: Number(spaceId),
+    snapshot: null,
+    acknowledgedStateVector: null,
+    localGeneration: 0,
+    acknowledgedGeneration: 0,
+    outbox: [],
+    lastError: null,
+  };
+}
+
+function taskSpaceSyncRecordKey(principal, spaceId) {
+  return taskSpaceKeyFor(principal, `space:${spaceId}`);
+}
+
+function taskSpaceSafeCounter(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+}
+
+function taskSpaceWorkspaceValue(value) {
+  if (value && typeof value === "object" && typeof value.raw === "string") {
+    return value.raw;
+  }
+  return value;
+}
+
 export function taskSpaceLoadWorkspace() {
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
     request.onupgradeneeded = () => {
+      taskSpaceEnsureStores(request.result);
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
       }
@@ -62,6 +197,12 @@ export function taskSpaceLoadWorkspace() {
       }
       if (!request.result.objectStoreNames.contains("crdt-updates")) {
         request.result.createObjectStore("crdt-updates");
+      }
+      if (!request.result.objectStoreNames.contains("sync-state")) {
+        request.result.createObjectStore("sync-state");
+      }
+      if (!request.result.objectStoreNames.contains("metadata-updates")) {
+        request.result.createObjectStore("metadata-updates");
       }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
@@ -76,29 +217,43 @@ export function taskSpaceLoadWorkspace() {
       }
       const transaction = db.transaction(storeName, "readonly");
       const store = transaction.objectStore(storeName);
-      const read = store.get("current");
+      const read = store.get(taskSpaceKey("current"));
       read.onerror = () => reject(read.error || new Error("Could not read workspace"));
       read.onsuccess = () => {
         if (read.result != null) {
-          resolve(read.result);
+          resolve(taskSpaceWorkspaceValue(read.result));
           return;
         }
-        const all = store.getAll();
-        all.onerror = () => reject(all.error || new Error("Could not list workspace records"));
-        all.onsuccess = () => resolve(all.result ?? null);
+        if (!taskSpaceCanReadLegacyGuest()) {
+          resolve(null);
+          return;
+        }
+        const legacy = store.get("current");
+        legacy.onerror = () => reject(legacy.error || new Error("Could not read legacy workspace"));
+        legacy.onsuccess = () => {
+          if (legacy.result != null) {
+            resolve(taskSpaceWorkspaceValue(legacy.result));
+            return;
+          }
+          resolve(null);
+        };
       };
     };
   });
 }
 
-export function taskSpaceSaveWorkspace(raw) {
+export function taskSpaceSaveWorkspace(raw, principal) {
+  const sequenceKey = taskSpaceKeyFor(principal, "workspace");
+  const writeSequence = (Number(taskSpaceWorkspaceWriteSequences.get(sequenceKey)) || 0) + 1;
+  taskSpaceWorkspaceWriteSequences.set(sequenceKey, writeSequence);
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
     request.onupgradeneeded = () => {
+      taskSpaceEnsureStores(request.result);
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
       }
@@ -108,14 +263,32 @@ export function taskSpaceSaveWorkspace(raw) {
       if (!request.result.objectStoreNames.contains("crdt-updates")) {
         request.result.createObjectStore("crdt-updates");
       }
+      if (!request.result.objectStoreNames.contains("sync-state")) {
+        request.result.createObjectStore("sync-state");
+      }
+      if (!request.result.objectStoreNames.contains("metadata-updates")) {
+        request.result.createObjectStore("metadata-updates");
+      }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
     request.onsuccess = () => {
       const db = request.result;
       const transaction = db.transaction("workspace", "readwrite");
-      transaction.objectStore("workspace").put(raw, "current");
+      const store = transaction.objectStore("workspace");
+      const key = taskSpaceKeyFor(principal, "current");
+      const read = store.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read workspace"));
+      read.onsuccess = () => {
+        const previousSequence = Number(read.result?.writeSequence) || 0;
+        if (writeSequence >= previousSequence) {
+          store.put({ raw, writeSequence }, key);
+        }
+      };
       transaction.onerror = () => reject(transaction.error || new Error("Could not save workspace"));
-      transaction.oncomplete = () => resolve(true);
+      transaction.oncomplete = () => {
+        taskSpaceMarkLegacyGuestMigrated(principal);
+        resolve(true);
+      };
     };
   });
 }
@@ -126,8 +299,9 @@ export function taskSpaceLoadCrdt(spaceId) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
     request.onupgradeneeded = () => {
+      taskSpaceEnsureStores(request.result);
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
       }
@@ -137,26 +311,52 @@ export function taskSpaceLoadCrdt(spaceId) {
       if (!request.result.objectStoreNames.contains("crdt-updates")) {
         request.result.createObjectStore("crdt-updates");
       }
+      if (!request.result.objectStoreNames.contains("sync-state")) {
+        request.result.createObjectStore("sync-state");
+      }
+      if (!request.result.objectStoreNames.contains("metadata-updates")) {
+        request.result.createObjectStore("metadata-updates");
+      }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
     request.onsuccess = () => {
       const db = request.result;
-      const transaction = db.transaction("crdt", "readonly");
-      const read = transaction.objectStore("crdt").get(`space:${spaceId}`);
-      read.onerror = () => reject(read.error || new Error("Could not read CRDT document"));
-      read.onsuccess = () => resolve(read.result ?? null);
+      const transaction = db.transaction(["sync-records", "crdt"], "readonly");
+      const recordRead = transaction.objectStore("sync-records").get(
+        taskSpaceSyncRecordKey(taskSpaceSyncPrincipal, spaceId),
+      );
+      recordRead.onerror = () => reject(recordRead.error || new Error("Could not read sync record"));
+      recordRead.onsuccess = () => {
+        if (recordRead.result?.snapshot != null) {
+          resolve(recordRead.result.snapshot);
+          return;
+        }
+        const read = transaction.objectStore("crdt").get(taskSpaceKey(`space:${spaceId}`));
+        read.onerror = () => reject(read.error || new Error("Could not read CRDT document"));
+        read.onsuccess = () => {
+          if (read.result != null || !taskSpaceCanReadLegacyGuest()) {
+            resolve(read.result ?? null);
+            return;
+          }
+          const legacy = transaction.objectStore("crdt").get(`space:${spaceId}`);
+          legacy.onerror = () => reject(legacy.error || new Error("Could not read legacy CRDT document"));
+          legacy.onsuccess = () => resolve(legacy.result ?? null);
+        };
+      };
     };
   });
 }
 
-export function taskSpaceSaveCrdt(spaceId, encodedSnapshot) {
+export function taskSpaceSaveCrdt(principal, spaceId, encodedSnapshot) {
+  const writeSequence = taskSpaceNextCrdtWriteSequence(principal, spaceId);
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
     request.onupgradeneeded = () => {
+      taskSpaceEnsureStores(request.result);
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
       }
@@ -166,26 +366,53 @@ export function taskSpaceSaveCrdt(spaceId, encodedSnapshot) {
       if (!request.result.objectStoreNames.contains("crdt-updates")) {
         request.result.createObjectStore("crdt-updates");
       }
+      if (!request.result.objectStoreNames.contains("sync-state")) {
+        request.result.createObjectStore("sync-state");
+      }
+      if (!request.result.objectStoreNames.contains("metadata-updates")) {
+        request.result.createObjectStore("metadata-updates");
+      }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
     request.onsuccess = () => {
       const db = request.result;
-      const transaction = db.transaction("crdt", "readwrite");
-      transaction.objectStore("crdt").put(encodedSnapshot, `space:${spaceId}`);
+      const transaction = db.transaction(["sync-records", "crdt"], "readwrite");
+      const records = transaction.objectStore("sync-records");
+      const key = taskSpaceSyncRecordKey(principal, spaceId);
+      const read = records.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read sync record"));
+      read.onsuccess = () => {
+        const record = read.result || taskSpaceEmptySyncRecord(principal, spaceId);
+        const previousSequence = taskSpaceSafeCounter(record.snapshotWriteSequence);
+        if (writeSequence >= previousSequence) {
+          record.snapshot = encodedSnapshot;
+          record.snapshotWriteSequence = writeSequence;
+        }
+        records.put(record, key);
+        // Keep the legacy mirror aligned with the accepted atomic record. An
+        // older async write may arrive after a newer snapshot; writing the
+        // incoming value unconditionally would reintroduce a stale fallback
+        // for older clients/readers.
+        if (record.snapshot != null) {
+          transaction.objectStore("crdt").put(record.snapshot, taskSpaceKeyFor(principal, `space:${spaceId}`));
+        }
+      };
       transaction.onerror = () => reject(transaction.error || new Error("Could not save CRDT document"));
       transaction.oncomplete = () => resolve(true);
     };
   });
 }
 
-export function taskSpaceQueueCrdtUpdate(spaceId, mutationId, encodedUpdate) {
+export function taskSpaceQueueCrdtUpdate(principal, spaceId, mutationId, stateVector, encodedUpdate, encodedSnapshot, localGeneration) {
+  const writeSequence = taskSpaceNextCrdtWriteSequence(principal, spaceId);
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
     request.onupgradeneeded = () => {
+      taskSpaceEnsureStores(request.result);
       if (!request.result.objectStoreNames.contains("workspace")) {
         request.result.createObjectStore("workspace");
       }
@@ -195,18 +422,128 @@ export function taskSpaceQueueCrdtUpdate(spaceId, mutationId, encodedUpdate) {
       if (!request.result.objectStoreNames.contains("crdt-updates")) {
         request.result.createObjectStore("crdt-updates");
       }
+      if (!request.result.objectStoreNames.contains("sync-state")) {
+        request.result.createObjectStore("sync-state");
+      }
+      if (!request.result.objectStoreNames.contains("metadata-updates")) {
+        request.result.createObjectStore("metadata-updates");
+      }
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
     request.onsuccess = () => {
       const db = request.result;
-      const transaction = db.transaction("crdt-updates", "readwrite");
-      transaction.objectStore("crdt-updates").put(
-        { spaceId, mutationId, update: encodedUpdate },
-        `${spaceId}:${mutationId}`,
-      );
+      const transaction = db.transaction(["sync-records", "crdt-updates", "sync-state", "crdt"], "readwrite");
+      const generationKey = taskSpaceKeyFor(principal, `generation:${spaceId}`);
+      const generationStore = transaction.objectStore("sync-state");
+      const records = transaction.objectStore("sync-records");
+      const recordKey = taskSpaceSyncRecordKey(principal, spaceId);
+      const recordRead = records.get(recordKey);
+      const generationRead = generationStore.get(generationKey);
+      let recordReady = false;
+      let generationReady = false;
+      recordRead.onerror = () => reject(recordRead.error || new Error("Could not read sync record"));
+      generationRead.onerror = () => reject(generationRead.error || new Error("Could not read local generation"));
+      const maybeWrite = () => {
+        if (!recordReady || !generationReady) return;
+        const record = recordRead.result || taskSpaceEmptySyncRecord(principal, spaceId);
+        const current = Math.max(
+          taskSpaceSafeCounter(record.localGeneration),
+          taskSpaceSafeCounter(generationRead.result),
+        );
+        const suppliedGeneration = taskSpaceSafeCounter(localGeneration);
+        // Every queued local mutation receives a strictly newer generation in
+        // the atomic record. This also covers two tabs that race before their
+        // localStorage counters become visible to one another.
+        const next = Math.max(current + 1, suppliedGeneration, 1);
+        const outbox = Array.isArray(record.outbox) ? record.outbox : [];
+        const entry = {
+          mutationId,
+          stateVector,
+          update: encodedUpdate,
+          localGeneration: next,
+        };
+        record.outbox = outbox.filter((item) => item?.mutationId !== mutationId).concat(entry);
+        // Queue writes can complete out of order when several local edits
+        // are being persisted at once. An older edit may still be retained
+        // in the outbox, but it must never replace the newer atomic snapshot.
+        if (suppliedGeneration >= current || current === 0) {
+          record.snapshot = encodedSnapshot;
+          record.snapshotWriteSequence = writeSequence;
+        }
+        record.localGeneration = next;
+        record.lastError = null;
+        records.put(record, recordKey);
+        generationStore.put(next, generationKey);
+        transaction.objectStore("crdt-updates").put(
+          { principal: String(principal || "guest"), spaceId, mutationId, stateVector, update: encodedUpdate, localGeneration: next, snapshot: encodedSnapshot },
+          taskSpaceKeyFor(principal, `${spaceId}:${mutationId}`),
+        );
+        if (record.snapshot != null) {
+          transaction.objectStore("crdt").put(record.snapshot, taskSpaceKeyFor(principal, `space:${spaceId}`));
+        }
+      };
+      recordRead.onsuccess = () => { recordReady = true; maybeWrite(); };
+      generationRead.onsuccess = () => { generationReady = true; maybeWrite(); };
       transaction.onerror = () => reject(transaction.error || new Error("Could not queue CRDT update"));
       transaction.oncomplete = () => resolve(true);
     };
+  });
+}
+
+export function taskSpaceSaveSyncState(principal, spaceId, stateVector) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction(["sync-records", "sync-state"], "readwrite");
+      const records = transaction.objectStore("sync-records");
+      const key = taskSpaceSyncRecordKey(principal, spaceId);
+      const read = records.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read sync record"));
+      read.onsuccess = () => {
+        const record = read.result || taskSpaceEmptySyncRecord(principal, spaceId);
+        record.acknowledgedStateVector = stateVector;
+        records.put(record, key);
+        transaction.objectStore("sync-state").put(stateVector, taskSpaceKeyFor(principal, `space:${spaceId}`));
+      };
+      transaction.onerror = () => reject(transaction.error || new Error("Could not save sync state"));
+      transaction.oncomplete = () => resolve(true);
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+export function taskSpaceLoadSyncState(principal, spaceId) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction(["sync-records", "sync-state"], "readonly");
+      const recordRead = transaction.objectStore("sync-records").get(
+        taskSpaceSyncRecordKey(principal, spaceId),
+      );
+      recordRead.onerror = () => reject(recordRead.error || new Error("Could not read sync record"));
+      recordRead.onsuccess = () => {
+        if (recordRead.result?.acknowledgedStateVector != null) {
+          resolve(recordRead.result.acknowledgedStateVector);
+          return;
+        }
+        const read = transaction.objectStore("sync-state").get(taskSpaceKeyFor(principal, `space:${spaceId}`));
+        read.onerror = () => reject(read.error || new Error("Could not read sync state"));
+        read.onsuccess = () => resolve(read.result ?? null);
+      };
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
   });
 }
 
@@ -216,32 +553,99 @@ export function taskSpaceLoadCrdtUpdates() {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
     request.onsuccess = () => {
       const db = request.result;
-      if (!db.objectStoreNames.contains("crdt-updates")) {
-        resolve([]);
-        return;
-      }
-      const read = db.transaction("crdt-updates", "readonly").objectStore("crdt-updates").getAll();
-      read.onerror = () => reject(read.error || new Error("Could not read CRDT update queue"));
-      read.onsuccess = () => resolve(read.result ?? []);
+      const transaction = db.transaction(["sync-records", "crdt-updates"], "readonly");
+      const recordsRead = transaction.objectStore("sync-records").getAll();
+      const legacyRead = transaction.objectStore("crdt-updates").getAll();
+      let records;
+      let legacy;
+      let recordsReady = false;
+      let legacyReady = false;
+      const finish = () => {
+        if (!recordsReady || !legacyReady) return;
+        const current = (records || [])
+          .filter((record) => record?.principal === taskSpaceSyncPrincipal)
+          .flatMap((record) => {
+            const outbox = Array.isArray(record.outbox)
+              ? record.outbox.map((item) => ({
+                principal: record.principal,
+                spaceId: record.spaceId,
+                ...item,
+              }))
+              : [];
+            if (outbox.length > 0) return outbox;
+            const localGeneration = taskSpaceSafeCounter(record.localGeneration);
+            const acknowledgedGeneration = taskSpaceSafeCounter(record.acknowledgedGeneration);
+            if (localGeneration <= acknowledgedGeneration) return [];
+            // The snapshot is the self-healing source of truth when an older
+            // per-mutation outbox row was lost. A stable recovery mutation id
+            // makes retries idempotent without a localStorage counter.
+            return [{
+              principal: record.principal,
+              spaceId: record.spaceId,
+              mutationId: "recovery:" + String(record.spaceId) + ":" + String(localGeneration),
+              stateVector: record.acknowledgedStateVector ?? null,
+              update: record.snapshot,
+              localGeneration,
+            }];
+          });
+        const currentKeys = new Set(current.map((item) => `${item.spaceId}:${item.mutationId}`));
+        const fallback = (legacy || []).filter((item) =>
+          item
+          && typeof item.spaceId === "number"
+          && typeof item.mutationId === "string"
+          && !currentKeys.has(`${item.spaceId}:${item.mutationId}`)
+          && (item.principal === taskSpaceSyncPrincipal
+            // Legacy outbox rows remain readable until they are explicitly
+            // acknowledged under the namespaced key. A workspace migration
+            // marker must not hide a queue entry before its first retry.
+            || (taskSpaceIsGuestPrincipal(taskSpaceSyncPrincipal) && item.principal == null)),
+        );
+        resolve(current.concat(fallback));
+      };
+      recordsRead.onerror = () => reject(recordsRead.error || new Error("Could not read sync records"));
+      recordsRead.onsuccess = () => { records = recordsRead.result; recordsReady = true; finish(); };
+      legacyRead.onerror = () => reject(legacyRead.error || new Error("Could not read CRDT update queue"));
+      legacyRead.onsuccess = () => { legacy = legacyRead.result; legacyReady = true; finish(); };
     };
     request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
   });
 }
 
-export function taskSpaceAckCrdtUpdate(spaceId, mutationId) {
+export function taskSpaceAckCrdtUpdate(principal, spaceId, mutationId) {
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
       reject(new Error("IndexedDB is unavailable"));
       return;
     }
-    const request = indexedDB.open("task-space", 3);
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
     request.onsuccess = () => {
       const db = request.result;
-      const transaction = db.transaction("crdt-updates", "readwrite");
-      transaction.objectStore("crdt-updates").delete(`${spaceId}:${mutationId}`);
+      const transaction = db.transaction(["sync-records", "crdt-updates"], "readwrite");
+      const records = transaction.objectStore("sync-records");
+      const key = taskSpaceSyncRecordKey(principal, spaceId);
+      const read = records.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read sync record"));
+      read.onsuccess = () => {
+        if (read.result) {
+          const record = read.result;
+          record.outbox = (Array.isArray(record.outbox) ? record.outbox : [])
+            .filter((item) => item?.mutationId !== mutationId);
+          records.put(record, key);
+        }
+        const updates = transaction.objectStore("crdt-updates");
+        updates.delete(taskSpaceKeyFor(principal, `${spaceId}:${mutationId}`));
+        // Older versions used an unscoped `space:mutation` key. Remove that
+        // legacy copy only after the server has acknowledged the namespaced
+        // request, otherwise it would be replayed forever on every drain.
+        if (taskSpaceIsGuestPrincipal(principal)) {
+          updates.delete(`${spaceId}:${mutationId}`);
+        }
+      };
       transaction.onerror = () => reject(transaction.error || new Error("Could not acknowledge CRDT update"));
       transaction.oncomplete = () => resolve(true);
     };
@@ -249,15 +653,268 @@ export function taskSpaceAckCrdtUpdate(spaceId, mutationId) {
   });
 }
 
-const taskSpaceSyncSources = new Map();
+export function taskSpaceCommitCrdtReconcile(
+  principal,
+  spaceId,
+  mutationId,
+  encodedSnapshot,
+  stateVector,
+  acknowledgedGeneration,
+) {
+  const writeSequence = taskSpaceNextCrdtWriteSequence(principal, spaceId);
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction(["sync-records", "crdt-updates", "sync-state", "crdt"], "readwrite");
+      const records = transaction.objectStore("sync-records");
+      const key = taskSpaceSyncRecordKey(principal, spaceId);
+      const read = records.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read sync record"));
+      read.onsuccess = () => {
+        const record = read.result || taskSpaceEmptySyncRecord(principal, spaceId);
+        const localGeneration = taskSpaceSafeCounter(record.localGeneration);
+        const requestedAcknowledgedGeneration = taskSpaceSafeCounter(acknowledgedGeneration);
+        const previousSequence = taskSpaceSafeCounter(record.snapshotWriteSequence);
+        // A local edit may commit while the network response is in flight.
+        // Its atomic record snapshot is newer than the response snapshot, so
+        // never let the older response clobber it. The server only
+        // acknowledged the generation that was sent in this request.
+        const snapshot = (localGeneration > requestedAcknowledgedGeneration
+          || writeSequence < previousSequence)
+          && record.snapshot != null
+          ? record.snapshot
+          : encodedSnapshot;
+        record.snapshot = snapshot;
+        if (writeSequence >= previousSequence) {
+          record.snapshotWriteSequence = writeSequence;
+        }
+        record.acknowledgedStateVector = stateVector;
+        record.acknowledgedGeneration = Math.max(
+          taskSpaceSafeCounter(record.acknowledgedGeneration),
+          Math.min(requestedAcknowledgedGeneration, localGeneration),
+        );
+        record.outbox = (Array.isArray(record.outbox) ? record.outbox : [])
+          .filter((item) => item?.mutationId !== mutationId);
+        record.lastError = null;
+        records.put(record, key);
+        transaction.objectStore("crdt").put(snapshot, taskSpaceKeyFor(principal, `space:${spaceId}`));
+        transaction.objectStore("sync-state").put(stateVector, taskSpaceKeyFor(principal, `space:${spaceId}`));
+        transaction.objectStore("crdt-updates").delete(taskSpaceKeyFor(principal, `${spaceId}:${mutationId}`));
+      };
+      transaction.onerror = () => reject(transaction.error || new Error("Could not commit reconciliation"));
+      transaction.oncomplete = () => resolve(true);
+    };
+  });
+}
 
-export function taskSpaceStartSyncEvents(url, onUpdate, onOpen) {
+export function taskSpaceQueueMetadataUpdate(principal, spaceId, operationId, operation, name, expectedVersion) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("metadata-updates")) {
+        resolve(false);
+        return;
+      }
+      const transaction = db.transaction("metadata-updates", "readwrite");
+      transaction.objectStore("metadata-updates").put(
+        { principal: String(principal || "guest"), spaceId, operationId, operation, name, expectedVersion },
+        taskSpaceKeyFor(principal, `${spaceId}:${operationId}`),
+      );
+      transaction.onerror = () => reject(transaction.error || new Error("Could not queue metadata update"));
+      transaction.oncomplete = () => resolve(true);
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+export function taskSpaceLoadMetadataUpdates() {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("metadata-updates")) {
+        resolve([]);
+        return;
+      }
+      const read = db.transaction("metadata-updates", "readonly").objectStore("metadata-updates").getAll();
+      read.onerror = () => reject(read.error || new Error("Could not read metadata update queue"));
+      read.onsuccess = () => resolve((read.result ?? []).filter((item) =>
+        item && item.principal === taskSpaceSyncPrincipal,
+      ));
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+export function taskSpaceAckMetadataUpdate(principal, spaceId, operationId) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 6);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("metadata-updates")) {
+        resolve(false);
+        return;
+      }
+      const transaction = db.transaction("metadata-updates", "readwrite");
+      transaction.objectStore("metadata-updates").delete(taskSpaceKeyFor(principal, `${spaceId}:${operationId}`));
+      transaction.onerror = () => reject(transaction.error || new Error("Could not acknowledge metadata update"));
+      transaction.oncomplete = () => resolve(true);
+    };
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+const taskSpaceSyncSources = new Map();
+const taskSpaceSafetyTimers = new Map();
+const taskSpaceLeaseTimers = new Map();
+const taskSpaceCrdtWriteSequences = new Map();
+const taskSpaceWorkspaceWriteSequences = new Map();
+const taskSpaceLeaseOwner = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+let taskSpaceBroadcast = null;
+
+function taskSpaceNextCrdtWriteSequence(principal, spaceId) {
+  const key = taskSpaceSyncRecordKey(principal, spaceId);
+  const next = (Number(taskSpaceCrdtWriteSequences.get(key)) || 0) + 1;
+  taskSpaceCrdtWriteSequences.set(key, next);
+  return next;
+}
+
+export function taskSpaceAcquireSyncLease(principal) {
+  return new Promise((resolve) => {
+    const key = taskSpaceKeyFor(principal, "sync-lease");
+    const now = Date.now();
+    let current = null;
+    try {
+      current = JSON.parse(globalThis.localStorage?.getItem(key) || "null");
+    } catch (_) {}
+    if (current && current.expiresAt > now && current.owner !== taskSpaceLeaseOwner) {
+      resolve(false);
+      return;
+    }
+    try {
+      globalThis.localStorage?.setItem(key, JSON.stringify({
+        owner: taskSpaceLeaseOwner,
+        expiresAt: now + 12_000,
+      }));
+      if (!taskSpaceLeaseTimers.has(key)) {
+        const timer = setInterval(() => taskSpaceAcquireSyncLease(principal), 4_000);
+        taskSpaceLeaseTimers.set(key, timer);
+      }
+      resolve(true);
+    } catch (_) {
+      // Private browsing/storage-disabled environments must still sync; the
+      // server-side mutation idempotency guard is the fallback coordinator.
+      resolve(true);
+    }
+  });
+}
+
+export function taskSpaceReleaseSyncLease(principal) {
+  const key = taskSpaceKeyFor(principal, "sync-lease");
+  const timer = taskSpaceLeaseTimers.get(key);
+  if (timer) {
+    clearInterval(timer);
+    taskSpaceLeaseTimers.delete(key);
+  }
+  try {
+    const current = JSON.parse(globalThis.localStorage?.getItem(key) || "null");
+    if (current?.owner === taskSpaceLeaseOwner) globalThis.localStorage?.removeItem(key);
+  } catch (_) {}
+}
+
+export function taskSpaceStartSyncBroadcast(principal, onHint) {
+  if (typeof globalThis.BroadcastChannel !== "function") return false;
+  if (taskSpaceBroadcast) taskSpaceBroadcast.close();
+  taskSpaceBroadcast = new BroadcastChannel(`task-space-sync:${String(principal || "guest")}`);
+  taskSpaceBroadcast.onmessage = (event) => {
+    if (event.data === "sync") onHint();
+  };
+  return true;
+}
+
+export function taskSpacePublishSyncHint() {
+  if (taskSpaceBroadcast) taskSpaceBroadcast.postMessage("sync");
+}
+
+export function taskSpaceStopSyncBroadcast() {
+  if (!taskSpaceBroadcast) return;
+  taskSpaceBroadcast.close();
+  taskSpaceBroadcast = null;
+}
+
+export function taskSpaceStartSyncSafetyTimer(onTick) {
+  const id = setInterval(onTick, 60_000);
+  taskSpaceSafetyTimers.set(id, onTick);
+  return id;
+}
+
+export function taskSpaceStopSyncSafetyTimer(id) {
+  clearInterval(id);
+  taskSpaceSafetyTimers.delete(id);
+}
+
+export function taskSpaceStartAccountRefresh(onTick) {
+  return setInterval(onTick, 60_000);
+}
+
+export function taskSpaceStopAccountRefresh(id) {
+  clearInterval(id);
+}
+
+export function taskSpaceStartSyncEvents(url, onUpdate, onOpen, onError) {
   taskSpaceStopSyncEvents(url);
-  const source = new EventSource(url, { withCredentials: true });
-  const update = (event) => onUpdate(event.data);
+  const cursorKey = `task-space:sync-cursor:${taskSpaceSyncPrincipal}`;
+  const cursor = globalThis.localStorage?.getItem(cursorKey);
+  const eventUrl = cursor
+    ? `${url}${url.includes("?") ? "&" : "?"}after_event_id=${encodeURIComponent(cursor)}`
+    : url;
+  const source = new EventSource(eventUrl, { withCredentials: true });
+  const update = (event) => {
+    if (event.lastEventId) {
+      globalThis.localStorage?.setItem(cursorKey, event.lastEventId);
+    }
+    onUpdate(event.data);
+  };
+  const reset = () => {
+    globalThis.localStorage?.removeItem(cursorKey);
+    onOpen();
+  };
   source.addEventListener("space-update", update);
+  source.addEventListener("sync-reset", reset);
   source.onopen = () => onOpen();
-  taskSpaceSyncSources.set(url, { source, update });
+  source.onerror = () => {
+    // Keep the cursor across transient disconnects. The server emits an
+    // explicit sync-reset event when retention has made a cursor unreplayable.
+    const now = Date.now();
+    if (!source.__taskSpaceLastErrorAt || now - source.__taskSpaceLastErrorAt > 5_000) {
+      source.__taskSpaceLastErrorAt = now;
+      onError();
+    }
+  };
+  taskSpaceSyncSources.set(url, { source, update, reset });
   return true;
 }
 
@@ -265,42 +922,142 @@ export function taskSpaceStopSyncEvents(url) {
   const existing = taskSpaceSyncSources.get(url);
   if (!existing) return;
   existing.source.removeEventListener("space-update", existing.update);
+  existing.source.removeEventListener("sync-reset", existing.reset);
   existing.source.close();
   taskSpaceSyncSources.delete(url);
 }
+
+export function taskSpaceSaveSyncCursor(cursor) {
+  if (!cursor) return;
+  try {
+    globalThis.localStorage?.setItem(
+      `task-space:sync-cursor:${taskSpaceSyncPrincipal}`,
+      String(cursor),
+    );
+  } catch (_) {}
+}
 "#)]
 unsafe extern "C" {
+    #[wasm_bindgen(js_name = taskSpaceSetSyncPrincipal)]
+    fn indexed_db_set_sync_principal(principal: &str) -> String;
+
     #[wasm_bindgen(js_name = taskSpaceLoadWorkspace)]
     fn indexed_db_load_workspace() -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceSaveWorkspace)]
-    fn indexed_db_save_workspace(raw: &str) -> js_sys::Promise;
+    fn indexed_db_save_workspace(raw: &str, principal: &str) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceLoadCrdt)]
     fn indexed_db_load_crdt(space_id: u64) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceSaveCrdt)]
-    fn indexed_db_save_crdt(space_id: u64, encoded_snapshot: &str) -> js_sys::Promise;
+    fn indexed_db_save_crdt(
+        principal: &str,
+        space_id: u64,
+        encoded_snapshot: &str,
+    ) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceQueueCrdtUpdate)]
     fn indexed_db_queue_crdt_update(
+        principal: &str,
         space_id: u64,
         mutation_id: &str,
+        state_vector: &str,
         encoded_update: &str,
+        encoded_snapshot: &str,
+        local_generation: u64,
     ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceSaveSyncState)]
+    fn indexed_db_save_sync_state(
+        principal: &str,
+        space_id: u64,
+        state_vector: &str,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceLoadSyncState)]
+    fn indexed_db_load_sync_state(principal: &str, space_id: u64) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceLoadCrdtUpdates)]
     fn indexed_db_load_crdt_updates() -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceAckCrdtUpdate)]
-    fn indexed_db_ack_crdt_update(space_id: u64, mutation_id: &str) -> js_sys::Promise;
+    fn indexed_db_ack_crdt_update(
+        principal: &str,
+        space_id: u64,
+        mutation_id: &str,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceCommitCrdtReconcile)]
+    fn indexed_db_commit_crdt_reconcile(
+        principal: &str,
+        space_id: u64,
+        mutation_id: &str,
+        encoded_snapshot: &str,
+        state_vector: &str,
+        acknowledged_generation: u64,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceQueueMetadataUpdate)]
+    fn indexed_db_queue_metadata_update(
+        principal: &str,
+        space_id: u64,
+        operation_id: &str,
+        operation: &str,
+        name: Option<&str>,
+        expected_version: Option<u64>,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceLoadMetadataUpdates)]
+    fn indexed_db_load_metadata_updates() -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceAckMetadataUpdate)]
+    fn indexed_db_ack_metadata_update(
+        principal: &str,
+        space_id: u64,
+        operation_id: &str,
+    ) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceStartSyncEvents)]
     fn start_sync_events(
         url: &str,
         on_update: &js_sys::Function,
         on_open: &js_sys::Function,
+        on_error: &js_sys::Function,
     ) -> bool;
+
+    #[wasm_bindgen(js_name = taskSpaceStopSyncEvents)]
+    fn stop_sync_events(url: &str);
+
+    #[wasm_bindgen(js_name = taskSpaceSaveSyncCursor)]
+    fn save_sync_cursor(cursor: u64);
+
+    #[wasm_bindgen(js_name = taskSpaceAcquireSyncLease)]
+    fn acquire_sync_lease(principal: &str) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceReleaseSyncLease)]
+    fn release_sync_lease(principal: &str);
+
+    #[wasm_bindgen(js_name = taskSpaceStartSyncBroadcast)]
+    fn start_sync_broadcast(principal: &str, on_hint: &js_sys::Function) -> bool;
+
+    #[wasm_bindgen(js_name = taskSpacePublishSyncHint)]
+    fn publish_sync_hint();
+
+    #[wasm_bindgen(js_name = taskSpaceStopSyncBroadcast)]
+    fn stop_sync_broadcast();
+
+    #[wasm_bindgen(js_name = taskSpaceStartSyncSafetyTimer)]
+    fn start_sync_safety_timer(on_tick: &js_sys::Function) -> i32;
+
+    #[wasm_bindgen(js_name = taskSpaceStopSyncSafetyTimer)]
+    fn stop_sync_safety_timer(timer_id: i32);
+
+    #[wasm_bindgen(js_name = taskSpaceStartAccountRefresh)]
+    fn start_account_refresh(on_tick: &js_sys::Function) -> i32;
+
+    #[wasm_bindgen(js_name = taskSpaceStopAccountRefresh)]
+    fn stop_account_refresh(timer_id: i32);
 }
 
 fn note_color_background(color: NoteColor) -> &'static str {
@@ -499,6 +1256,15 @@ fn viewport_note_position(pan: (f64, f64), zoom: f64) -> (f64, f64) {
 
 fn parse_board(raw: &str) -> Option<BoardData> {
     let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version > u64::from(CURRENT_SCHEMA_VERSION))
+    {
+        // Preserve the raw record for a newer client rather than silently
+        // reinterpreting fields under an older schema.
+        return None;
+    }
     let mut board = serde_json::from_value::<BoardData>(value.clone())
         .ok()
         .or_else(|| {
@@ -532,7 +1298,15 @@ fn parse_board(raw: &str) -> Option<BoardData> {
 }
 
 fn parse_workspace(raw: &str) -> Option<WorkspaceData> {
-    let workspace = serde_json::from_str::<WorkspaceData>(raw).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version > u64::from(CURRENT_SCHEMA_VERSION))
+    {
+        return None;
+    }
+    let workspace = serde_json::from_value::<WorkspaceData>(value).ok()?;
     (!workspace.spaces.is_empty()).then(|| normalize_workspace(workspace))
 }
 
@@ -543,15 +1317,16 @@ fn workspace_from_board(board: BoardData) -> WorkspaceData {
         device_id: load_device_id(),
         tombstones: Vec::new(),
         spaces: vec![Space {
-            id: 1,
+            id: local_entity_seed(),
             name: "my space".into(),
+            metadata_version: 0,
             archived: false,
             created_at: now,
             updated_at: now,
             deleted_at: None,
             board,
         }],
-        active_space_id: 1,
+        active_space_id: 0,
     }
 }
 
@@ -561,6 +1336,7 @@ fn parse_indexed_db_value(value: JsValue) -> Option<WorkspaceData> {
             .ok()
             .and_then(|json| json.as_string())
     })?;
+    mark_future_schema(&raw);
     parse_workspace(&raw)
         .or_else(|| {
             parse_board(&raw)
@@ -570,12 +1346,49 @@ fn parse_indexed_db_value(value: JsValue) -> Option<WorkspaceData> {
         .or_else(|| parse_indexed_db_json(&raw))
 }
 
+fn mark_future_schema(raw: &str) {
+    let is_future = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .is_some_and(|version| version > u64::from(CURRENT_SCHEMA_VERSION));
+    if is_future {
+        STORAGE_SCHEMA_BLOCKED.with(|blocked| blocked.set(true));
+    }
+}
+
+fn storage_schema_blocked() -> bool {
+    STORAGE_SCHEMA_BLOCKED.with(Cell::get)
+}
+
+fn decode_indexed_crdt_value(value: JsValue) -> Result<Option<Vec<u8>>, ()> {
+    let Some(encoded) = value.as_string() else {
+        return Ok(None);
+    };
+    let encoded = EncodedUpdate::from_base64(encoded).map_err(|_| ())?;
+    let bytes = encoded.to_bytes().map_err(|_| ())?;
+    if bytes.len() > MAX_SYNC_SNAPSHOT_BYTES {
+        return Err(());
+    }
+    Ok(Some(bytes))
+}
+
 fn parse_indexed_db_json(raw: &str) -> Option<WorkspaceData> {
     let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
     parse_indexed_db_json_value(value)
 }
 
 fn parse_indexed_db_json_value(value: serde_json::Value) -> Option<WorkspaceData> {
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version > u64::from(CURRENT_SCHEMA_VERSION))
+    {
+        STORAGE_SCHEMA_BLOCKED.with(|blocked| blocked.set(true));
+    }
     if let Some(raw) = value.as_str() {
         return parse_indexed_db_json(raw);
     }
@@ -605,25 +1418,51 @@ fn parse_indexed_db_json_value(value: serde_json::Value) -> Option<WorkspaceData
 
 fn load_board() -> BoardData {
     let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
-    let current = storage
-        .as_ref()
-        .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
+    let can_read_legacy = storage.as_ref().is_some_and(|storage| {
+        storage
+            .get_item(GUEST_LEGACY_MIGRATED_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("1")
+    });
+    if can_read_legacy {
+        for key in [STORAGE_KEY, LEGACY_STORAGE_KEY] {
+            if let Some(raw) = storage
+                .as_ref()
+                .and_then(|storage| storage.get_item(key).ok().flatten())
+            {
+                mark_future_schema(&raw);
+            }
+        }
+    }
+    let current = can_read_legacy
+        .then(|| {
+            storage
+                .as_ref()
+                .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
+        })
+        .flatten()
         .and_then(|raw| parse_board(&raw));
     let mut board = current
         .or_else(|| {
-            storage
-                .as_ref()
-                .and_then(|storage| storage.get_item(LEGACY_STORAGE_KEY).ok().flatten())
-                .and_then(|raw| parse_board(&raw))
-                .map(|mut board| {
-                    // v1 stored positions as percentages. Put those notes around
-                    // the new canvas origin during the one-time migration.
-                    for note in &mut board.notes {
-                        note.x = note.x * 10.0 - 500.0;
-                        note.y = note.y * 8.0 - 400.0;
-                    }
-                    board
+            can_read_legacy
+                .then(|| {
+                    storage
+                        .as_ref()
+                        .and_then(|storage| storage.get_item(LEGACY_STORAGE_KEY).ok().flatten())
+                        .and_then(|raw| parse_board(&raw))
+                        .map(|mut board| {
+                            // v1 stored positions as percentages. Put those notes around
+                            // the new canvas origin during the one-time migration.
+                            for note in &mut board.notes {
+                                note.x = note.x * 10.0 - 500.0;
+                                note.y = note.y * 8.0 - 400.0;
+                            }
+                            board
+                        })
                 })
+                .flatten()
         })
         .unwrap_or(BoardData {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -665,21 +1504,157 @@ fn now_millis() -> u64 {
     js_sys::Date::now().max(0.0) as u64
 }
 
+fn is_guest_principal(principal: &str) -> bool {
+    if principal == "guest" {
+        return true;
+    }
+    let Some(identifier) = principal.strip_prefix("guest:") else {
+        return false;
+    };
+    !identifier.is_empty()
+        && identifier.len() <= 96
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn guest_principal() -> String {
+    let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
+    let stored_principal = storage
+        .as_ref()
+        .and_then(|storage| storage.get_item(GUEST_PRINCIPAL_STORAGE_KEY).ok().flatten())
+        .or_else(|| {
+            web_sys::window()
+                .and_then(|window| window.session_storage().ok().flatten())
+                .and_then(|storage| storage.get_item(GUEST_PRINCIPAL_STORAGE_KEY).ok().flatten())
+        })
+        .or_else(|| browser_cookie(GUEST_PRINCIPAL_STORAGE_KEY));
+    if let Some(principal) =
+        stored_principal.filter(|principal| is_guest_principal(principal) && principal != "guest")
+    {
+        return principal;
+    }
+
+    let identifier = web_sys::window()
+        .and_then(|window| window.crypto().ok())
+        .map(|crypto| crypto.random_uuid())
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                now_millis(),
+                (js_sys::Math::random() * 1_000_000_000.0) as u64
+            )
+        });
+    let principal = format!("guest:{identifier}");
+    let persisted_in_local = storage.as_ref().is_some_and(|storage| {
+        storage
+            .set_item(GUEST_PRINCIPAL_STORAGE_KEY, &principal)
+            .is_ok()
+    });
+    if !persisted_in_local {
+        let persisted_in_session = web_sys::window()
+            .and_then(|window| window.session_storage().ok().flatten())
+            .is_some_and(|storage| {
+                storage
+                    .set_item(GUEST_PRINCIPAL_STORAGE_KEY, &principal)
+                    .is_ok()
+            });
+        if !persisted_in_session {
+            // The cookie is the final fallback for privacy modes that disable
+            // both Web Storage implementations.
+            set_browser_cookie(GUEST_PRINCIPAL_STORAGE_KEY, &principal);
+        }
+    }
+    principal
+}
+
+fn browser_cookie(name: &str) -> Option<String> {
+    let document = web_sys::window()?
+        .document()?
+        .dyn_into::<web_sys::HtmlDocument>()
+        .ok()?;
+    document.cookie().ok()?.split(';').find_map(|cookie| {
+        let (cookie_name, value) = cookie.trim().split_once('=')?;
+        (cookie_name == name && !value.trim().is_empty()).then(|| value.trim().to_owned())
+    })
+}
+
+fn set_browser_cookie(name: &str, value: &str) {
+    if let Some(document) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.dyn_into::<web_sys::HtmlDocument>().ok())
+    {
+        let _ = document.set_cookie(&format!(
+            "{name}={value}; Path=/; Max-Age=31536000; SameSite=Lax"
+        ));
+    }
+}
+
+fn is_safe_local_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn load_device_id() -> String {
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
         return "device-local".into();
     };
-    if let Ok(Some(device_id)) = storage.get_item(DEVICE_ID_STORAGE_KEY) {
+    if let Ok(Some(device_id)) = storage.get_item(DEVICE_ID_STORAGE_KEY)
+        && is_safe_local_identifier(&device_id)
+    {
         return device_id;
     }
-    let device_id = format!(
-        "device-{}-{}",
-        now_millis(),
-        (js_sys::Math::random() * 1_000_000_000.0) as u64
-    );
+    let device_id = web_sys::window()
+        .and_then(|window| window.crypto().ok())
+        .map(|crypto| format!("device-{}", crypto.random_uuid()))
+        .unwrap_or_else(|| {
+            format!(
+                "device-{}-{}",
+                now_millis(),
+                (js_sys::Math::random() * 1_000_000_000.0) as u64
+            )
+        });
     let _ = storage.set_item(DEVICE_ID_STORAGE_KEY, &device_id);
     device_id
+}
+
+/// Preserve the numeric wire format for now while making new offline IDs
+/// cryptographically random and device-scoped. The JavaScript-safe range is
+/// retained for the current wire/database contract; the planned UUID/ULID
+/// migration can replace this compatibility representation later.
+fn local_entity_seed() -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let random_uuid = web_sys::window()
+        .and_then(|window| window.crypto().ok())
+        .map(|crypto| crypto.random_uuid())
+        .unwrap_or_default();
+    for byte in random_uuid.bytes().chain(load_device_id().bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if random_uuid.is_empty() {
+        hash ^= now_millis();
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= (js_sys::Math::random() * (1u64 << 32) as f64) as u64;
+    }
+    // Keep the result below 2^53 so it survives JavaScript Number JSON
+    // round-trips without losing integer precision.
+    let candidate = hash & ((1u64 << 53) - 1);
+    candidate.max(1)
+}
+
+fn next_space_id_for(spaces: &[Space]) -> u64 {
+    let local = local_entity_seed();
+    let highest = spaces
+        .iter()
+        .map(|space| space.id)
+        .max()
+        .unwrap_or_default();
+    local.max(highest.saturating_add(1).min((1u64 << 53) - 1))
 }
 
 fn workspace_snapshot(
@@ -694,6 +1669,333 @@ fn workspace_snapshot(
         spaces,
         active_space_id,
     }
+}
+
+fn workspace_has_local_data(workspace: &WorkspaceData) -> bool {
+    workspace.spaces.iter().any(|space| {
+        !space.board.notes.is_empty()
+            || !space.board.groups.is_empty()
+            || !space.board.tombstones.is_empty()
+            || space.archived
+            || space.deleted_at.is_some()
+    }) || !workspace.tombstones.is_empty()
+}
+
+fn rekey_workspace_for_account(mut workspace: WorkspaceData) -> WorkspaceData {
+    let mut used = HashSet::new();
+    let mut next_id = || {
+        let mut candidate = local_entity_seed();
+        while !used.insert(candidate) {
+            candidate = candidate.saturating_add(1);
+        }
+        candidate
+    };
+    let mut space_ids = HashMap::new();
+    for space in &mut workspace.spaces {
+        let new_id = next_id();
+        space_ids.insert(space.id, new_id);
+        space.id = new_id;
+    }
+    if let Some(new_active) = space_ids.get(&workspace.active_space_id).copied() {
+        workspace.active_space_id = new_active;
+    }
+    for tombstone in &mut workspace.tombstones {
+        if matches!(tombstone.kind, TombstoneKind::Space) {
+            let old_id = tombstone.id;
+            let new_id = if let Some(new_id) = space_ids.get(&old_id).copied() {
+                new_id
+            } else {
+                let new_id = next_id();
+                space_ids.insert(old_id, new_id);
+                new_id
+            };
+            tombstone.id = new_id;
+        }
+    }
+    for space in &mut workspace.spaces {
+        let mut note_ids = HashMap::new();
+        for note in &mut space.board.notes {
+            let new_id = next_id();
+            note_ids.insert(note.id, new_id);
+            note.id = new_id;
+        }
+        let mut group_ids = HashMap::new();
+        for group in &mut space.board.groups {
+            let new_id = next_id();
+            group_ids.insert(group.id, new_id);
+            group.id = new_id;
+        }
+        for tombstone in &space.board.tombstones {
+            match tombstone.kind {
+                TombstoneKind::Note => {
+                    if !note_ids.contains_key(&tombstone.id) {
+                        note_ids.insert(tombstone.id, next_id());
+                    }
+                }
+                TombstoneKind::Group => {
+                    if !group_ids.contains_key(&tombstone.id) {
+                        group_ids.insert(tombstone.id, next_id());
+                    }
+                }
+                TombstoneKind::Space => {}
+            }
+        }
+        for note in &mut space.board.notes {
+            note.group_id = note.group_id.and_then(|id| group_ids.get(&id).copied());
+        }
+        for tombstone in &mut space.board.tombstones {
+            match tombstone.kind {
+                TombstoneKind::Note => {
+                    if let Some(new_id) = note_ids.get(&tombstone.id).copied() {
+                        tombstone.id = new_id;
+                    }
+                }
+                TombstoneKind::Group => {
+                    if let Some(new_id) = group_ids.get(&tombstone.id).copied() {
+                        tombstone.id = new_id;
+                    }
+                }
+                TombstoneKind::Space => {}
+            }
+        }
+    }
+    workspace
+}
+
+fn install_workspace(
+    workspace: WorkspaceData,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    workspace_tombstones: RwSignal<Vec<Tombstone>>,
+    next_space_id: RwSignal<u64>,
+    next_id: RwSignal<u64>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) -> WorkspaceData {
+    let workspace = normalize_workspace(workspace);
+    let active_id = workspace.active_space_id;
+    let board = workspace
+        .spaces
+        .iter()
+        .find(|space| space.id == active_id)
+        .map(|space| space.board.clone())
+        .unwrap_or_else(empty_board);
+    next_space_id.set(next_space_id_for(&workspace.spaces));
+    next_id.set(next_note_id(&board));
+    spaces.set(workspace.spaces.clone());
+    active_space_id.set(active_id);
+    notes.set(board.notes);
+    groups.set(board.groups);
+    workspace_tombstones.set(workspace.tombstones.clone());
+    crdt_docs.update(|items| items.clear());
+    workspace
+}
+
+fn confirm_workspace_adoption() -> bool {
+    web_sys::window()
+        .and_then(|window| {
+            window
+                .confirm_with_message(
+                    "Use this browser's local workspace for your signed-in account?",
+                )
+                .ok()
+        })
+        .unwrap_or(false)
+}
+
+async fn prepare_account_workspace(
+    account_id: String,
+    allow_guest_adoption: bool,
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    workspace_tombstones: RwSignal<Vec<Tombstone>>,
+    next_space_id: RwSignal<u64>,
+    next_id: RwSignal<u64>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) -> bool {
+    let guest_workspace = {
+        let mut workspace = workspace_snapshot(
+            spaces.get_untracked(),
+            active_space_id.get_untracked(),
+            workspace_tombstones.get_untracked(),
+        );
+        if let Some(space) = workspace
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == workspace.active_space_id)
+        {
+            space.board.notes = notes.get_untracked();
+            space.board.groups = groups.get_untracked();
+        }
+        normalize_workspace(workspace)
+    };
+    let had_guest_data = workspace_has_local_data(&guest_workspace);
+
+    let principal = format!("account:{account_id}");
+    select_sync_principal(&principal);
+    let account_workspace = JsFuture::from(indexed_db_load_workspace())
+        .await
+        .ok()
+        .and_then(parse_indexed_db_value);
+    if current_sync_principal() != principal {
+        return false;
+    }
+    let adopted_guest = allow_guest_adoption
+        && account_workspace.is_none()
+        && had_guest_data
+        && confirm_workspace_adoption();
+    let workspace = account_workspace.unwrap_or_else(|| {
+        if adopted_guest {
+            rekey_workspace_for_account(guest_workspace.clone())
+        } else {
+            workspace_from_board(empty_board())
+        }
+    });
+    let workspace = install_workspace(
+        workspace,
+        spaces,
+        active_space_id,
+        notes,
+        groups,
+        workspace_tombstones,
+        next_space_id,
+        next_id,
+        crdt_docs,
+    );
+    let active_id = workspace.active_space_id;
+    let current_board = workspace
+        .spaces
+        .iter()
+        .find(|space| space.id == active_id)
+        .map(|space| space.board.clone())
+        .unwrap_or_else(empty_board);
+    let loaded_sync_state = JsFuture::from(indexed_db_load_sync_state(&principal, active_id))
+        .await
+        .ok()
+        .and_then(|value| value.as_string())
+        .and_then(|encoded| EncodedUpdate::from_base64(encoded).ok())
+        .and_then(|encoded| encoded.to_bytes().ok())
+        .unwrap_or_else(SpaceDoc::empty_state_vector);
+    SYNC_ACKED_STATE_VECTORS.with(|states| {
+        states
+            .borrow_mut()
+            .insert((principal.clone(), active_id), loaded_sync_state);
+    });
+    if current_sync_principal() != principal {
+        return false;
+    }
+    let loaded_snapshot = match JsFuture::from(indexed_db_load_crdt(active_id)).await {
+        Ok(value) => match decode_indexed_crdt_value(value) {
+            Ok(snapshot) => snapshot,
+            Err(()) => return false,
+        },
+        Err(_) => None,
+    };
+    if current_sync_principal() != principal {
+        return false;
+    }
+    let loaded_doc = loaded_snapshot
+        .as_deref()
+        .and_then(|bytes| SpaceDoc::from_update(bytes).ok());
+    if loaded_snapshot.is_some() && loaded_doc.is_none() {
+        // Preserve an unknown/corrupt CRDT snapshot for export and upgrade
+        // tooling; never silently replace it with the JSON projection.
+        return false;
+    }
+    let had_loaded_doc = loaded_doc.is_some();
+    let (doc, bootstrap_state_vector) = if let Some(doc) = loaded_doc {
+        (doc, None)
+    } else {
+        let doc = SpaceDoc::new();
+        let state_vector = doc.state_vector();
+        doc.import_board(&current_board);
+        (doc, Some(state_vector))
+    };
+    if had_loaded_doc {
+        let loaded_board = doc.board();
+        notes.set(loaded_board.notes);
+        groups.set(loaded_board.groups);
+    }
+    let encoded_snapshot = EncodedUpdate::from_bytes(&doc.snapshot());
+    crdt_docs.update(|items| {
+        items.insert(active_id, doc);
+    });
+    queue_indexed_db_crdt_save(active_id, encoded_snapshot.as_str().to_owned());
+    if bootstrap_state_vector.is_some() && workspace_has_local_data(&workspace) {
+        let space_name = workspace
+            .spaces
+            .iter()
+            .find(|space| space.id == active_id)
+            .map(|space| space.name.clone());
+        queue_crdt_update(
+            active_id,
+            EncodedUpdate::from_bytes(
+                &bootstrap_state_vector.unwrap_or_else(SpaceDoc::empty_state_vector),
+            )
+            .as_str()
+            .to_owned(),
+            encoded_snapshot.as_str().to_owned(),
+            encoded_snapshot.as_str().to_owned(),
+            space_name,
+        );
+    }
+    // Adoption and legacy JSON migration can contain several spaces while
+    // IndexedDB has only hydrated the active one. Seed every remaining space
+    // from its local projection before the first pull; otherwise only the
+    // active space would ever reach the account.
+    for space in workspace
+        .spaces
+        .iter()
+        .filter(|space| space.id != active_id && space.deleted_at.is_none())
+    {
+        if current_sync_principal() != principal {
+            return false;
+        }
+        let existing_snapshot = match JsFuture::from(indexed_db_load_crdt(space.id)).await {
+            Ok(value) => match decode_indexed_crdt_value(value) {
+                Ok(snapshot) => snapshot,
+                Err(()) => continue,
+            },
+            Err(_) => None,
+        };
+        if current_sync_principal() != principal {
+            return false;
+        }
+        if existing_snapshot
+            .as_deref()
+            .is_some_and(|bytes| SpaceDoc::from_update(bytes).is_ok())
+        {
+            continue;
+        }
+        if existing_snapshot.is_some() {
+            continue;
+        }
+        if space.board.notes.is_empty()
+            && space.board.groups.is_empty()
+            && space.board.tombstones.is_empty()
+        {
+            continue;
+        }
+        let doc = SpaceDoc::new();
+        let bootstrap_state_vector = doc.state_vector();
+        doc.import_board(&space.board);
+        let encoded_snapshot = EncodedUpdate::from_bytes(&doc.snapshot());
+        queue_indexed_db_crdt_save(space.id, encoded_snapshot.as_str().to_owned());
+        queue_crdt_update(
+            space.id,
+            EncodedUpdate::from_bytes(&bootstrap_state_vector)
+                .as_str()
+                .to_owned(),
+            encoded_snapshot.as_str().to_owned(),
+            encoded_snapshot.as_str().to_owned(),
+            Some(space.name.clone()),
+        );
+    }
+    let _ = save_workspace(&workspace, None);
+    true
 }
 
 fn normalize_workspace(mut workspace: WorkspaceData) -> WorkspaceData {
@@ -728,14 +2030,20 @@ fn normalize_workspace(mut workspace: WorkspaceData) -> WorkspaceData {
         }
     }
 
-    if !workspace
-        .spaces
-        .iter()
-        .any(|space| space.id == workspace.active_space_id && !space.archived)
-    {
-        if let Some(space) = workspace.spaces.iter_mut().find(|space| !space.archived) {
+    if !workspace.spaces.iter().any(|space| {
+        space.id == workspace.active_space_id && !space.archived && space.deleted_at.is_none()
+    }) {
+        if let Some(space) = workspace
+            .spaces
+            .iter_mut()
+            .find(|space| !space.archived && space.deleted_at.is_none())
+        {
             workspace.active_space_id = space.id;
-        } else if let Some(space) = workspace.spaces.first_mut() {
+        } else if let Some(space) = workspace
+            .spaces
+            .iter_mut()
+            .find(|space| space.deleted_at.is_none())
+        {
             space.archived = false;
             workspace.active_space_id = space.id;
         }
@@ -764,7 +2072,14 @@ fn hydrate_workspace_from_indexed_db(
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
 ) {
     spawn_local(async move {
+        // This hydration starts in the guest namespace, but authentication can
+        // switch the principal while IndexedDB is resolving. Never apply a
+        // late guest read to an account workspace (or vice versa).
+        let hydration_principal = current_sync_principal();
         if let Ok(value) = JsFuture::from(indexed_db_load_workspace()).await {
+            if hydration_principal != current_sync_principal() {
+                return;
+            }
             if let Some(imported) = parse_indexed_db_value(value) {
                 let local_changed = spaces.get_untracked() != initial_workspace.spaces
                     || active_space_id.get_untracked() != initial_workspace.active_space_id
@@ -781,15 +2096,7 @@ fn hydrate_workspace_from_indexed_db(
                     spaces.set(imported.spaces);
                     active_space_id.set(imported.active_space_id);
                     workspace_tombstones.set(imported.tombstones);
-                    next_space_id.set(
-                        spaces
-                            .get_untracked()
-                            .iter()
-                            .map(|space| space.id)
-                            .max()
-                            .unwrap_or(0)
-                            .saturating_add(1),
-                    );
+                    next_space_id.set(next_space_id_for(&spaces.get_untracked()));
                     next_id.set(next_note_id(&imported_board));
                     notes.set(imported_board.notes);
                     groups.set(imported_board.groups);
@@ -810,59 +2117,110 @@ fn hydrate_workspace_from_indexed_db(
             .find(|space| space.id == active_id)
             .map(|space| space.board.clone())
             .unwrap_or_else(empty_board);
-        let loaded_doc = JsFuture::from(indexed_db_load_crdt(active_id))
-            .await
-            .ok()
-            .and_then(|value| value.as_string())
-            .and_then(|encoded| EncodedUpdate::from_base64(encoded).ok())
-            .and_then(|encoded| encoded.to_bytes().ok())
-            .and_then(|bytes| SpaceDoc::from_update(&bytes).ok());
+        let loaded_snapshot = match JsFuture::from(indexed_db_load_crdt(active_id)).await {
+            Ok(value) => match decode_indexed_crdt_value(value) {
+                Ok(snapshot) => snapshot,
+                Err(()) => {
+                    storage_hydrated.set(true);
+                    return;
+                }
+            },
+            Err(_) => None,
+        };
+        if hydration_principal != current_sync_principal() {
+            return;
+        }
+        let loaded_doc = loaded_snapshot
+            .as_deref()
+            .and_then(|bytes| SpaceDoc::from_update(bytes).ok());
+        if loaded_snapshot.is_some() && loaded_doc.is_none() {
+            storage_hydrated.set(true);
+            return;
+        }
         let had_loaded_doc = loaded_doc.is_some();
-        let doc = loaded_doc.unwrap_or_else(|| {
+        let (doc, bootstrap_state_vector) = if let Some(doc) = loaded_doc {
+            (doc, None)
+        } else {
             let doc = SpaceDoc::new();
+            let state_vector = doc.state_vector();
             doc.import_board(&current_board);
-            doc
-        });
+            (doc, Some(state_vector))
+        };
         let loaded_board = doc.board();
         if had_loaded_doc {
             notes.set(loaded_board.notes);
             groups.set(loaded_board.groups);
         }
         let encoded_snapshot = EncodedUpdate::from_bytes(&doc.snapshot());
+        if hydration_principal != current_sync_principal() {
+            return;
+        }
         crdt_docs.update(|items| {
             items.insert(active_id, doc);
         });
         queue_indexed_db_crdt_save(active_id, encoded_snapshot.as_str().to_owned());
+        if !had_loaded_doc {
+            let space_name = spaces
+                .get_untracked()
+                .iter()
+                .find(|space| space.id == active_id)
+                .map(|space| space.name.clone());
+            let bootstrap_state_vector =
+                bootstrap_state_vector.unwrap_or_else(SpaceDoc::empty_state_vector);
+            queue_crdt_update(
+                active_id,
+                EncodedUpdate::from_bytes(&bootstrap_state_vector)
+                    .as_str()
+                    .to_owned(),
+                encoded_snapshot.as_str().to_owned(),
+                encoded_snapshot.as_str().to_owned(),
+                space_name,
+            );
+        }
         storage_hydrated.set(true);
     });
 }
 
 fn load_workspace() -> WorkspaceData {
     let storage = web_sys::window().and_then(|window| window.local_storage().ok().flatten());
-    let workspace = storage
-        .as_ref()
-        .and_then(|storage| {
-            storage
-                .get_item(LEGACY_WORKSPACE_STORAGE_KEY)
-                .ok()
-                .flatten()
+    let can_read_legacy = storage.as_ref().is_some_and(|storage| {
+        storage
+            .get_item(GUEST_LEGACY_MIGRATED_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("1")
+    });
+    let raw_workspace = can_read_legacy
+        .then(|| {
+            storage.as_ref().and_then(|storage| {
+                storage
+                    .get_item(LEGACY_WORKSPACE_STORAGE_KEY)
+                    .ok()
+                    .flatten()
+            })
         })
-        .and_then(|raw| serde_json::from_str::<WorkspaceData>(&raw).ok())
-        .filter(|workspace| !workspace.spaces.is_empty())
+        .flatten();
+    if let Some(raw) = raw_workspace.as_deref() {
+        mark_future_schema(raw);
+    }
+    let workspace = raw_workspace
+        .and_then(|raw| parse_workspace(&raw))
         .unwrap_or_else(|| WorkspaceData {
             schema_version: CURRENT_SCHEMA_VERSION,
             device_id: load_device_id(),
             tombstones: Vec::new(),
             spaces: vec![Space {
-                id: 1,
+                id: local_entity_seed(),
                 name: "my space".into(),
+                metadata_version: 0,
                 archived: false,
                 created_at: now_millis(),
                 updated_at: now_millis(),
                 deleted_at: None,
                 board: load_board(),
             }],
-            active_space_id: 1,
+            active_space_id: 0,
         });
     normalize_workspace(workspace)
 }
@@ -871,6 +2229,12 @@ fn save_workspace(
     workspace: &WorkspaceData,
     storage_status: Option<RwSignal<StorageStatus>>,
 ) -> bool {
+    if storage_schema_blocked() {
+        if let Some(storage_status) = storage_status {
+            storage_status.set(StorageStatus::Error);
+        }
+        return false;
+    }
     let workspace = normalize_workspace(workspace.clone());
     if let Ok(raw) = serde_json::to_string(&workspace) {
         queue_indexed_db_save(raw, storage_status);
@@ -880,10 +2244,43 @@ fn save_workspace(
     }
 }
 
+fn current_sync_principal() -> String {
+    SYNC_PRINCIPAL.with(|principal| principal.borrow().clone())
+}
+
+fn acknowledged_state_vector(space_id: u64) -> Option<Vec<u8>> {
+    let principal = current_sync_principal();
+    SYNC_ACKED_STATE_VECTORS.with(|states| states.borrow().get(&(principal, space_id)).cloned())
+}
+
+fn set_acknowledged_state_vector(principal: &str, space_id: u64, state_vector: Vec<u8>) {
+    SYNC_ACKED_STATE_VECTORS.with(|states| {
+        states
+            .borrow_mut()
+            .insert((principal.to_owned(), space_id), state_vector);
+    });
+}
+
+fn select_sync_principal(principal: &str) {
+    let principal = if principal.trim().is_empty() {
+        "guest"
+    } else {
+        principal
+    };
+    SYNC_PRINCIPAL.with(|current| *current.borrow_mut() = principal.to_owned());
+    let _ = indexed_db_set_sync_principal(principal);
+}
+
 fn write_workspace_exact(
     workspace: &WorkspaceData,
     storage_status: Option<RwSignal<StorageStatus>>,
 ) -> bool {
+    if storage_schema_blocked() {
+        if let Some(storage_status) = storage_status {
+            storage_status.set(StorageStatus::Error);
+        }
+        return false;
+    }
     let workspace = normalize_workspace(workspace.clone());
     let Ok(raw) = serde_json::to_string(&workspace) else {
         return false;
@@ -893,8 +2290,15 @@ fn write_workspace_exact(
 }
 
 fn queue_indexed_db_save(raw: String, storage_status: Option<RwSignal<StorageStatus>>) {
+    if storage_schema_blocked() {
+        if let Some(storage_status) = storage_status {
+            storage_status.set(StorageStatus::Error);
+        }
+        return;
+    }
+    let principal = current_sync_principal();
     spawn_local(async move {
-        let saved = JsFuture::from(indexed_db_save_workspace(&raw))
+        let saved = JsFuture::from(indexed_db_save_workspace(&raw, &principal))
             .await
             .is_ok();
         if let Some(storage_status) = storage_status {
@@ -915,40 +2319,195 @@ fn queue_indexed_db_save(raw: String, storage_status: Option<RwSignal<StorageSta
 }
 
 fn queue_indexed_db_crdt_save(space_id: u64, encoded_snapshot: String) {
+    if storage_schema_blocked() {
+        return;
+    }
+    let principal = current_sync_principal();
     spawn_local(async move {
-        let _ = JsFuture::from(indexed_db_save_crdt(space_id, &encoded_snapshot)).await;
+        let _ = JsFuture::from(indexed_db_save_crdt(
+            &principal,
+            space_id,
+            &encoded_snapshot,
+        ))
+        .await;
+    });
+}
+
+fn sync_is_active() -> bool {
+    SYNC_ACTIVE.with(Cell::get)
+}
+
+fn next_sync_run_generation() -> u64 {
+    SYNC_RUN_GENERATION.with(|generation| {
+        let next = generation.get().saturating_add(1).max(1);
+        generation.set(next);
+        next
+    })
+}
+
+fn sync_run_is_current(run_generation: u64) -> bool {
+    SYNC_RUN_GENERATION.with(|generation| generation.get() == run_generation)
+}
+
+fn set_sync_active(active: bool) {
+    SYNC_ACTIVE.with(|state| state.set(active));
+}
+
+fn stop_authenticated_sync() {
+    next_sync_run_generation();
+    set_sync_active(false);
+    stop_sync_events(&api_url("/sync/events"));
+    let principal = current_sync_principal();
+    release_sync_lease(&principal);
+    stop_sync_broadcast();
+}
+
+async fn register_sync_space(space_id: u64, name: &str) -> bool {
+    let Ok(builder) = Request::post(&api_url(&format!("/sync/spaces/{space_id}")))
+        .credentials(RequestCredentials::Include)
+        .json(&RegisterSpacePayload { name })
+    else {
+        return false;
+    };
+    send_request_with_timeout(builder)
+        .await
+        .is_ok_and(|response| (200..300).contains(&response.status()))
+}
+
+fn queue_space_metadata_operation(
+    _spaces: RwSignal<Vec<Space>>,
+    space_id: u64,
+    operation: SpaceMetadataOperation,
+    name: Option<String>,
+    expected_version: Option<u64>,
+) {
+    let principal = current_sync_principal();
+    spawn_local(async move {
+        let operation_id = next_sync_mutation_id();
+        let _ = JsFuture::from(indexed_db_queue_metadata_update(
+            &principal,
+            space_id,
+            &operation_id,
+            metadata_operation_name(&operation),
+            name.as_deref(),
+            expected_version,
+        ))
+        .await;
+        if sync_is_active() {
+            schedule_sync_drain();
+        }
+        publish_sync_hint();
+    });
+}
+
+fn metadata_operation_name(operation: &SpaceMetadataOperation) -> &'static str {
+    match operation {
+        SpaceMetadataOperation::Rename => "rename",
+        SpaceMetadataOperation::Archive => "archive",
+        SpaceMetadataOperation::Unarchive => "unarchive",
+        SpaceMetadataOperation::Delete => "delete",
+        SpaceMetadataOperation::Restore => "restore",
+    }
+}
+
+fn queue_crdt_update(
+    space_id: u64,
+    state_vector: String,
+    encoded_update: String,
+    encoded_snapshot: String,
+    space_name: Option<String>,
+) {
+    if storage_schema_blocked() {
+        return;
+    }
+    let principal = current_sync_principal();
+    let local_generation = next_local_generation(space_id);
+    spawn_local(async move {
+        let mutation_id = next_sync_mutation_id();
+        let queued = JsFuture::from(indexed_db_queue_crdt_update(
+            &principal,
+            space_id,
+            &mutation_id,
+            &state_vector,
+            &encoded_update,
+            &encoded_snapshot,
+            local_generation,
+        ))
+        .await
+        .is_ok();
+        if !queued {
+            return;
+        }
+
+        // A space created during an active session has not gone through the
+        // startup registration pass. Register it before the outbox worker
+        // attempts its first push.
+        if sync_is_active()
+            && let Some(name) = space_name.as_deref()
+        {
+            let _ = register_sync_space(space_id, name).await;
+        }
+        schedule_sync_drain();
+        publish_sync_hint();
     });
 }
 
 fn next_sync_mutation_id() -> String {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return format!("{}:{}", load_device_id(), now_millis());
-    };
-    let sequence = storage
-        .get_item(SYNC_SEQUENCE_STORAGE_KEY)
-        .ok()
-        .flatten()
+    web_sys::window()
+        .and_then(|window| window.crypto().ok())
+        .map(|crypto| crypto.random_uuid())
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}-{}",
+                load_device_id(),
+                now_millis(),
+                (js_sys::Math::random() * 1_000_000_000.0) as u64
+            )
+        })
+}
+
+fn next_local_generation(space_id: u64) -> u64 {
+    let principal = current_sync_principal();
+    let key = format!("task-space:generation:{principal}:{space_id}");
+    let persisted = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(&key).ok().flatten())
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
-        .saturating_add(1);
-    let _ = storage.set_item(SYNC_SEQUENCE_STORAGE_KEY, &sequence.to_string());
-    format!("{}:{}", load_device_id(), sequence)
+        .unwrap_or_default();
+    let current = LOCAL_GENERATIONS.with(|generations| {
+        let mut generations = generations.borrow_mut();
+        let entry = generations
+            .entry((principal.clone(), space_id))
+            .or_insert(persisted);
+        *entry = (*entry).max(persisted);
+        *entry
+    });
+    let next = current.saturating_add(1).max(1);
+    LOCAL_GENERATIONS.with(|generations| {
+        generations.borrow_mut().insert((principal, space_id), next);
+    });
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item(&key, &next.to_string());
+    }
+    next
 }
 
 fn persist_space_crdt(
     space_id: u64,
     board: &BoardData,
+    spaces: RwSignal<Vec<Space>>,
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
 ) {
     crdt_docs.update(|items| {
         items.entry(space_id).or_default();
     });
-    let previous_state_vector = crdt_docs
-        .get_untracked()
-        .get(&space_id)
-        .map(SpaceDoc::state_vector)
-        .unwrap_or_default();
+    // A space without a server acknowledgement is a first-sync bootstrap.
+    // Diffing against the local vector here would produce an empty update and
+    // strand a newly-created offline space after registration.
+    let previous_state_vector =
+        acknowledged_state_vector(space_id).unwrap_or_else(SpaceDoc::empty_state_vector);
     crdt_docs.update(|items| {
         let doc = items.entry(space_id).or_default();
         doc.import_board(board);
@@ -967,26 +2526,51 @@ fn persist_space_crdt(
         if let Ok(update) = doc.encode_update(&previous_state_vector)
             && !update.is_empty()
         {
-            let mutation_id = next_sync_mutation_id();
             let encoded = EncodedUpdate::from_bytes(&update);
-            spawn_local(async move {
-                let _ = JsFuture::from(indexed_db_queue_crdt_update(
-                    space_id,
-                    &mutation_id,
-                    encoded.as_str(),
-                ))
-                .await;
-            });
+            let space_name = spaces
+                .get_untracked()
+                .iter()
+                .find(|space| space.id == space_id)
+                .map(|space| space.name.clone());
+            queue_crdt_update(
+                space_id,
+                EncodedUpdate::from_bytes(&previous_state_vector)
+                    .as_str()
+                    .to_owned(),
+                encoded.as_str().to_owned(),
+                EncodedUpdate::from_bytes(&snapshot).as_str().to_owned(),
+                space_name,
+            );
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct QueuedCrdtUpdate {
+    #[serde(default)]
+    principal: Option<String>,
     #[serde(rename = "spaceId")]
     space_id: u64,
     mutation_id: String,
+    #[serde(rename = "localGeneration", default)]
+    local_generation: Option<u64>,
+    #[serde(rename = "stateVector", default)]
+    state_vector: Option<String>,
     update: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct QueuedMetadataUpdate {
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(rename = "spaceId")]
+    space_id: u64,
+    #[serde(rename = "operationId")]
+    operation_id: String,
+    operation: String,
+    name: Option<String>,
+    #[serde(rename = "expectedVersion")]
+    expected_version: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -996,13 +2580,16 @@ struct RegisterSpacePayload<'a> {
 
 async fn register_sync_spaces(spaces: RwSignal<Vec<Space>>) {
     for space in spaces.get_untracked() {
+        if space.deleted_at.is_some() {
+            continue;
+        }
         let Ok(builder) = Request::post(&api_url(&format!("/sync/spaces/{}", space.id)))
             .credentials(RequestCredentials::Include)
             .json(&RegisterSpacePayload { name: &space.name })
         else {
             return;
         };
-        let Ok(response) = builder.send().await else {
+        let Ok(response) = send_request_with_timeout(builder).await else {
             return;
         };
         if response.status() >= 300 {
@@ -1011,28 +2598,46 @@ async fn register_sync_spaces(spaces: RwSignal<Vec<Space>>) {
     }
 }
 
-async fn merge_remote_spaces(spaces: RwSignal<Vec<Space>>, next_space_id: RwSignal<u64>) {
-    let Ok(response) = Request::get(&api_url("/sync/spaces"))
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
+async fn merge_remote_spaces(
+    spaces: RwSignal<Vec<Space>>,
+    next_space_id: RwSignal<u64>,
+    active_space_id: RwSignal<u64>,
+) {
+    let principal = current_sync_principal();
+    let Ok(response) = send_with_timeout(
+        Request::get(&api_url("/sync/spaces")).credentials(RequestCredentials::Include),
+    )
+    .await
     else {
         return;
     };
+    if principal != current_sync_principal() {
+        return;
+    }
     if response.status() >= 300 {
         return;
     }
     let Ok(remote_spaces) = response.json::<Vec<Space>>().await else {
         return;
     };
+    if principal != current_sync_principal() {
+        return;
+    }
     let highest_remote_id = remote_spaces.iter().map(|space| space.id).max();
     spaces.update(|local_spaces| {
         for remote in remote_spaces {
-            if local_spaces.iter().all(|local| local.id != remote.id) {
+            if let Some(local) = local_spaces.iter_mut().find(|local| local.id == remote.id) {
+                local.name = remote.name.clone();
+                local.metadata_version = remote.metadata_version;
+                local.archived = remote.archived || remote.deleted_at.is_some();
+                local.updated_at = remote.updated_at;
+                local.deleted_at = remote.deleted_at;
+            } else {
                 local_spaces.push(Space {
                     id: remote.id,
                     name: remote.name,
-                    archived: remote.archived,
+                    metadata_version: remote.metadata_version,
+                    archived: remote.archived || remote.deleted_at.is_some(),
                     created_at: remote.created_at,
                     updated_at: remote.updated_at,
                     deleted_at: remote.deleted_at,
@@ -1044,6 +2649,15 @@ async fn merge_remote_spaces(spaces: RwSignal<Vec<Space>>, next_space_id: RwSign
             }
         }
     });
+    if !spaces.get_untracked().iter().any(|space| {
+        space.id == active_space_id.get_untracked() && !space.archived && space.deleted_at.is_none()
+    }) && let Some(space) = spaces
+        .get_untracked()
+        .iter()
+        .find(|space| !space.archived && space.deleted_at.is_none())
+    {
+        active_space_id.set(space.id);
+    }
     if let Some(highest_remote_id) = highest_remote_id {
         next_space_id.update(|next| {
             *next = (*next).max(highest_remote_id.saturating_add(1));
@@ -1051,69 +2665,457 @@ async fn merge_remote_spaces(spaces: RwSignal<Vec<Space>>, next_space_id: RwSign
     }
 }
 
-fn parse_queued_crdt_updates(value: JsValue) -> Vec<QueuedCrdtUpdate> {
-    let Ok(raw) = js_sys::JSON::stringify(&value) else {
-        return Vec::new();
-    };
-    let Some(raw) = raw.as_string() else {
-        return Vec::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+fn parse_queued_crdt_updates(value: JsValue) -> Result<Vec<QueuedCrdtUpdate>, ()> {
+    let raw = js_sys::JSON::stringify(&value).map_err(|_| ())?;
+    let raw = raw.as_string().ok_or(())?;
+    serde_json::from_str(&raw).map_err(|_| ())
 }
 
-async fn drain_sync_queue() {
-    let Ok(value) = JsFuture::from(indexed_db_load_crdt_updates()).await else {
-        return;
+enum QueueDrainResult {
+    Complete,
+    Retry,
+    Paused,
+    PausedAuth,
+    PausedBilling,
+}
+
+fn response_error_code(response: &Response) -> Option<String> {
+    response.headers().get("x-task-space-error-code")
+}
+
+fn is_billing_pause_response(response: &Response) -> bool {
+    response.status() == 403
+        && response_error_code(response)
+            .as_deref()
+            .is_some_and(|code| matches!(code, "SYNC_NOT_ENTITLED" | "SYNC_PAYMENT_PAUSED"))
+}
+
+fn metadata_operation_from_name(name: &str) -> Option<SpaceMetadataOperation> {
+    Some(match name {
+        "rename" => SpaceMetadataOperation::Rename,
+        "archive" => SpaceMetadataOperation::Archive,
+        "unarchive" => SpaceMetadataOperation::Unarchive,
+        "delete" => SpaceMetadataOperation::Delete,
+        "restore" => SpaceMetadataOperation::Restore,
+        _ => return None,
+    })
+}
+
+async fn drain_metadata_queue_once(
+    runtime: SyncRuntime,
+    auth_retry_used: &mut bool,
+) -> QueueDrainResult {
+    let Ok(value) = JsFuture::from(indexed_db_load_metadata_updates()).await else {
+        return QueueDrainResult::Retry;
     };
-    for queued in parse_queued_crdt_updates(value) {
-        let Ok(update) = EncodedUpdate::from_base64(queued.update) else {
-            continue;
+    let Ok(raw) = js_sys::JSON::stringify(&value) else {
+        return QueueDrainResult::Retry;
+    };
+    let Some(raw) = raw.as_string() else {
+        return QueueDrainResult::Retry;
+    };
+    let Ok(queued) = serde_json::from_str::<Vec<QueuedMetadataUpdate>>(&raw) else {
+        return QueueDrainResult::Paused;
+    };
+    for queued in queued {
+        let principal = queued
+            .principal
+            .clone()
+            .unwrap_or_else(current_sync_principal);
+        if principal != current_sync_principal() {
+            return QueueDrainResult::Paused;
+        }
+        let Some(operation) = metadata_operation_from_name(&queued.operation) else {
+            return QueueDrainResult::Paused;
         };
-        let request = SyncPushRequest {
-            protocol_version: SYNC_PROTOCOL_VERSION,
+        let request = SyncMetadataRequest {
+            protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+            space_id: queued.space_id,
+            operation_id: queued.operation_id.clone(),
+            operation,
+            name: queued.name.clone(),
+            expected_version: queued.expected_version,
+        };
+        let Ok(builder) = Request::post(&api_url(&format!(
+            "/sync/spaces/{}/metadata",
+            queued.space_id
+        )))
+        .credentials(RequestCredentials::Include)
+        .json(&request) else {
+            return QueueDrainResult::Retry;
+        };
+        let Ok(response) = send_request_with_timeout(builder).await else {
+            return QueueDrainResult::Retry;
+        };
+        if principal != current_sync_principal() || !sync_is_active() {
+            return QueueDrainResult::Paused;
+        }
+        match response.status() {
+            200..=299 => {
+                let Ok(payload) = response.json::<SyncMetadataResponse>().await else {
+                    return QueueDrainResult::Retry;
+                };
+                if principal != current_sync_principal() || !sync_is_active() {
+                    return QueueDrainResult::Paused;
+                }
+                if payload.protocol_version != SYNC_RECONCILE_PROTOCOL_VERSION
+                    || payload.space_id != queued.space_id
+                {
+                    return QueueDrainResult::Paused;
+                }
+                runtime.spaces.update(|items| {
+                    if let Some(space) = items.iter_mut().find(|space| space.id == payload.space_id)
+                    {
+                        space.name = payload.name.clone();
+                        space.archived = payload.archived;
+                        space.metadata_version = payload.metadata_version;
+                        space.deleted_at = payload.deleted_at;
+                    }
+                });
+            }
+            408 | 425 | 429 | 500..=599 => return QueueDrainResult::Retry,
+            401 => {
+                if !*auth_retry_used && refresh_session_once().await {
+                    *auth_retry_used = true;
+                    return QueueDrainResult::Retry;
+                }
+                return QueueDrainResult::PausedAuth;
+            }
+            403 if is_billing_pause_response(&response) => return QueueDrainResult::PausedBilling,
+            403 => return QueueDrainResult::Paused,
+            404 | 409 | 422 => return QueueDrainResult::Paused,
+            _ => return QueueDrainResult::Paused,
+        }
+        let _ = JsFuture::from(indexed_db_ack_metadata_update(
+            &principal,
+            queued.space_id,
+            &queued.operation_id,
+        ))
+        .await;
+    }
+    QueueDrainResult::Complete
+}
+
+async fn drain_sync_queue_once(
+    runtime: SyncRuntime,
+    auth_retry_used: &mut bool,
+) -> QueueDrainResult {
+    match drain_metadata_queue_once(runtime, auth_retry_used).await {
+        QueueDrainResult::Complete => {}
+        other => return other,
+    }
+    let Ok(value) = JsFuture::from(indexed_db_load_crdt_updates()).await else {
+        return QueueDrainResult::Retry;
+    };
+    let Ok(queued_updates) = parse_queued_crdt_updates(value) else {
+        return QueueDrainResult::Paused;
+    };
+    for queued in queued_updates {
+        let Ok(update) = EncodedUpdate::from_base64(queued.update) else {
+            // Keep malformed records for diagnostics instead of silently
+            // acknowledging and losing the only copy of the update. Stop the
+            // drain so the UI remains in an actionable error state.
+            return QueueDrainResult::Paused;
+        };
+        let state_vector = match queued.state_vector {
+            Some(state_vector) => {
+                let Ok(state_vector) = EncodedUpdate::from_base64(state_vector) else {
+                    return QueueDrainResult::Paused;
+                };
+                state_vector
+            }
+            None => EncodedUpdate::from_bytes(&SpaceDoc::empty_state_vector()),
+        };
+        let request = SyncReconcileRequest {
+            protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
             space_id: queued.space_id,
             mutation_id: queued.mutation_id.clone(),
+            device_id: load_device_id(),
+            local_generation: queued.local_generation.unwrap_or_default(),
+            state_vector,
             update,
         };
-        let Ok(builder) = Request::post(&api_url("/sync/push"))
+        let Ok(builder) = Request::post(&api_url("/sync/v2/reconcile"))
             .credentials(RequestCredentials::Include)
             .json(&request)
         else {
-            return;
+            return QueueDrainResult::Retry;
         };
-        let Ok(response) = builder.send().await else {
-            return;
+        let Ok(response) = send_request_with_timeout(builder).await else {
+            return QueueDrainResult::Retry;
         };
-        if response.status() >= 300 {
-            return;
+        match response.status() {
+            200..=299 => {
+                let Ok(payload) = response.json::<SyncReconcileResponse>().await else {
+                    return QueueDrainResult::Retry;
+                };
+                if payload.protocol_version != SYNC_RECONCILE_PROTOCOL_VERSION
+                    || payload.space_id != queued.space_id
+                {
+                    return QueueDrainResult::Paused;
+                }
+                let Ok(remote_update) = payload.update.to_bytes() else {
+                    return QueueDrainResult::Paused;
+                };
+                let Ok(server_state_vector) = payload.state_vector.to_bytes() else {
+                    return QueueDrainResult::Paused;
+                };
+                if remote_update.len() > MAX_SYNC_UPDATE_BYTES
+                    || server_state_vector.len() > MAX_SYNC_STATE_VECTOR_BYTES
+                {
+                    return QueueDrainResult::Paused;
+                }
+                let principal = queued
+                    .principal
+                    .clone()
+                    .unwrap_or_else(current_sync_principal);
+                if principal != current_sync_principal() {
+                    return QueueDrainResult::Paused;
+                }
+                let Some(encoded_snapshot) =
+                    apply_reconcile_update(runtime, queued.space_id, &remote_update)
+                else {
+                    return QueueDrainResult::Retry;
+                };
+                if JsFuture::from(indexed_db_commit_crdt_reconcile(
+                    &principal,
+                    queued.space_id,
+                    &queued.mutation_id,
+                    &encoded_snapshot,
+                    payload.state_vector.as_str(),
+                    queued.local_generation.unwrap_or_default(),
+                ))
+                .await
+                .is_err()
+                {
+                    return QueueDrainResult::Retry;
+                }
+                set_acknowledged_state_vector(&principal, queued.space_id, server_state_vector);
+                if payload.event_cursor > 0 {
+                    save_sync_cursor(payload.event_cursor);
+                }
+            }
+            408 | 425 | 429 | 500..=599 => return QueueDrainResult::Retry,
+            401 => {
+                if !*auth_retry_used && refresh_session_once().await {
+                    *auth_retry_used = true;
+                    return QueueDrainResult::Retry;
+                }
+                return QueueDrainResult::PausedAuth;
+            }
+            403 if is_billing_pause_response(&response) => return QueueDrainResult::PausedBilling,
+            403 => return QueueDrainResult::Paused,
+            404 | 409 | 422 => return QueueDrainResult::Paused,
+            _ => return QueueDrainResult::Paused,
         }
+        let principal = queued
+            .principal
+            .clone()
+            .unwrap_or_else(current_sync_principal);
         let _ = JsFuture::from(indexed_db_ack_crdt_update(
+            &principal,
             queued.space_id,
             &queued.mutation_id,
         ))
         .await;
     }
+    QueueDrainResult::Complete
+}
+
+fn apply_reconcile_update(runtime: SyncRuntime, space_id: u64, update: &[u8]) -> Option<String> {
+    if update.len() > MAX_SYNC_UPDATE_BYTES {
+        return None;
+    }
+    let mut next_board = None;
+    let mut encoded_snapshot = None;
+    runtime.crdt_docs.update(|items| {
+        let doc = items.entry(space_id).or_default();
+        if update.is_empty() || doc.apply_update(update).is_ok() {
+            next_board = Some(doc.board());
+            let snapshot = doc.snapshot();
+            if snapshot.len() <= MAX_SYNC_SNAPSHOT_BYTES {
+                encoded_snapshot = Some(EncodedUpdate::from_bytes(&snapshot).as_str().to_owned());
+            }
+        }
+    });
+    let board = next_board?;
+    runtime.spaces.update(|items| {
+        if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
+            space.board = board.clone();
+            space.updated_at = now_millis();
+        }
+    });
+    if runtime.active_space_id.get_untracked() == space_id {
+        runtime.notes.set(board.notes);
+        runtime.groups.set(board.groups);
+    }
+    let snapshot = encoded_snapshot?;
+    Some(snapshot)
+}
+
+async fn sync_wait_ms(milliseconds: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let Some(window) = web_sys::window() else {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        };
+        let callback = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.unchecked_ref(),
+            milliseconds,
+        );
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+fn schedule_sync_drain() {
+    if !sync_is_active() {
+        return;
+    }
+    let already_running = SYNC_DRAIN_IN_FLIGHT.with(|running| {
+        if running.get() {
+            SYNC_DRAIN_PENDING.with(|pending| pending.set(true));
+            true
+        } else {
+            running.set(true);
+            false
+        }
+    });
+    if already_running {
+        return;
+    }
+
+    let Some(runtime) = SYNC_RUNTIME.with(|runtime| *runtime.borrow()) else {
+        SYNC_DRAIN_IN_FLIGHT.with(|running| running.set(false));
+        return;
+    };
+
+    spawn_local(async move {
+        let mut retry_delay = 1_000;
+        let mut auth_retry_used = false;
+        loop {
+            if !sync_is_active() || !sync_run_is_current(runtime.run_generation) {
+                break;
+            }
+            let principal = current_sync_principal();
+            let owns_lease = JsFuture::from(acquire_sync_lease(&principal))
+                .await
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if !sync_is_active() || !sync_run_is_current(runtime.run_generation) {
+                break;
+            }
+            if !owns_lease {
+                runtime.status.set(SyncStatus::Syncing);
+                sync_wait_ms(2_000).await;
+                continue;
+            }
+            runtime.status.set(SyncStatus::Syncing);
+            match drain_sync_queue_once(runtime, &mut auth_retry_used).await {
+                QueueDrainResult::Complete => {
+                    retry_delay = 1_000;
+                    auth_retry_used = false;
+                    runtime.status.set(SyncStatus::Synced);
+                    let rerun = SYNC_DRAIN_PENDING.with(|pending| pending.take());
+                    if !rerun {
+                        break;
+                    }
+                }
+                QueueDrainResult::Retry => {
+                    runtime.status.set(SyncStatus::Offline);
+                    let jitter =
+                        (f64::from(retry_delay) * 0.25 * (js_sys::Math::random() * 2.0 - 1.0))
+                            as i32;
+                    sync_wait_ms((retry_delay + jitter).max(250)).await;
+                    retry_delay = (retry_delay * 2).min(60_000);
+                }
+                QueueDrainResult::PausedAuth => {
+                    stop_sync_events(&api_url("/sync/events"));
+                    runtime.status.set(SyncStatus::AuthPaused);
+                    break;
+                }
+                QueueDrainResult::PausedBilling => {
+                    runtime.status.set(SyncStatus::BillingPaused);
+                    break;
+                }
+                QueueDrainResult::Paused => {
+                    runtime.status.set(SyncStatus::Error);
+                    break;
+                }
+            }
+        }
+        SYNC_DRAIN_IN_FLIGHT.with(|running| running.set(false));
+        if sync_is_active()
+            && sync_run_is_current(runtime.run_generation)
+            && SYNC_DRAIN_PENDING.with(|pending| pending.take())
+        {
+            schedule_sync_drain();
+        }
+    });
 }
 
 fn apply_remote_sync_event(
     raw: String,
+    run_generation: u64,
     spaces: RwSignal<Vec<Space>>,
     active_space_id: RwSignal<u64>,
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
 ) {
+    if !sync_is_active() || !sync_run_is_current(run_generation) {
+        return;
+    }
     let Ok(event) = serde_json::from_str::<SyncEvent>(&raw) else {
         return;
     };
+    if event.protocol_version != SYNC_PROTOCOL_VERSION || event.event_id == 0 {
+        return;
+    }
+    if let Some(metadata) = event.metadata.as_ref() {
+        let deleted = metadata.deleted_at.is_some();
+        spaces.update(|items| {
+            if let Some(space) = items.iter_mut().find(|space| space.id == event.space_id) {
+                space.name = metadata.name.clone();
+                space.metadata_version = metadata.metadata_version;
+                space.archived = metadata.archived || deleted;
+                space.deleted_at = metadata.deleted_at;
+            }
+        });
+        if deleted
+            && active_space_id.get_untracked() == event.space_id
+            && let Some(space) = spaces
+                .get_untracked()
+                .iter()
+                .find(|space| !space.archived && space.deleted_at.is_none())
+        {
+            active_space_id.set(space.id);
+            notes.set(space.board.notes.clone());
+            groups.set(space.board.groups.clone());
+        }
+        if event.update.as_str().is_empty() {
+            return;
+        }
+    }
     let Ok(update) = event.update.to_bytes() else {
         return;
     };
+    if update.len() > MAX_SYNC_UPDATE_BYTES {
+        return;
+    }
     let mut next_board = None;
     crdt_docs.update(|items| {
         let doc = items.entry(event.space_id).or_default();
-        if doc.apply_update(&update).is_ok() {
-            next_board = Some(doc.board());
+        let candidate = doc.clone();
+        if candidate.apply_update(&update).is_ok() {
+            let snapshot = candidate.snapshot();
+            if snapshot.len() <= MAX_SYNC_SNAPSHOT_BYTES {
+                *doc = candidate;
+                next_board = Some(doc.board());
+            }
         }
     });
     let Some(board) = next_board else {
@@ -1129,31 +3131,96 @@ fn apply_remote_sync_event(
         notes.set(board.notes);
         groups.set(board.groups);
     }
-    save_crdt_doc_snapshot(event.space_id, crdt_docs);
+    if sync_is_active() && sync_run_is_current(run_generation) {
+        save_crdt_doc_snapshot(&current_sync_principal(), event.space_id, crdt_docs);
+    }
 }
 
-fn save_crdt_doc_snapshot(space_id: u64, crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>) {
+fn save_crdt_doc_snapshot(
+    principal: &str,
+    space_id: u64,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+) {
     let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() else {
         return;
     };
-    queue_indexed_db_crdt_save(
-        space_id,
-        EncodedUpdate::from_bytes(&doc.snapshot())
-            .as_str()
-            .to_owned(),
-    );
+    let principal = principal.to_owned();
+    spawn_local(async move {
+        let _ = JsFuture::from(indexed_db_save_crdt(
+            &principal,
+            space_id,
+            EncodedUpdate::from_bytes(&doc.snapshot()).as_str(),
+        ))
+        .await;
+    });
 }
 
-async fn pull_active_space(
+async fn pull_space(
     spaces: RwSignal<Vec<Space>>,
     active_space_id: RwSignal<u64>,
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+    space_id: u64,
+    run_generation: u64,
 ) {
-    let space_id = active_space_id.get_untracked();
-    let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() else {
+    let principal = current_sync_principal();
+    // Load the acknowledged server vector even when the CRDT document is
+    // already cached in memory. Without this, the first edit after a fast
+    // account switch/reconnect could diff against the local vector and queue
+    // an empty upload instead of the actual local change.
+    if let Ok(value) = JsFuture::from(indexed_db_load_sync_state(&principal, space_id)).await
+        && let Some(encoded) = value
+            .as_string()
+            .and_then(|encoded| EncodedUpdate::from_base64(encoded).ok())
+        && let Ok(state_vector) = encoded.to_bytes()
+    {
+        set_acknowledged_state_vector(&principal, space_id, state_vector);
+    } else if acknowledged_state_vector(space_id).is_none() {
+        set_acknowledged_state_vector(&principal, space_id, SpaceDoc::empty_state_vector());
+    }
+    if principal != current_sync_principal()
+        || !sync_is_active()
+        || !sync_run_is_current(run_generation)
+    {
         return;
+    }
+    let doc = if let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() {
+        doc
+    } else {
+        let loaded_snapshot = match JsFuture::from(indexed_db_load_crdt(space_id)).await {
+            Ok(value) => match decode_indexed_crdt_value(value) {
+                Ok(snapshot) => snapshot,
+                Err(()) => return,
+            },
+            Err(_) => None,
+        };
+        if principal != current_sync_principal()
+            || !sync_is_active()
+            || !sync_run_is_current(run_generation)
+        {
+            return;
+        }
+        let loaded_doc = loaded_snapshot
+            .as_deref()
+            .and_then(|bytes| SpaceDoc::from_update(bytes).ok());
+        if loaded_snapshot.is_some() && loaded_doc.is_none() {
+            return;
+        }
+        let had_loaded_doc = loaded_doc.is_some();
+        let doc = loaded_doc.unwrap_or_else(SpaceDoc::new);
+        if !had_loaded_doc
+            && let Some(space) = spaces
+                .get_untracked()
+                .into_iter()
+                .find(|space| space.id == space_id)
+        {
+            doc.import_board(&space.board);
+        }
+        crdt_docs.update(|items| {
+            items.insert(space_id, doc.clone());
+        });
+        doc
     };
     let request = SyncPullRequest {
         protocol_version: SYNC_PROTOCOL_VERSION,
@@ -1166,27 +3233,47 @@ async fn pull_active_space(
     else {
         return;
     };
-    let Ok(response) = builder.send().await else {
+    let Ok(response) = send_request_with_timeout(builder).await else {
         return;
     };
+    if principal != current_sync_principal()
+        || !sync_is_active()
+        || !sync_run_is_current(run_generation)
+    {
+        return;
+    }
     if response.status() >= 300 {
         return;
     }
     let Ok(payload) = response.json::<SyncPullResponse>().await else {
         return;
     };
+    if principal != current_sync_principal()
+        || !sync_is_active()
+        || !sync_run_is_current(run_generation)
+    {
+        return;
+    }
+    if payload.protocol_version != SYNC_PROTOCOL_VERSION
+        || payload.space_id != space_id
+        || payload.has_more
+    {
+        return;
+    }
     let Ok(update) = payload.update.to_bytes() else {
         return;
     };
-    if update.is_empty() {
+    if update.is_empty() || update.len() > MAX_SYNC_UPDATE_BYTES {
         return;
     }
     let mut next_board = None;
     crdt_docs.update(|items| {
-        if let Some(doc) = items.get(&space_id)
-            && doc.apply_update(&update).is_ok()
+        if let Some(candidate) = items.get(&space_id).cloned()
+            && candidate.apply_update(&update).is_ok()
+            && candidate.snapshot().len() <= MAX_SYNC_SNAPSHOT_BYTES
         {
-            next_board = Some(doc.board());
+            next_board = Some(candidate.board());
+            items.insert(space_id, candidate);
         }
     });
     let Some(board) = next_board else {
@@ -1198,9 +3285,62 @@ async fn pull_active_space(
             space.updated_at = now_millis();
         }
     });
-    notes.set(board.notes);
-    groups.set(board.groups);
-    save_crdt_doc_snapshot(space_id, crdt_docs);
+    if active_space_id.get_untracked() == space_id {
+        notes.set(board.notes);
+        groups.set(board.groups);
+    }
+    save_crdt_doc_snapshot(&principal, space_id, crdt_docs);
+}
+
+async fn pull_active_space(
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+    run_generation: u64,
+) {
+    let space_id = active_space_id.get_untracked();
+    pull_space(
+        spaces,
+        active_space_id,
+        notes,
+        groups,
+        crdt_docs,
+        space_id,
+        run_generation,
+    )
+    .await;
+}
+
+async fn pull_all_spaces(
+    spaces: RwSignal<Vec<Space>>,
+    active_space_id: RwSignal<u64>,
+    notes: RwSignal<Vec<Note>>,
+    groups: RwSignal<Vec<Group>>,
+    crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+    run_generation: u64,
+) {
+    let active = active_space_id.get_untracked();
+    let ids: Vec<u64> = spaces
+        .get_untracked()
+        .iter()
+        .filter(|space| space.deleted_at.is_none())
+        .map(|space| space.id)
+        .filter(|space_id| *space_id != active)
+        .collect();
+    for space_id in ids {
+        pull_space(
+            spaces,
+            active_space_id,
+            notes,
+            groups,
+            crdt_docs,
+            space_id,
+            run_generation,
+        )
+        .await;
+    }
 }
 
 fn start_authenticated_sync(
@@ -1210,12 +3350,97 @@ fn start_authenticated_sync(
     notes: RwSignal<Vec<Note>>,
     groups: RwSignal<Vec<Group>>,
     crdt_docs: RwSignal<HashMap<u64, SpaceDoc>>,
+    sync_status: RwSignal<SyncStatus>,
 ) {
+    let principal = current_sync_principal();
+    let run_generation = next_sync_run_generation();
+    let cleanup_principal = principal.clone();
+    let online_listener = window_event_listener_untyped("online", |_| {
+        schedule_sync_drain();
+    });
+    let visibility_listener = window_event_listener_untyped("visibilitychange", |_| {
+        schedule_sync_drain();
+    });
+    let registration_spaces = spaces;
+    let safety_tick = Closure::<dyn FnMut()>::new(move || {
+        if !sync_is_active() || !sync_run_is_current(run_generation) {
+            return;
+        }
+        schedule_sync_drain();
+        // Registration is intentionally retried independently of the CRDT
+        // outbox. A newly-created empty space has no document mutation to
+        // wake the queue, so a transient failure here must not strand it.
+        spawn_local(register_sync_spaces(registration_spaces));
+    });
+    let safety_timer = start_sync_safety_timer(safety_tick.as_ref().unchecked_ref());
+    safety_tick.forget();
+    on_cleanup(move || {
+        if sync_run_is_current(run_generation) {
+            next_sync_run_generation();
+            set_sync_active(false);
+            SYNC_RUNTIME.with(|runtime| runtime.replace(None));
+            stop_sync_events(&api_url("/sync/events"));
+            release_sync_lease(&cleanup_principal);
+            stop_sync_broadcast();
+        }
+        online_listener.remove();
+        visibility_listener.remove();
+        stop_sync_safety_timer(safety_timer);
+    });
+
+    let on_hint = Closure::<dyn FnMut()>::new(schedule_sync_drain);
+    let _ = start_sync_broadcast(&principal, on_hint.as_ref().unchecked_ref());
+    on_hint.forget();
+
     spawn_local(async move {
-        merge_remote_spaces(spaces, next_space_id).await;
+        merge_remote_spaces(spaces, next_space_id, active_space_id).await;
+        if principal != current_sync_principal() || !sync_run_is_current(run_generation) {
+            return;
+        }
         register_sync_spaces(spaces).await;
-        drain_sync_queue().await;
-        pull_active_space(spaces, active_space_id, notes, groups, crdt_docs).await;
+        if principal != current_sync_principal() || !sync_run_is_current(run_generation) {
+            return;
+        }
+        SYNC_RUNTIME.with(|runtime| {
+            runtime.replace(Some(SyncRuntime {
+                run_generation,
+                spaces,
+                active_space_id,
+                notes,
+                groups,
+                crdt_docs,
+                status: sync_status,
+            }));
+        });
+        sync_status.set(SyncStatus::Syncing);
+        set_sync_active(true);
+        let _ = JsFuture::from(acquire_sync_lease(&principal)).await;
+        if principal != current_sync_principal() || !sync_run_is_current(run_generation) {
+            return;
+        }
+        schedule_sync_drain();
+        pull_active_space(
+            spaces,
+            active_space_id,
+            notes,
+            groups,
+            crdt_docs,
+            run_generation,
+        )
+        .await;
+        let all_spaces = spaces;
+        let all_active = active_space_id;
+        let all_notes = notes;
+        let all_groups = groups;
+        let all_docs = crdt_docs;
+        spawn_local(pull_all_spaces(
+            all_spaces,
+            all_active,
+            all_notes,
+            all_groups,
+            all_docs,
+            run_generation,
+        ));
 
         let update_spaces = spaces;
         let update_active = active_space_id;
@@ -1225,6 +3450,7 @@ fn start_authenticated_sync(
         let on_update = Closure::<dyn FnMut(String)>::new(move |raw| {
             apply_remote_sync_event(
                 raw,
+                run_generation,
                 update_spaces,
                 update_active,
                 update_notes,
@@ -1238,21 +3464,62 @@ fn start_authenticated_sync(
         let reconnect_groups = groups;
         let reconnect_docs = crdt_docs;
         let on_open = Closure::<dyn FnMut()>::new(move || {
+            schedule_sync_drain();
             spawn_local(pull_active_space(
                 reconnect_spaces,
                 reconnect_active,
                 reconnect_notes,
                 reconnect_groups,
                 reconnect_docs,
+                run_generation,
             ));
+            // A reconnect (including a durable `sync-reset` cursor recovery)
+            // must repair every registered space, not just the visible one.
+            // Pulling all spaces here replays metadata and reconciliation after
+            // retention gaps, account switches, or missed SSE events.
+            spawn_local(pull_all_spaces(
+                reconnect_spaces,
+                reconnect_active,
+                reconnect_notes,
+                reconnect_groups,
+                reconnect_docs,
+                run_generation,
+            ));
+        });
+        let on_error_status = sync_status;
+        let on_error = Closure::<dyn FnMut()>::new(move || {
+            spawn_local(async move {
+                let online = web_sys::window().is_some_and(|window| window.navigator().on_line());
+                if !online {
+                    if sync_is_active() && sync_run_is_current(run_generation) {
+                        on_error_status.set(SyncStatus::Offline);
+                    }
+                    return;
+                }
+                if refresh_session_once().await {
+                    if !sync_is_active() || !sync_run_is_current(run_generation) {
+                        return;
+                    }
+                    on_error_status.set(SyncStatus::Syncing);
+                    schedule_sync_drain();
+                } else {
+                    if !sync_is_active() || !sync_run_is_current(run_generation) {
+                        return;
+                    }
+                    stop_sync_events(&api_url("/sync/events"));
+                    on_error_status.set(SyncStatus::AuthPaused);
+                }
+            });
         });
         let _ = start_sync_events(
             &api_url("/sync/events"),
             on_update.as_ref().unchecked_ref(),
             on_open.as_ref().unchecked_ref(),
+            on_error.as_ref().unchecked_ref(),
         );
         on_update.forget();
         on_open.forget();
+        on_error.forget();
     });
 }
 
@@ -1364,13 +3631,13 @@ fn persist_space_board(
 }
 
 fn next_note_id(board: &BoardData) -> u64 {
-    board
+    let highest = board
         .notes
         .iter()
         .map(|note| note.id)
         .max()
-        .unwrap_or(0)
-        .saturating_add(1)
+        .unwrap_or_default();
+    local_entity_seed().max(highest.saturating_add(1).min((1u64 << 53) - 1))
 }
 
 fn normalize_space_name(value: &str) -> String {
@@ -1475,7 +3742,7 @@ fn redo_board(
 }
 
 fn load_view(space_id: u64) -> ViewState {
-    let storage_key = format!("{VIEW_STORAGE_KEY_PREFIX}{space_id}");
+    let storage_key = view_storage_key(space_id);
     let view = web_sys::window()
         .and_then(|window| window.local_storage().ok().flatten())
         .and_then(|storage| {
@@ -1505,10 +3772,17 @@ fn save_view(space_id: u64, view: ViewState) {
     else {
         return;
     };
-    let storage_key = format!("{VIEW_STORAGE_KEY_PREFIX}{space_id}");
+    let storage_key = view_storage_key(space_id);
     if let Ok(raw) = serde_json::to_string(&view) {
         let _ = storage.set_item(&storage_key, &raw);
     }
+}
+
+fn view_storage_key(space_id: u64) -> String {
+    format!(
+        "{VIEW_STORAGE_KEY_PREFIX}{}:{space_id}",
+        current_sync_principal()
+    )
 }
 
 fn activate_space(
@@ -1531,7 +3805,7 @@ fn activate_space(
     let Some(space) = spaces
         .get_untracked()
         .into_iter()
-        .find(|space| space.id == space_id && !space.archived)
+        .find(|space| space.id == space_id && !space.archived && space.deleted_at.is_none())
     else {
         return false;
     };
@@ -1620,6 +3894,7 @@ impl SpaceActions {
             items.push(Space {
                 id: space_id,
                 name: "new space".into(),
+                metadata_version: 0,
                 archived: false,
                 created_at: now_millis(),
                 updated_at: now_millis(),
@@ -1655,7 +3930,7 @@ impl SpaceActions {
             .spaces
             .get_untracked()
             .iter()
-            .filter(|space| !space.archived)
+            .filter(|space| !space.archived && space.deleted_at.is_none())
             .count();
         if active_count <= 1 {
             self.restore_message.set(Some("keep one space open".into()));
@@ -1677,6 +3952,12 @@ impl SpaceActions {
             self.group_edit_snapshot,
         );
         let current_id = self.active_space_id.get_untracked();
+        let expected_version = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == current_id)
+            .map(|space| space.metadata_version);
         persist_space_board(
             self.spaces,
             current_id,
@@ -1690,11 +3971,18 @@ impl SpaceActions {
                 space.updated_at = now_millis();
             }
         });
+        queue_space_metadata_operation(
+            self.spaces,
+            current_id,
+            SpaceMetadataOperation::Archive,
+            None,
+            expected_version,
+        );
         if let Some(next_space_id) = self
             .spaces
             .get_untracked()
             .into_iter()
-            .find(|space| !space.archived)
+            .find(|space| !space.archived && space.deleted_at.is_none())
             .map(|space| space.id)
         {
             self.switch(next_space_id);
@@ -1751,14 +4039,30 @@ impl SpaceActions {
     }
 
     fn restore(self, space_id: u64) {
+        let expected_version = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.metadata_version);
         self.workspace_tombstones.update(|items| {
             items.retain(|tombstone| {
                 tombstone.kind != TombstoneKind::Space || tombstone.id != space_id
             });
         });
+        let operation = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == space_id)
+            .filter(|space| space.deleted_at.is_some())
+            .map(|_| SpaceMetadataOperation::Restore)
+            .unwrap_or(SpaceMetadataOperation::Unarchive);
+        queue_space_metadata_operation(self.spaces, space_id, operation, None, expected_version);
         self.spaces.update(|items| {
             if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
                 space.archived = false;
+                space.deleted_at = None;
                 space.updated_at = now_millis();
             }
         });
@@ -1771,12 +4075,25 @@ impl SpaceActions {
             return;
         };
         let name = normalize_space_name(&rename_value.get_untracked());
+        let expected_version = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == id)
+            .map(|space| space.metadata_version);
         self.spaces.update(|items| {
             if let Some(space) = items.iter_mut().find(|space| space.id == id) {
-                space.name = name;
+                space.name = name.clone();
                 space.updated_at = now_millis();
             }
         });
+        queue_space_metadata_operation(
+            self.spaces,
+            id,
+            SpaceMetadataOperation::Rename,
+            Some(name),
+            expected_version,
+        );
         self.save_workspace(self.active_space_id.get_untracked());
         rename_space_id.set(None);
     }
@@ -1794,12 +4111,18 @@ impl SpaceActions {
             return;
         };
         let current_id = self.active_space_id.get_untracked();
+        let expected_version = self
+            .spaces
+            .get_untracked()
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.metadata_version);
         if space_id == current_id
             && self
                 .spaces
                 .get_untracked()
                 .iter()
-                .filter(|space| !space.archived)
+                .filter(|space| !space.archived && space.deleted_at.is_none())
                 .count()
                 <= 1
         {
@@ -1842,14 +4165,26 @@ impl SpaceActions {
                 });
             }
         });
-        self.spaces
-            .update(|items| items.retain(|space| space.id != space_id));
+        queue_space_metadata_operation(
+            self.spaces,
+            space_id,
+            SpaceMetadataOperation::Delete,
+            None,
+            expected_version,
+        );
+        self.spaces.update(|items| {
+            if let Some(space) = items.iter_mut().find(|space| space.id == space_id) {
+                space.archived = true;
+                space.deleted_at = Some(now_millis());
+                space.updated_at = now_millis();
+            }
+        });
         if space_id == current_id {
             if let Some(next_space_id) = self
                 .spaces
                 .get_untracked()
                 .into_iter()
-                .find(|space| !space.archived)
+                .find(|space| !space.archived && space.deleted_at.is_none())
                 .map(|space| space.id)
             {
                 self.switch(next_space_id);
@@ -3626,6 +5961,11 @@ fn NoteCard(
 
 #[component]
 pub fn Board() -> impl IntoView {
+    // A fresh page starts in the non-account namespace. Switching to an
+    // authenticated principal happens only after the server identity is
+    // known and the account-local workspace has been loaded.
+    let guest_principal = guest_principal();
+    select_sync_principal(&guest_principal);
     let initial_workspace = load_workspace();
     let initial_workspace_for_hydration = initial_workspace.clone();
     let initial_space_id = initial_workspace.active_space_id;
@@ -3680,18 +6020,13 @@ pub fn Board() -> impl IntoView {
     let sync_started = RwSignal::new(false);
     let account_state = RwSignal::new(AccountState::Checking);
     let sync_entitled = RwSignal::new(false);
+    let sync_status = RwSignal::new(SyncStatus::Checking);
+    let account_namespace_loading = RwSignal::new(false);
+    let account_namespace_prepared = RwSignal::new(None::<String>);
     let checkout_error = RwSignal::new(None::<String>);
     let checkout_pending = RwSignal::new(false);
     let crdt_docs = RwSignal::new(HashMap::<u64, SpaceDoc>::new());
-    let next_space_id = RwSignal::new(
-        spaces
-            .get_untracked()
-            .iter()
-            .map(|space| space.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1),
-    );
+    let next_space_id = RwSignal::new(next_space_id_for(&spaces.get_untracked()));
     let next_id = RwSignal::new(initial_next_id);
 
     hydrate_workspace_from_indexed_db(
@@ -3714,19 +6049,77 @@ pub fn Board() -> impl IntoView {
         crdt_docs,
     );
 
+    // Entitlement changes arrive through verified webhooks, not the checkout
+    // return URL. Refresh independently of the sync coordinator so a page
+    // paused for payment can notice recovery without a reload; principal
+    // checks discard late responses after logout or account switching.
+    let account_refresh_tick = Closure::<dyn FnMut()>::new(move || {
+        let principal = current_sync_principal();
+        spawn_local(async move {
+            let state = load_account_state().await;
+            if current_sync_principal() == principal
+                && !(matches!(state, AccountState::Unavailable)
+                    && account_state.get_untracked().is_authenticated())
+            {
+                account_state.set(state);
+            }
+        });
+    });
+    let account_refresh_timer =
+        start_account_refresh(account_refresh_tick.as_ref().unchecked_ref());
+    account_refresh_tick.forget();
+    on_cleanup(move || stop_account_refresh(account_refresh_timer));
+
+    let initial_account_principal = current_sync_principal();
     spawn_local(async move {
-        account_state.set(load_account_state_after_checkout().await);
+        let state = load_account_state_after_checkout().await;
+        if current_sync_principal() == initial_account_principal {
+            account_state.set(state);
+        }
     });
 
     Effect::new(move |_| {
-        if storage_hydrated.get()
-            && account_state
-                .get()
-                .entitlement()
-                .is_some_and(Entitlement::can_sync)
-        {
-            sync_entitled.set(true);
+        if !storage_hydrated.get() || account_namespace_loading.get() {
+            return;
         }
+        let AccountState::SignedIn(entitlement) = account_state.get() else {
+            return;
+        };
+        let account_id = entitlement.account_id.clone();
+        if account_namespace_prepared.get().as_deref() == Some(account_id.as_str()) {
+            return;
+        }
+        if sync_started.get_untracked() {
+            stop_authenticated_sync();
+            sync_started.set(false);
+        }
+        account_namespace_loading.set(true);
+        let prepared_account_id = account_id.clone();
+        let allow_guest_adoption = is_guest_principal(&current_sync_principal());
+        spawn_local(async move {
+            let prepared = prepare_account_workspace(
+                account_id,
+                allow_guest_adoption,
+                spaces,
+                active_space_id,
+                notes,
+                groups,
+                workspace_tombstones,
+                next_space_id,
+                next_id,
+                crdt_docs,
+            )
+            .await;
+            if current_sync_principal() != format!("account:{prepared_account_id}") {
+                return;
+            }
+            account_namespace_prepared.set(prepared.then_some(prepared_account_id));
+            account_namespace_loading.set(false);
+            if !prepared {
+                sync_status.set(SyncStatus::Error);
+            }
+            sync_entitled.set(prepared && entitlement.can_sync_at(now_millis() / 1_000));
+        });
     });
 
     Effect::new(move |_| {
@@ -3739,7 +6132,49 @@ pub fn Board() -> impl IntoView {
                 notes,
                 groups,
                 crdt_docs,
+                sync_status,
             );
+        }
+    });
+
+    Effect::new(move |_| {
+        if account_namespace_loading.get() {
+            sync_status.set(SyncStatus::Checking);
+            return;
+        }
+        match account_state.get() {
+            AccountState::Checking => sync_status.set(SyncStatus::Checking),
+            AccountState::Guest | AccountState::Unavailable => {
+                sync_entitled.set(false);
+                if sync_started.get_untracked() {
+                    stop_authenticated_sync();
+                    sync_started.set(false);
+                }
+                sync_status.set(
+                    if matches!(account_state.get_untracked(), AccountState::Guest) {
+                        SyncStatus::Disabled
+                    } else {
+                        SyncStatus::Error
+                    },
+                );
+            }
+            AccountState::SignedIn(entitlement)
+                if !entitlement.can_sync_at(now_millis() / 1_000) =>
+            {
+                sync_entitled.set(false);
+                if sync_started.get_untracked() {
+                    stop_authenticated_sync();
+                    sync_started.set(false);
+                }
+                sync_status.set(SyncStatus::BillingPaused);
+            }
+            AccountState::SignedIn(entitlement) => {
+                if account_namespace_prepared.get_untracked().as_deref()
+                    == Some(entitlement.account_id.as_str())
+                {
+                    sync_entitled.set(entitlement.can_sync_at(now_millis() / 1_000));
+                }
+            }
         }
     });
 
@@ -3754,6 +6189,7 @@ pub fn Board() -> impl IntoView {
             notes,
             groups,
             crdt_docs,
+            SYNC_RUN_GENERATION.with(Cell::get),
         ));
     });
 
@@ -3810,8 +6246,12 @@ pub fn Board() -> impl IntoView {
     };
 
     let retry_account_check = move |_| {
+        let principal = current_sync_principal();
         spawn_local(async move {
-            account_state.set(load_account_state().await);
+            let state = load_account_state().await;
+            if current_sync_principal() == principal {
+                account_state.set(state);
+            }
         });
     };
 
@@ -3841,7 +6281,7 @@ pub fn Board() -> impl IntoView {
                 .find(|space| space.id == active_id)
                 .map(|space| space.board.clone())
         {
-            persist_space_crdt(active_id, &board, crdt_docs);
+            persist_space_crdt(active_id, &board, spaces, crdt_docs);
         }
         storage_status.set(if saved {
             StorageStatus::Saved
@@ -4152,7 +6592,7 @@ pub fn Board() -> impl IntoView {
     };
 
     let keyboard_listener = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
-        if matches!(account_state.get_untracked(), AccountState::SignedIn(entitlement) if !entitlement.can_sync())
+        if matches!(account_state.get_untracked(), AccountState::SignedIn(entitlement) if !entitlement.can_sync_at(now_millis() / 1_000))
         {
             return;
         }
@@ -4550,7 +6990,7 @@ pub fn Board() -> impl IntoView {
                                 {move || spaces
                                             .get()
                                             .into_iter()
-                                            .filter(|space| !space.archived)
+                                            .filter(|space| !space.archived && space.deleted_at.is_none())
                                             .map(|space| {
                                                 let space_actions = space_actions;
                                                 let is_active = space.id == active_space_id.get();
@@ -4826,14 +7266,14 @@ pub fn Board() -> impl IntoView {
                             let has_dodo_customer = entitlement.provider.as_deref() == Some("dodo")
                                 && entitlement.provider_customer_id.is_some();
                             view! {
-                            <span class=if entitlement.can_sync() {
+                            <span class=if entitlement.can_sync_at(now_millis() / 1_000) {
                                 "rounded-[3px] bg-note-green/70 px-2 py-2 text-xs text-note-ink-green"
                             } else {
                                 "rounded-[3px] bg-note-yellow/80 px-2 py-2 text-xs text-note-ink-yellow"
                             }>
-                                {if entitlement.can_sync() { "pro" } else { "account" }}
+                                {if entitlement.can_sync_at(now_millis() / 1_000) { "pro" } else { "account" }}
                             </span>
-                            {if !entitlement.can_sync() {
+                            {if !entitlement.can_sync_at(now_millis() / 1_000) {
                                 view! {
                                     <a href="#account-gate" class="rounded-[3px] bg-marker px-2 py-2 text-sm font-medium text-ink hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-ink/40">
                                         "upgrade"
@@ -4856,7 +7296,7 @@ pub fn Board() -> impl IntoView {
                             {move || checkout_error.get().map(|message| view! {
                                 <span class="max-w-56 rounded-[3px] bg-note-pink/70 px-2 py-2 text-xs text-note-ink-pink">{message}</span>
                             })}
-                            <button type="button" on:click=move |_| spawn_local(sign_out()) class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
+                            <button type="button" on:click=move |_| { stop_authenticated_sync(); spawn_local(sign_out()); } class="rounded-[3px] px-2 py-2 text-sm text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30">
                                 "sign out"
                             </button>
                             }.into_any()
@@ -4922,16 +7362,41 @@ pub fn Board() -> impl IntoView {
                             StorageStatus::Error => "couldn't save locally",
                         }}
                     </span>
+                    <button
+                        type="button"
+                        disabled=move || !sync_started.get()
+                        on:click=move |_| {
+                            sync_status.set(SyncStatus::Syncing);
+                            spawn_local(async move {
+                                let refreshed = load_account_state().await;
+                                account_state.set(refreshed);
+                                schedule_sync_drain();
+                            });
+                        }
+                        class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm hover:bg-white/70 disabled:cursor-not-allowed disabled:opacity-50"
+                        title="Retry synchronization now"
+                    >
+                        "sync now"
+                    </button>
+                    <span class=move || match sync_status.get() {
+                        SyncStatus::AuthPaused | SyncStatus::BillingPaused | SyncStatus::Error =>
+                            "rounded-[3px] border border-note-ink-yellow/30 bg-note-yellow/70 px-2.5 py-1.5 text-note-ink-yellow shadow-sm backdrop-blur-sm",
+                        _ => "rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm",
+                    }>
+                        {move || sync_status.get().label()}
+                    </span>
                 </div>
             </div>
 
             {move || match account_state.get() {
-                AccountState::SignedIn(entitlement) if !entitlement.can_sync() => {
+                AccountState::SignedIn(entitlement) if !entitlement.can_sync_at(now_millis() / 1_000) => {
                     let has_dodo_customer = entitlement.provider.as_deref() == Some("dodo")
                         && entitlement.provider_customer_id.is_some();
                     let status_message = match entitlement.status {
                         task_core::billing::SubscriptionStatus::Free =>
                             "your account is ready, but sync is waiting for Pro",
+                        task_core::billing::SubscriptionStatus::Pending =>
+                            "your payment is still processing; sync will start after confirmation",
                         task_core::billing::SubscriptionStatus::PastDue =>
                             "your payment needs attention before sync can continue",
                         task_core::billing::SubscriptionStatus::Canceled
@@ -5068,6 +7533,7 @@ mod tests {
             spaces: vec![Space {
                 id: 7,
                 name: "research".into(),
+                metadata_version: 0,
                 archived: true,
                 board: BoardData {
                     notes: vec![Note {

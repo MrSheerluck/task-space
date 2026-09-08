@@ -9,6 +9,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::EntityId;
 
 pub const SYNC_PROTOCOL_VERSION: u32 = 1;
+pub const SYNC_RECONCILE_PROTOCOL_VERSION: u32 = 2;
+/// Maximum decoded state-vector size accepted by sync endpoints.
+pub const MAX_SYNC_STATE_VECTOR_BYTES: usize = 512 * 1024;
+/// Maximum decoded CRDT update size accepted by sync endpoints.
+pub const MAX_SYNC_UPDATE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum serialized CRDT snapshot size retained by a server or browser.
+///
+/// A snapshot is the durable recovery source for reconciliation, so allowing
+/// it to grow without a bound would turn ordinary edits into an unbounded
+/// storage and memory denial-of-service vector.
+pub const MAX_SYNC_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EncodedUpdate(String);
@@ -92,6 +103,81 @@ pub struct SyncEvent {
     pub event_id: u64,
     pub space_id: EntityId,
     pub update: EncodedUpdate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SyncMetadataEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncMetadataEvent {
+    pub metadata_version: u64,
+    pub name: String,
+    pub archived: bool,
+    pub deleted_at: Option<u64>,
+}
+
+/// A durable, bidirectional reconciliation request. `update` contains the
+/// client's changes since `state_vector`; the server returns the changes that
+/// were missing from that same vector after merging the request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncReconcileRequest {
+    pub protocol_version: u32,
+    pub space_id: EntityId,
+    pub mutation_id: String,
+    /// Stable installation/device identity used for diagnostics and replay
+    /// correlation. It is never used as an authorization principal.
+    #[serde(default)]
+    pub device_id: String,
+    /// Local generation captured when this exact payload was queued.
+    #[serde(default)]
+    pub local_generation: u64,
+    pub state_vector: EncodedUpdate,
+    pub update: EncodedUpdate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncReconcileResponse {
+    pub protocol_version: u32,
+    pub space_id: EntityId,
+    pub accepted: bool,
+    pub event_id: Option<u64>,
+    pub update: EncodedUpdate,
+    pub state_vector: EncodedUpdate,
+    #[serde(default)]
+    pub entitlement_version: u64,
+    #[serde(default)]
+    pub event_cursor: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceMetadataOperation {
+    Rename,
+    Archive,
+    Unarchive,
+    Delete,
+    Restore,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncMetadataRequest {
+    pub protocol_version: u32,
+    pub space_id: EntityId,
+    pub operation_id: String,
+    pub operation: SpaceMetadataOperation,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub expected_version: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncMetadataResponse {
+    pub protocol_version: u32,
+    pub space_id: EntityId,
+    pub metadata_version: u64,
+    pub name: String,
+    pub archived: bool,
+    pub deleted_at: Option<u64>,
 }
 
 #[cfg(test)]
@@ -125,6 +211,23 @@ mod tests {
         };
         let raw = serde_json::to_string(&request).expect("request should serialize");
         let restored: SyncPushRequest =
+            serde_json::from_str(&raw).expect("request should deserialize");
+        assert_eq!(restored, request);
+    }
+
+    #[test]
+    fn reconcile_contract_round_trips() {
+        let request = SyncReconcileRequest {
+            protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+            space_id: 42,
+            mutation_id: "9d6f0f0f-1c9e-4a4b-9c47-9e6a3f1bcf5d".into(),
+            device_id: "device-a".into(),
+            local_generation: 1,
+            state_vector: EncodedUpdate::from_bytes(&[0, 1]),
+            update: EncodedUpdate::from_bytes(&[2, 3]),
+        };
+        let raw = serde_json::to_string(&request).expect("request should serialize");
+        let restored: SyncReconcileRequest =
             serde_json::from_str(&raw).expect("request should deserialize");
         assert_eq!(restored, request);
     }

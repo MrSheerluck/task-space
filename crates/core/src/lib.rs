@@ -159,6 +159,8 @@ pub struct Space {
     pub id: EntityId,
     pub name: String,
     #[serde(default)]
+    pub metadata_version: u64,
+    #[serde(default)]
     pub archived: bool,
     #[serde(default)]
     pub created_at: u64,

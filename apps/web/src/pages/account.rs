@@ -1,14 +1,20 @@
+use std::cell::RefCell;
+
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use task_core::billing::Entitlement;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::RequestCredentials;
 
-use super::api::api_url;
+use super::api::{api_url, send_request_with_timeout, send_with_timeout};
 
 const AUTHENTICATED_SESSION_STORAGE_KEY: &str = "task_space_authenticated_session";
+
+thread_local! {
+    static REFRESH_IN_FLIGHT: RefCell<Option<js_sys::Promise>> = const { RefCell::new(None) };
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AccountState {
@@ -60,7 +66,7 @@ pub async fn load_account_state() -> AccountState {
     };
 
     if response.status() == 401 {
-        if refresh_session().await {
+        if refresh_session_once().await {
             return match account_entitlement().await {
                 Ok(response) if (200..300).contains(&response.status()) => response
                     .json::<Entitlement>()
@@ -90,12 +96,33 @@ pub async fn load_account_state() -> AccountState {
     }
 }
 
-async fn refresh_session() -> bool {
-    Request::post(&api_url("/auth/refresh"))
-        .credentials(RequestCredentials::Include)
-        .send()
+/// Refresh the cookie session once, sharing a single in-flight rotation among
+/// concurrent callers so refresh-token rotation cannot race.
+pub async fn refresh_session_once() -> bool {
+    if let Some(existing) = REFRESH_IN_FLIGHT.with(|flight| flight.borrow().clone()) {
+        return JsFuture::from(existing)
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    }
+    let promise = future_to_promise(async {
+        let success = send_with_timeout(
+            Request::post(&api_url("/auth/refresh")).credentials(RequestCredentials::Include),
+        )
         .await
-        .is_ok_and(|response| (200..300).contains(&response.status()))
+        .is_ok_and(|response| (200..300).contains(&response.status()));
+        Ok(JsValue::from_bool(success))
+    });
+    REFRESH_IN_FLIGHT.with(|flight| flight.replace(Some(promise.clone())));
+    let result = JsFuture::from(promise)
+        .await
+        .ok()
+        .and_then(|value| value.as_bool());
+    REFRESH_IN_FLIGHT.with(|flight| {
+        flight.borrow_mut().take();
+    });
+    result.unwrap_or(false)
 }
 
 async fn account_entitlement() -> Result<gloo_net::http::Response, gloo_net::Error> {
@@ -106,10 +133,7 @@ async fn account_entitlement() -> Result<gloo_net::http::Response, gloo_net::Err
         api_url("/account/entitlement"),
         js_sys::Date::now()
     );
-    Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
+    send_with_timeout(Request::get(&url).credentials(RequestCredentials::Include)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,11 +158,10 @@ pub async fn start_checkout(interval: &'static str) -> Result<String, String> {
             .credentials(RequestCredentials::Include)
             .json(&CheckoutRequest { interval })
             .map_err(|_| "the checkout request could not be prepared".to_owned())?;
-        let response = request
-            .send()
+        let response = send_request_with_timeout(request)
             .await
             .map_err(|_| "the billing service could not be reached".to_owned())?;
-        if response.status() == 401 && !refreshed && refresh_session().await {
+        if response.status() == 401 && !refreshed && refresh_session_once().await {
             refreshed = true;
             continue;
         }
@@ -167,12 +190,12 @@ pub async fn start_checkout(interval: &'static str) -> Result<String, String> {
 pub async fn start_billing_portal() -> Result<String, String> {
     let mut refreshed = false;
     let response = loop {
-        let response = Request::post(&api_url("/billing/portal"))
-            .credentials(RequestCredentials::Include)
-            .send()
-            .await
-            .map_err(|_| "the billing service could not be reached".to_owned())?;
-        if response.status() == 401 && !refreshed && refresh_session().await {
+        let response = send_with_timeout(
+            Request::post(&api_url("/billing/portal")).credentials(RequestCredentials::Include),
+        )
+        .await
+        .map_err(|_| "the billing service could not be reached".to_owned())?;
+        if response.status() == 401 && !refreshed && refresh_session_once().await {
             refreshed = true;
             continue;
         }
@@ -309,10 +332,10 @@ mod tests {
 
 pub async fn sign_out() {
     forget_authenticated_session();
-    let _ = Request::get(&api_url("/auth/logout"))
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await;
+    let _ = send_with_timeout(
+        Request::post(&api_url("/auth/logout")).credentials(RequestCredentials::Include),
+    )
+    .await;
     if let Some(window) = web_sys::window() {
         let _ = window.location().set_href("/");
     }

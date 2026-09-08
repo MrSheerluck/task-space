@@ -7,8 +7,9 @@
 
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Any, Doc, Map, MapRef, ReadTxn, StateVector, Transact, Update, WriteTxn};
+use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, StateVector, Transact, Update, WriteTxn};
 
+use crate::sync::{MAX_SYNC_SNAPSHOT_BYTES, MAX_SYNC_UPDATE_BYTES};
 use crate::{BoardData, Group, Note, NoteColor, NoteStatus, TombstoneKind};
 
 pub const CRDT_SCHEMA_VERSION: i64 = 1;
@@ -32,7 +33,8 @@ impl SpaceDoc {
     pub fn new() -> Self {
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
-        txn.get_or_insert_map(ROOT_META);
+        let meta = txn.get_or_insert_map(ROOT_META);
+        meta.try_update(&mut txn, "schema_version", CRDT_SCHEMA_VERSION);
         txn.get_or_insert_map(ROOT_NOTES);
         txn.get_or_insert_map(ROOT_GROUPS);
         drop(txn);
@@ -40,11 +42,83 @@ impl SpaceDoc {
     }
 
     pub fn from_update(update: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let space = Self::new();
+        if update.len() > MAX_SYNC_SNAPSHOT_BYTES {
+            return Err("CRDT snapshot is too large".into());
+        }
+        // Apply the incoming snapshot to a blank document first. Seeding the
+        // current schema before applying it lets Yrs conflict resolution hide
+        // a future schema marker from the remote document.
+        let space = Self { doc: Doc::new() };
+        {
+            let mut txn = space.doc.transact_mut();
+            // Yrs updates address these named roots, so create the roots but
+            // do not seed the schema value until after the remote update has
+            // been validated.
+            txn.get_or_insert_map(ROOT_META);
+            txn.get_or_insert_map(ROOT_NOTES);
+            txn.get_or_insert_map(ROOT_GROUPS);
+        }
         let mut txn = space.doc.transact_mut();
         txn.apply_update(Update::decode_v1(update)?)?;
         drop(txn);
+        let stored_schema = {
+            let txn = space.doc.transact();
+            match txn.get(ROOT_META) {
+                None => None,
+                Some(Out::YMap(meta)) => match meta.get(&txn, "schema_version") {
+                    None => None,
+                    Some(Out::Any(Any::Number(version))) => Some(
+                        parse_schema_number(version).ok_or("invalid CRDT schema version marker")?,
+                    ),
+                    Some(Out::Any(Any::BigInt(version))) => Some(version),
+                    Some(_) => {
+                        return Err("invalid CRDT schema version marker".into());
+                    }
+                },
+                Some(_) => return Err("invalid CRDT metadata root".into()),
+            }
+        };
+        if stored_schema
+            .as_ref()
+            .is_some_and(|version| *version != CRDT_SCHEMA_VERSION)
+        {
+            return Err(format!(
+                "unsupported CRDT schema version {}",
+                stored_schema.unwrap_or_default()
+            )
+            .into());
+        }
+        let mut txn = space.doc.transact_mut();
+        let has_schema_marker = txn
+            .get(ROOT_META)
+            .and_then(|value| match value {
+                Out::YMap(meta) => meta.get(&txn, "schema_version"),
+                _ => None,
+            })
+            .is_some();
+        if !has_schema_marker {
+            let meta = txn.get_or_insert_map(ROOT_META);
+            meta.try_update(&mut txn, "schema_version", CRDT_SCHEMA_VERSION);
+        }
+        txn.get_or_insert_map(ROOT_NOTES);
+        txn.get_or_insert_map(ROOT_GROUPS);
+        drop(txn);
         Ok(space)
+    }
+
+    pub fn schema_version(&self) -> i64 {
+        let txn = self.doc.transact();
+        txn.get(ROOT_META)
+            .and_then(|value| match value {
+                Out::YMap(meta) => meta.get(&txn, "schema_version"),
+                _ => None,
+            })
+            .and_then(|value| match value {
+                Out::Any(Any::Number(version)) => parse_schema_number(version),
+                Out::Any(Any::BigInt(version)) => Some(version),
+                _ => None,
+            })
+            .unwrap_or(CRDT_SCHEMA_VERSION)
     }
 
     pub fn doc(&self) -> &Doc {
@@ -53,6 +127,12 @@ impl SpaceDoc {
 
     pub fn state_vector(&self) -> Vec<u8> {
         self.doc.transact().state_vector().encode_v1()
+    }
+
+    /// Encode the empty state vector used when a replica has never uploaded
+    /// any of its local document state.
+    pub fn empty_state_vector() -> Vec<u8> {
+        StateVector::default().encode_v1()
     }
 
     pub fn encode_update(
@@ -67,6 +147,9 @@ impl SpaceDoc {
         &self,
         update: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if update.len() > MAX_SYNC_UPDATE_BYTES {
+            return Err("CRDT update is too large".into());
+        }
         let mut txn = self.doc.transact_mut();
         txn.apply_update(Update::decode_v1(update)?)?;
         Ok(())
@@ -167,6 +250,11 @@ impl SpaceDoc {
     }
 }
 
+fn parse_schema_number(version: f64) -> Option<i64> {
+    (version.is_finite() && version >= 0.0 && version.fract() == 0.0 && version <= i64::MAX as f64)
+        .then_some(version as i64)
+}
+
 fn sync_note_map(txn: &mut yrs::TransactionMut, map: &MapRef, note: &Note) {
     map.try_update(txn, "id", note.id as i64);
     map.try_update(txn, "text", note.text.clone());
@@ -205,7 +293,7 @@ fn sync_group_map(txn: &mut yrs::TransactionMut, map: &MapRef, group: &Group) {
 fn map_to_notes<T: ReadTxn>(txn: &T, notes: &MapRef) -> Vec<Note> {
     let mut result: Vec<_> = notes
         .iter(txn)
-        .filter_map(|(id, value)| out_map(value).and_then(|map| map_to_note(txn, &id, &map)))
+        .filter_map(|(id, value)| out_map(value).and_then(|map| map_to_note(txn, id, &map)))
         .collect();
     result.sort_by_key(|note| note.id);
     result
@@ -214,7 +302,7 @@ fn map_to_notes<T: ReadTxn>(txn: &T, notes: &MapRef) -> Vec<Note> {
 fn map_to_groups<T: ReadTxn>(txn: &T, groups: &MapRef) -> Vec<Group> {
     let mut result: Vec<_> = groups
         .iter(txn)
-        .filter_map(|(id, value)| out_map(value).and_then(|map| map_to_group(txn, &id, &map)))
+        .filter_map(|(id, value)| out_map(value).and_then(|map| map_to_group(txn, id, &map)))
         .collect();
     result.sort_by_key(|group| group.id);
     result
@@ -241,7 +329,7 @@ fn map_to_note<T: ReadTxn>(txn: &T, key: &str, map: &MapRef) -> Option<Note> {
         due_date: string(map.get(txn, "due_date")),
         x: decimal(map.get(txn, "x")).unwrap_or_default(),
         y: decimal(map.get(txn, "y")).unwrap_or_default(),
-        rotation: number(map.get(txn, "rotation")).unwrap_or_default() as i8,
+        rotation: signed_i8(map.get(txn, "rotation")).unwrap_or_default(),
         group_id: number(map.get(txn, "group_id")),
         created_at: number(map.get(txn, "created_at")).unwrap_or_default(),
         updated_at: number(map.get(txn, "updated_at")).unwrap_or_default(),
@@ -275,14 +363,37 @@ fn string(value: Option<yrs::Out>) -> Option<String> {
 
 fn number(value: Option<yrs::Out>) -> Option<u64> {
     value.and_then(|value| match value {
-        yrs::Out::Any(Any::Number(value)) if value >= 0.0 => Some(value as u64),
+        yrs::Out::Any(Any::Number(value))
+            if value.is_finite()
+                && value >= 0.0
+                && value.fract() == 0.0
+                && value <= u64::MAX as f64 =>
+        {
+            Some(value as u64)
+        }
+        yrs::Out::Any(Any::BigInt(value)) if value >= 0 => u64::try_from(value).ok(),
+        _ => None,
+    })
+}
+
+fn signed_i8(value: Option<yrs::Out>) -> Option<i8> {
+    value.and_then(|value| match value {
+        yrs::Out::Any(Any::Number(value))
+            if value.is_finite()
+                && value.fract() == 0.0
+                && value >= f64::from(i8::MIN)
+                && value <= f64::from(i8::MAX) =>
+        {
+            Some(value as i8)
+        }
+        yrs::Out::Any(Any::BigInt(value)) => i8::try_from(value).ok(),
         _ => None,
     })
 }
 
 fn decimal(value: Option<yrs::Out>) -> Option<f64> {
     value.and_then(|value| match value {
-        yrs::Out::Any(Any::Number(value)) => Some(value),
+        yrs::Out::Any(Any::Number(value)) if value.is_finite() => Some(value),
         _ => None,
     })
 }
@@ -361,6 +472,79 @@ mod tests {
 
         let restored = SpaceDoc::from_update(&local.snapshot()).expect("snapshot should apply");
         assert_eq!(restored.board().notes, board.notes);
+    }
+
+    #[test]
+    fn signed_rotation_and_group_reference_round_trip() {
+        let board = BoardData {
+            notes: vec![Note {
+                id: 7,
+                rotation: -3,
+                group_id: Some(9),
+                ..note(7, "grouped")
+            }],
+            groups: vec![crate::Group {
+                id: 9,
+                label: "group".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = SpaceDoc::new();
+        local.import_board(&board);
+        let restored = SpaceDoc::from_update(&local.snapshot()).expect("snapshot should apply");
+        let restored_note = &restored.board().notes[0];
+        assert_eq!(restored_note.rotation, -3);
+        assert_eq!(restored_note.group_id, Some(9));
+    }
+
+    #[test]
+    fn new_documents_are_tagged_with_the_supported_schema() {
+        assert_eq!(SpaceDoc::new().schema_version(), CRDT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn documents_with_an_unknown_schema_are_rejected() {
+        let document = SpaceDoc::new();
+        document.import_board(&BoardData {
+            notes: vec![note(99, "schema marker")],
+            ..Default::default()
+        });
+        {
+            let mut transaction = document.doc().transact_mut();
+            let meta = transaction.get_or_insert_map(ROOT_META);
+            meta.try_update(&mut transaction, "schema_version", CRDT_SCHEMA_VERSION + 1);
+        }
+        assert_eq!(document.schema_version(), CRDT_SCHEMA_VERSION + 1);
+
+        let raw = document.snapshot();
+        let result = SpaceDoc::from_update(&raw);
+        assert!(
+            result.is_err(),
+            "future schema should require an explicit migration"
+        );
+        assert!(result.err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("unsupported CRDT schema version")
+        }));
+    }
+
+    #[test]
+    fn documents_with_a_fractional_schema_marker_are_rejected() {
+        let document = SpaceDoc::new();
+        {
+            let mut transaction = document.doc().transact_mut();
+            let meta = transaction.get_or_insert_map(ROOT_META);
+            meta.try_update(&mut transaction, "schema_version", 1.5_f64);
+        }
+        let result = SpaceDoc::from_update(&document.snapshot());
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("invalid CRDT schema"))
+        );
     }
 
     #[test]
