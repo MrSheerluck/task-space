@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/task-space-alerts.yml
+
+scrape_configs:
+  # Keep this target on the private Compose/management network. The API does
+  # not expose metrics through the public Nginx/Cloudflare Tunnel route.
+  - job_name: task-space-api
+    metrics_path: /internal/metrics
+    static_configs:
+      - targets: ["task-space-api:3000"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/task-space-metrics-token

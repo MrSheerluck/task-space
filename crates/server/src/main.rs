@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderName, HeaderValue, Method};
 use axum::middleware;
 use sqlx::PgPool;
 use task_server::dodo::{DodoClient, DodoClientConfig, DodoWebhook, DodoWebhookConfig};
 use task_server::http::{
-    RequestRateLimiter, SyncHttpState, add_request_id, metrics_router, protected_sync_router,
+    RequestRateLimiter, SyncHttpState, add_request_id, health_router, metrics_router,
+    protected_sync_router,
 };
 use task_server::metrics::Metrics;
 use task_server::postgres::{PostgresBillingStore, PostgresSyncStore};
@@ -42,6 +43,14 @@ async fn main() {
         .migrate()
         .await
         .expect("database migrations should run");
+    let migrated_documents = store
+        .backfill_document_migrations()
+        .await
+        .expect("CRDT document migrations should run");
+    if migrated_documents > 0 {
+        eprintln!("materialized {migrated_documents} migrated CRDT snapshots");
+    }
+    store.start_event_listener();
     workos
         .check_readiness()
         .await
@@ -50,18 +59,45 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(90 * 24 * 60 * 60);
+    let tombstone_retention_seconds = std::env::var("SYNC_TOMBSTONE_RETENTION_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(retention_seconds);
+    let metrics = Metrics::default();
     let retention_store = store.clone();
+    let retention_metrics = metrics.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
             interval.tick().await;
-            if let Err(error) = retention_store.prune_history(retention_seconds).await {
-                eprintln!("sync history retention failed: {error}");
+            let tombstone_retention_millis = tombstone_retention_seconds.saturating_mul(1_000);
+            retention_metrics.inc("task_space_sync_compaction_runs_total");
+            match retention_store
+                .compact_documents(retention_seconds, tombstone_retention_millis, 100)
+                .await
+            {
+                Ok(compacted) if compacted > 0 => {
+                    retention_metrics.add("task_space_sync_compacted_snapshots_total", compacted);
+                    eprintln!("sync document compaction replaced {compacted} snapshots")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    retention_metrics.inc("task_space_sync_compaction_failures_total");
+                    eprintln!("sync document compaction failed: {error}");
+                }
+            }
+            match retention_store.prune_history(retention_seconds).await {
+                Ok(deleted) => {
+                    retention_metrics.add("task_space_sync_pruned_updates_total", deleted);
+                }
+                Err(error) => {
+                    retention_metrics.inc("task_space_sync_retention_failures_total");
+                    eprintln!("sync history retention failed: {error}");
+                }
             }
         }
     });
     let billing = PostgresBillingStore::new(pool);
-    let metrics = Metrics::default();
     let billing_history_store = billing.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
@@ -166,6 +202,7 @@ async fn main() {
         .expose_headers([
             HeaderName::from_static("x-request-id"),
             HeaderName::from_static("x-task-space-error-code"),
+            RETRY_AFTER,
         ])
         .allow_credentials(true);
     let app = workos::router(workos.clone())
@@ -174,6 +211,7 @@ async fn main() {
             billing.clone(),
             metrics.clone(),
         ))
+        .merge(health_router(store.pool().clone(), metrics.clone()))
         .merge(metrics_router(
             metrics.clone(),
             std::env::var("TASK_SPACE_METRICS_TOKEN").ok(),
@@ -199,19 +237,13 @@ async fn main() {
 }
 
 fn allowed_origins() -> Vec<String> {
-    let configured = std::env::var("TASK_SPACE_ALLOWED_ORIGINS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(normalize_origin)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if !configured.is_empty() {
-        return configured;
+    if let Ok(value) = std::env::var("TASK_SPACE_ALLOWED_ORIGINS") {
+        // Presence of the explicit variable is authoritative, even if an
+        // operator mistyped an origin. Falling back in that case could widen
+        // a deliberately restricted production policy.
+        return value.split(',').filter_map(normalize_origin).collect();
     }
-    vec![
+    let mut origins = vec![
         "http://localhost".to_owned(),
         "http://localhost:8080".to_owned(),
         "http://localhost:3000".to_owned(),
@@ -221,7 +253,26 @@ fn allowed_origins() -> Vec<String> {
         "http://[::1]".to_owned(),
         "http://[::1]:8080".to_owned(),
         "http://[::1]:3000".to_owned(),
-    ]
+    ];
+    // A stable HTTPS test origin is already required for the auth callback
+    // and payment return URL. When the explicit allowlist is omitted, derive
+    // the browser origin from those server-owned URLs so cookie-authenticated
+    // POSTs from an ngrok/staging host are not silently rejected as CSRF. An
+    // explicit TASK_SPACE_ALLOWED_ORIGINS value remains authoritative in
+    // production and can be used to narrow this set to one exact origin.
+    for variable in [
+        "WORKOS_POST_LOGIN_REDIRECT_URI",
+        "DODO_PAYMENTS_RETURN_URL",
+        "WORKOS_REDIRECT_URI",
+    ] {
+        if let Ok(value) = std::env::var(variable)
+            && let Some(origin) = origin_from_url(&value)
+            && !origins.iter().any(|existing| existing == &origin)
+        {
+            origins.push(origin);
+        }
+    }
+    origins
 }
 
 fn normalize_origin(value: &str) -> Option<String> {
@@ -236,6 +287,22 @@ fn normalize_origin(value: &str) -> Option<String> {
     {
         return None;
     }
+    origin_from_parsed_url(&url)
+}
+
+fn origin_from_url(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    origin_from_parsed_url(&url)
+}
+
+fn origin_from_parsed_url(url: &Url) -> Option<String> {
     let host = url.host_str()?;
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -247,4 +314,27 @@ fn normalize_origin(value: &str) -> Option<String> {
         None => host,
     };
     Some(format!("{}://{authority}", url.scheme()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirect_urls_reduce_to_the_exact_browser_origin() {
+        assert_eq!(
+            origin_from_url("https://adnate-anesthetically-jenice.ngrok-free.dev/auth/callback"),
+            Some("https://adnate-anesthetically-jenice.ngrok-free.dev".to_owned())
+        );
+        assert_eq!(
+            origin_from_url("https://app.example.test/app?checkout=1"),
+            Some("https://app.example.test".to_owned())
+        );
+    }
+
+    #[test]
+    fn origin_derivation_rejects_credentials() {
+        assert!(origin_from_url("https://user:password@app.example.test/app").is_none());
+        assert!(normalize_origin("https://app.example.test/app").is_none());
+    }
 }

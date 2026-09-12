@@ -1,0 +1,281 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "API 5xx rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(task_space_http_responses_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "5xx/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "title": "HTTP responses by status",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(task_space_http_responses_total[5m]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "title": "Reconciliation outcomes",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(task_space_sync_reconcile_success_total[5m]))",
+          "legendFormat": "success/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (kind) (rate(task_space_sync_reconcile_failures_total[5m]))",
+          "legendFormat": "failure: {{kind}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "title": "Reconciliation latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(task_space_sync_reconcile_duration_ms_bucket{outcome=\"success\"}[5m])))",
+          "legendFormat": "p95 success",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(task_space_sync_reconcile_duration_ms_sum{outcome=\"success\"}[5m])) / clamp_min(sum(rate(task_space_sync_reconcile_duration_ms_count{outcome=\"success\"}[5m])), 1)",
+          "legendFormat": "average success",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "title": "SSE reconnects and cursor resets",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(increase(task_space_sync_sse_reconnects_total[1h]))",
+          "legendFormat": "reconnects/hour",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(task_space_sync_cursor_resets_total[1h]))",
+          "legendFormat": "cursor resets/hour",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(task_space_sync_sse_replay_events_total[1h]))",
+          "legendFormat": "replay events/hour",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "title": "Readiness and webhook failures",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(increase(task_space_readiness_failures_total[1h]))",
+          "legendFormat": "readiness failures/hour",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(task_space_webhook_failures_total[1h]))",
+          "legendFormat": "webhook failures/hour",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "title": "Compaction and retention",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(increase(task_space_sync_compaction_runs_total[6h]))",
+          "legendFormat": "compaction runs/6h",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(task_space_sync_compaction_failures_total[6h]))",
+          "legendFormat": "compaction failures/6h",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(task_space_sync_retention_failures_total[6h]))",
+          "legendFormat": "retention failures/6h",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "title": "Sync payload sizes",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(task_space_sync_update_bytes_total[5m]))",
+          "legendFormat": "updates bytes/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(task_space_sync_response_update_bytes_total[5m]))",
+          "legendFormat": "response update bytes/s",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(task_space_sync_response_state_vector_bytes_total[5m]))",
+          "legendFormat": "state vector bytes/s",
+          "refId": "C"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "task-space",
+    "sync",
+    "auth",
+    "billing"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "title": "Task Space Sync / Auth / Billing",
+  "uid": "task-space-sync",
+  "version": 1
+}

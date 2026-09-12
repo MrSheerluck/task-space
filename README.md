@@ -114,34 +114,37 @@ after the verified webhook has updated the server entitlement.
 
 Hosted checkout can be opened from localhost, but Dodo cannot deliver a
 webhook to a private `localhost` address. For a complete auth and payment test,
-run the built frontend and API behind the same HTTPS ngrok origin instead:
+run the built frontend and API behind the same HTTPS Cloudflare Tunnel origin:
 
 ```sh
 docker compose --env-file .env -f deploy/docker-compose.yml up --build -d \
   postgres task-space-api task-space
-ngrok http 8081
+make cloudflare-tunnel
 ```
 
 The `task-space` container exposes its Nginx frontend/API proxy only on
-`127.0.0.1:8081`, so ngrok receives the same routing layout used in production.
-After ngrok prints its HTTPS URL, use that one origin everywhere:
+`127.0.0.1:8081`, so Cloudflare Tunnel receives the same routing layout used in
+production.
+The configured manual-testing origin is `https://taskspace-dev.smbl.dev`. Keep
+the named tunnel process running for the entire test session and use that one
+origin everywhere:
 
-- `WORKOS_REDIRECT_URI=https://<ngrok-host>/auth/callback`
-- `WORKOS_POST_LOGIN_REDIRECT_URI=https://<ngrok-host>/app`
+- `WORKOS_REDIRECT_URI=https://taskspace-dev.smbl.dev/auth/callback`
+- `WORKOS_POST_LOGIN_REDIRECT_URI=https://taskspace-dev.smbl.dev/app`
 - `WORKOS_TOKEN_ISSUER=https://api.workos.com/user_management/<default-client-id>`
   (the exact access-token `iss`; WorkOS uses the environment's default
   application client id when multiple applications share one user base)
-- `DODO_PAYMENTS_RETURN_URL=https://<ngrok-host>/app`
-- WorkOS Redirect URI: `https://<ngrok-host>/auth/callback`
-- WorkOS Sign-up URL: `https://<ngrok-host>/signup`
-- WorkOS Sign-in URL: `https://<ngrok-host>/auth/sign-in`
-- WorkOS Sign-out URI: `https://<ngrok-host>/`
-- WorkOS Password reset URL: `https://<ngrok-host>/reset-password`
-- Dodo test-mode webhook URL: `https://<ngrok-host>/webhooks/dodo`
+- `DODO_PAYMENTS_RETURN_URL=https://taskspace-dev.smbl.dev/app`
+- WorkOS Redirect URI: `https://taskspace-dev.smbl.dev/auth/callback`
+- WorkOS Sign-up URL: `https://taskspace-dev.smbl.dev/signup`
+- WorkOS Sign-in URL: `https://taskspace-dev.smbl.dev/auth/sign-in`
+- WorkOS Sign-out URI: `https://taskspace-dev.smbl.dev/`
+- WorkOS Password reset URL: `https://taskspace-dev.smbl.dev/reset-password`
+- Dodo test-mode webhook URL: `https://taskspace-dev.smbl.dev/webhooks/dodo`
 
 Restart `task-space-api` after changing `.env`. The Dodo endpoint must use the
 signing secret stored in `DODO_PAYMENTS_WEBHOOK_KEY` and subscribe to all
-`subscription.*` lifecycle events used by the server. Keep the ngrok process
+`subscription.*` lifecycle events used by the server. Keep the Cloudflare Tunnel
 running for the entire checkout: the hosted payment may succeed without the
 local entitlement changing if the webhook cannot reach the tunnel.
 

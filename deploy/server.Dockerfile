@@ -2,7 +2,9 @@ FROM rust:1.96-bookworm AS builder
 
 WORKDIR /src
 COPY . .
-RUN cargo build -p task-server --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build -p task-server --release
 
 FROM debian:bookworm-slim
 

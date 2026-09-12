@@ -14,10 +14,12 @@ database/provider/chaos gates require an approved PostgreSQL, WorkOS, Dodo, and
 browser test environment and cannot be proven from source-only checks.
 
 Local verification on this branch is green: workspace checks, the WASM web
-check, 19 core tests, 40 server tests, 12 web tests, server clippy with
-warnings denied, and `git diff --check`. Full workspace clippy still reports
-UI style lints in the large Leptos board module; it is not used as the release
-gate until those refactors are scheduled.
+check, workspace tests, full workspace clippy with warnings denied, the
+browser Chromium/WebKit smoke gates, PostgreSQL sync/HTTP acceptance tests,
+backup/restore rehearsal, restart recovery, Prometheus configuration checks,
+and `git diff --check`. Provider-backed browser/device, production alert
+delivery, and long-running fault-injection evidence still require the
+deployment acceptance environment described below.
 
 The server now exposes bounded request and webhook counters through the
 operator-token-protected `/internal/metrics` endpoint. Provider mode is
@@ -170,6 +172,12 @@ Under a PostgreSQL row lock, the server:
 5. computes the server update missing from the client's submitted state vector;
 6. saves the merged snapshot and durable account event in the same transaction;
 7. returns the missing update, merged server state vector, event cursor, and entitlement version.
+
+The reconcile event cursor is informational rather than an acknowledgement of
+all account events up to that sequence. A document response does not carry
+intervening metadata events, so the browser only persists an SSE cursor after
+the corresponding ordered event has been reconciled and its local projection
+has been durably written.
 
 The client then:
 

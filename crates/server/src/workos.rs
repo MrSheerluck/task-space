@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use crate::http::{AuthError, AuthenticatedAccount, SessionVerifier};
+use crate::http::{AuthError, AuthenticatedAccount, RequestRateLimiter, SessionVerifier};
 
 const STATE_TTL: Duration = Duration::from_secs(600);
 const JWKS_TTL: Duration = Duration::from_secs(300);
@@ -69,10 +69,7 @@ impl WorkOsAuthConfig {
                 .filter(|audience| !audience.trim().is_empty()),
             cookie_name: std::env::var("WORKOS_SESSION_COOKIE")
                 .unwrap_or_else(|_| "task_space_session".to_owned()),
-            allowed_origins: std::env::var("TASK_SPACE_ALLOWED_ORIGINS")
-                .ok()
-                .map(|value| value.split(',').filter_map(normalize_origin).collect())
-                .unwrap_or_default(),
+            allowed_origins: configured_allowed_origins(),
         })
     }
 }
@@ -111,6 +108,7 @@ struct WorkOsAuthInner {
     client: Client,
     pending_states: Mutex<HashMap<String, Instant>>,
     jwks: tokio::sync::RwLock<Option<CachedJwks>>,
+    request_limiter: RequestRateLimiter,
 }
 
 #[derive(Clone)]
@@ -174,6 +172,8 @@ struct AuthResponse {
     status: &'static str,
     message: Option<String>,
     email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_authentication_token: Option<String>,
 }
@@ -291,6 +291,7 @@ impl WorkOsAuth {
                     .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?,
                 pending_states: Mutex::new(HashMap::new()),
                 jwks: tokio::sync::RwLock::new(None),
+                request_limiter: RequestRateLimiter::default(),
             }),
         })
     }
@@ -835,12 +836,34 @@ async fn require_auth_origin(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Some((route, limit)) = auth_rate_limit(request.uri().path())
+        && !auth.inner.request_limiter.allow_ip(
+            request.headers(),
+            route,
+            limit,
+            Duration::from_secs(60),
+        )
+    {
+        return AuthRouteError::RateLimited.into_response();
+    }
     if request.method() == axum::http::Method::POST
         && ensure_same_site_request(request.headers(), &auth.inner.config.allowed_origins).is_err()
     {
         return AuthRouteError::CsrfRejected.into_response();
     }
     next.run(request).await
+}
+
+fn auth_rate_limit(path: &str) -> Option<(&'static str, usize)> {
+    Some(match path {
+        "/auth/sign-in" | "/auth/sign-up" => ("auth-password", 20),
+        "/auth/verify-email" => ("auth-verify", 30),
+        "/auth/password-reset" | "/auth/password-reset/confirm" => ("auth-reset", 20),
+        "/auth/refresh" => ("auth-refresh", 120),
+        "/auth/logout" => ("auth-logout", 120),
+        "/auth/callback" => ("auth-callback", 60),
+        _ => return None,
+    })
 }
 
 async fn sign_in(State(auth): State<Arc<WorkOsAuth>>) -> Result<Response, AuthRouteError> {
@@ -869,6 +892,7 @@ async fn password_sign_in(
                 status: "verification_required",
                 message: Some("check your email for the verification code".to_owned()),
                 email: Some(credentials.email.trim().to_owned()),
+                account_id: None,
                 pending_authentication_token: Some(token.clone()),
             })
             .into_response();
@@ -954,6 +978,7 @@ async fn request_password_reset(
             status: "reset_requested",
             message: Some("if that email has an account, a reset link is on its way".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -961,6 +986,7 @@ async fn request_password_reset(
             status: "reset_requested",
             message: Some("if that email has an account, a reset link is on its way".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -987,6 +1013,7 @@ async fn confirm_password_reset(
             status: "password_reset",
             message: Some("your password has been reset".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -1015,16 +1042,22 @@ fn is_valid_email(email: &str) -> bool {
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
-    (
+    let mut response = (
         status,
         Json(AuthResponse {
             status: "error",
             message: Some(message.to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         }),
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -1146,6 +1179,7 @@ async fn logout(State(auth): State<Arc<WorkOsAuth>>, headers: HeaderMap) -> Resp
         status: "signed_out",
         message: None,
         email: None,
+        account_id: None,
         pending_authentication_token: None,
     })
     .into_response();
@@ -1271,6 +1305,7 @@ impl WorkOsAuth {
             status: "authenticated",
             message: None,
             email: None,
+            account_id: Some(session.account.account_id.clone()),
             pending_authentication_token: None,
         })
         .into_response();
@@ -1425,6 +1460,7 @@ fn cookie_value(cookies: &str, cookie_name: &str) -> Option<String> {
 enum AuthRouteError {
     WorkOs(WorkOsError),
     CsrfRejected,
+    RateLimited,
 }
 
 impl From<WorkOsError> for AuthRouteError {
@@ -1436,8 +1472,10 @@ impl From<WorkOsError> for AuthRouteError {
 impl IntoResponse for AuthRouteError {
     fn into_response(self) -> Response {
         let is_csrf_rejected = matches!(&self, Self::CsrfRejected);
+        let is_rate_limited = matches!(&self, Self::RateLimited);
         let status = match self {
             Self::CsrfRejected => axum::http::StatusCode::FORBIDDEN,
+            Self::RateLimited => axum::http::StatusCode::TOO_MANY_REQUESTS,
             Self::WorkOs(WorkOsError::Request(_))
             | Self::WorkOs(WorkOsError::InvalidResponse(_)) => axum::http::StatusCode::BAD_GATEWAY,
             Self::WorkOs(WorkOsError::InvalidState) | Self::WorkOs(WorkOsError::MissingCode) => {
@@ -1454,12 +1492,25 @@ impl IntoResponse for AuthRouteError {
         // Do not serialize provider details, authorization codes, refresh
         // tokens, or pending-authentication tokens into a browser response.
         // Those fields are useful only to bounded server-side diagnostics.
-        let message = if is_csrf_rejected {
+        let message = if is_rate_limited {
+            "too many authentication requests; please try again later"
+        } else if is_csrf_rejected {
             "request origin was rejected"
         } else {
             "authentication failed"
         };
-        (status, message).into_response()
+        let mut response = (status, message).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        if is_rate_limited {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("60"),
+            );
+        }
+        response
     }
 }
 
@@ -1475,6 +1526,45 @@ fn normalize_origin(value: &str) -> Option<String> {
     {
         return None;
     }
+    origin_from_parsed_url(&url)
+}
+
+fn configured_allowed_origins() -> Vec<String> {
+    if let Ok(value) = std::env::var("TASK_SPACE_ALLOWED_ORIGINS") {
+        // Presence of the explicit variable is authoritative, even if an
+        // operator mistyped an origin. Falling back in that case could widen
+        // a deliberately restricted production policy.
+        return value.split(',').filter_map(normalize_origin).collect();
+    }
+    [
+        "WORKOS_POST_LOGIN_REDIRECT_URI",
+        "DODO_PAYMENTS_RETURN_URL",
+        "WORKOS_REDIRECT_URI",
+    ]
+    .into_iter()
+    .filter_map(|variable| std::env::var(variable).ok())
+    .filter_map(|value| origin_from_url(&value))
+    .fold(Vec::new(), |mut origins, origin| {
+        if !origins.iter().any(|existing| existing == &origin) {
+            origins.push(origin);
+        }
+        origins
+    })
+}
+
+fn origin_from_url(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    origin_from_parsed_url(&url)
+}
+
+fn origin_from_parsed_url(url: &Url) -> Option<String> {
     let host = url.host_str()?;
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -1670,5 +1760,62 @@ mod tests {
         );
         assert!(normalize_origin("https://app.example.com/path").is_none());
         assert!(normalize_origin("https://user:pass@app.example.com/").is_none());
+    }
+
+    #[test]
+    fn authenticated_response_exposes_only_the_verified_account_id() {
+        let response = AuthResponse {
+            status: "authenticated",
+            message: None,
+            email: None,
+            account_id: Some("account_123".to_owned()),
+            pending_authentication_token: None,
+        };
+        let json = serde_json::to_value(response).expect("auth response should serialize");
+        assert_eq!(json["account_id"], "account_123");
+        assert!(json.get("pending_authentication_token").is_none());
+    }
+
+    #[test]
+    fn auth_rate_limits_cover_provider_authentication_surface() {
+        assert_eq!(
+            auth_rate_limit("/auth/sign-in"),
+            Some(("auth-password", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/sign-up"),
+            Some(("auth-password", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/verify-email"),
+            Some(("auth-verify", 30))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/password-reset/confirm"),
+            Some(("auth-reset", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/refresh"),
+            Some(("auth-refresh", 120))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/callback"),
+            Some(("auth-callback", 60))
+        );
+        assert_eq!(auth_rate_limit("/auth/session"), None);
+    }
+
+    #[test]
+    fn auth_rate_limit_response_is_cacheless_and_retryable() {
+        let response = AuthRouteError::RateLimited.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("cache-control"),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get("retry-after"),
+            Some(&HeaderValue::from_static("60"))
+        );
     }
 }

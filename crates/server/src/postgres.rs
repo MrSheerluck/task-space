@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use task_core::billing::{
     BILLING_PROTOCOL_VERSION, BillingEvent, BillingEventType, Entitlement, FREE_SPACE_LIMIT,
@@ -16,13 +17,14 @@ use task_core::billing::{
 use task_core::crdt::SpaceDoc;
 use task_core::sync::{
     EncodedUpdate, MAX_SYNC_SNAPSHOT_BYTES, MAX_SYNC_STATE_VECTOR_BYTES, MAX_SYNC_UPDATE_BYTES,
-    SYNC_PROTOCOL_VERSION, SYNC_RECONCILE_PROTOCOL_VERSION, SpaceMetadataOperation, SyncEvent,
-    SyncMetadataEvent, SyncMetadataRequest, SyncMetadataResponse, SyncPullRequest,
-    SyncPullResponse, SyncPushRequest, SyncReconcileRequest, SyncReconcileResponse,
+    SYNC_DOCUMENT_SCHEMA_VERSION, SYNC_PROTOCOL_VERSION, SYNC_RECONCILE_PROTOCOL_VERSION,
+    SpaceMetadataOperation, SyncEvent, SyncMetadataEvent, SyncMetadataRequest,
+    SyncMetadataResponse, SyncPullRequest, SyncPullResponse, SyncPushRequest, SyncReconcileRequest,
+    SyncReconcileResponse,
 };
-use task_core::{EntityId, Space};
+use task_core::{BoardData, EntityId, SpaceManifestEntry};
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::DeliveryEvent;
@@ -38,6 +40,8 @@ pub enum PostgresStoreError {
     UnsupportedSyncProtocol(u32),
     #[error("unsupported sync reconcile protocol version {0}")]
     UnsupportedSyncReconcileProtocol(u32),
+    #[error("unsupported sync document schema version {0}")]
+    UnsupportedSyncDocumentSchema(u32),
     #[error("unsupported billing protocol version {0}")]
     UnsupportedBillingProtocol(u32),
     #[error("invalid Yrs update: {0}")]
@@ -66,6 +70,8 @@ pub enum PostgresStoreError {
     SpaceLimitReached,
     #[error("space metadata version conflict")]
     MetadataVersionConflict,
+    #[error("space metadata operation lost deterministic conflict resolution")]
+    MetadataConflictSuperseded,
     #[error("metadata operation id was reused with a different request")]
     MetadataOperationIdReused,
     #[error("sync event cursor requires a reset")]
@@ -76,10 +82,14 @@ pub enum PostgresStoreError {
 pub struct PostgresSyncStore {
     pool: PgPool,
     events: Arc<broadcast::Sender<DeliveryEvent>>,
+    #[cfg(test)]
+    reconcile_fault: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 const MAX_SAFE_ENTITY_ID: u64 = (1u64 << 53) - 1;
 const MAX_BILLING_FIELD_LEN: usize = 256;
+const MAX_SYNC_REPLAY_EVENTS: usize = 1_000;
+const SYNC_EVENT_CHANNEL: &str = "task_space_sync_events";
 
 impl PostgresSyncStore {
     pub fn new(pool: PgPool) -> Self {
@@ -87,7 +97,33 @@ impl PostgresSyncStore {
         Self {
             pool,
             events: Arc::new(events),
+            #[cfg(test)]
+            reconcile_fault: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    fn set_reconcile_fault(&self, stage: Option<&str>) {
+        if let Ok(mut fault) = self.reconcile_fault.lock() {
+            *fault = stage.map(str::to_owned);
+        }
+    }
+
+    fn maybe_inject_reconcile_fault(&self, _stage: &str) -> Result<(), PostgresStoreError> {
+        #[cfg(test)]
+        if self
+            .reconcile_fault
+            .lock()
+            .ok()
+            .and_then(|fault| fault.clone())
+            .as_deref()
+            == Some(_stage)
+        {
+            return Err(PostgresStoreError::InvalidInput(format!(
+                "test reconcile fault at {_stage}"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn connect(database_url: &str) -> Result<Self, PostgresStoreError> {
@@ -100,8 +136,173 @@ impl PostgresSyncStore {
         Ok(())
     }
 
+    /// Materialize any application-level CRDT schema migrations in the
+    /// durable snapshot before serving traffic. The row lock makes this safe
+    /// during a rolling deployment: concurrent API instances either perform
+    /// the migration or observe the already-canonical snapshot. This is a
+    /// representation migration, not a user mutation, so it does not create
+    /// a replay event; clients discover it through their normal state-vector
+    /// pull or reconcile.
+    pub async fn backfill_document_migrations(&self) -> Result<u64, PostgresStoreError> {
+        let candidates = sqlx::query(
+            "SELECT account_id, space_id
+             FROM crdt_documents
+             ORDER BY account_id, space_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut migrated = 0;
+
+        for candidate in candidates {
+            let account_id: String = candidate.try_get("account_id")?;
+            let space_id: i64 = candidate.try_get("space_id")?;
+            let mut transaction = self.pool.begin().await?;
+            let Some(row) = sqlx::query(
+                "SELECT snapshot
+                 FROM crdt_documents
+                 WHERE account_id = $1 AND space_id = $2
+                 FOR UPDATE",
+            )
+            .bind(&account_id)
+            .bind(space_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            else {
+                transaction.commit().await?;
+                continue;
+            };
+            let snapshot: Vec<u8> = row.try_get("snapshot")?;
+            if snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+                return Err(PostgresStoreError::PayloadTooLarge);
+            }
+            let document = SpaceDoc::from_update(&snapshot)
+                .map_err(|error| PostgresStoreError::InvalidUpdate(error.to_string()))?;
+            let next_snapshot = document.snapshot();
+            if next_snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+                return Err(PostgresStoreError::PayloadTooLarge);
+            }
+            if next_snapshot != snapshot {
+                sqlx::query(
+                    "UPDATE crdt_documents
+                     SET snapshot = $3, updated_at = NOW()
+                     WHERE account_id = $1 AND space_id = $2",
+                )
+                .bind(&account_id)
+                .bind(space_id)
+                .bind(next_snapshot)
+                .execute(&mut *transaction)
+                .await?;
+                migrated += 1;
+            }
+            transaction.commit().await?;
+        }
+
+        Ok(migrated)
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Forward committed sync events between API instances. PostgreSQL
+    /// NOTIFY is used only as a low-latency wake-up; the event payload is
+    /// loaded from the durable `sync_events` table after notification. SSE
+    /// replay and client reconciliation remain correct if this listener is
+    /// delayed or unavailable.
+    pub fn start_event_listener(&self) {
+        drop(self.start_event_listener_with_ready());
+    }
+
+    fn start_event_listener_with_ready(&self) -> oneshot::Receiver<()> {
+        let pool = self.pool.clone();
+        let events = Arc::clone(&self.events);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut ready_sender = Some(ready_sender);
+            let mut retry_delay = std::time::Duration::from_secs(1);
+            loop {
+                let mut listener = match PgListener::connect_with(&pool).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("sync event listener connection failed: {error}");
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
+                        continue;
+                    }
+                };
+                if let Err(error) = listener.listen(SYNC_EVENT_CHANNEL).await {
+                    eprintln!("sync event listener subscription failed: {error}");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
+                    continue;
+                }
+                retry_delay = std::time::Duration::from_secs(1);
+                if let Some(sender) = ready_sender.take() {
+                    let _ = sender.send(());
+                }
+
+                loop {
+                    let notification = match listener.recv().await {
+                        Ok(notification) => notification,
+                        Err(error) => {
+                            eprintln!("sync event listener disconnected: {error}");
+                            break;
+                        }
+                    };
+                    let Ok(event_id) = notification.payload().parse::<i64>() else {
+                        eprintln!("ignoring malformed sync event notification");
+                        continue;
+                    };
+                    let row = match sqlx::query(
+                        "SELECT e.event_id, e.account_id, e.space_id,
+                                s.stable_id::TEXT AS stable_space_id, e.update, e.metadata
+                         FROM sync_events e
+                         JOIN spaces s ON s.account_id = e.account_id AND s.space_id = e.space_id
+                         WHERE e.event_id = $1",
+                    )
+                    .bind(event_id)
+                    .fetch_optional(&pool)
+                    .await
+                    {
+                        Ok(row) => row,
+                        Err(error) => {
+                            eprintln!("sync event listener lookup failed: {error}");
+                            break;
+                        }
+                    };
+                    let Some(row) = row else {
+                        continue;
+                    };
+                    let Ok(account_id) = row.try_get::<String, _>("account_id") else {
+                        continue;
+                    };
+                    let Ok(space_id) = row.try_get::<i64, _>("space_id") else {
+                        continue;
+                    };
+                    let Ok(update) = row.try_get::<Vec<u8>, _>("update") else {
+                        continue;
+                    };
+                    let metadata = row
+                        .try_get::<Option<serde_json::Value>, _>("metadata")
+                        .ok()
+                        .flatten()
+                        .and_then(|value| serde_json::from_value::<SyncMetadataEvent>(value).ok());
+                    let event = SyncEvent {
+                        protocol_version: SYNC_PROTOCOL_VERSION,
+                        document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
+                        event_id: to_u64(event_id),
+                        space_id: to_u64(space_id),
+                        stable_space_id: row.try_get("stable_space_id").ok(),
+                        update: EncodedUpdate::from_bytes(&update),
+                        metadata,
+                    };
+                    let _ = events.send(DeliveryEvent { account_id, event });
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
+            }
+        });
+        ready_receiver
     }
 
     /// Registering is idempotent so the browser can safely retry it whenever
@@ -110,10 +311,25 @@ impl PostgresSyncStore {
         &self,
         account_id: &str,
         space_id: EntityId,
+        stable_id: Option<&str>,
         name: &str,
         max_spaces: u32,
     ) -> Result<(), PostgresStoreError> {
         validate_entity_id(space_id)?;
+        let requested_stable_id = stable_id;
+        let stable_id = stable_id
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| {
+                PostgresStoreError::InvalidInput("stable space id must be a UUID".to_owned())
+            })?
+            .unwrap_or_else(|| {
+                Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("https://task-space.invalid/account/{account_id}/space/{space_id}")
+                        .as_bytes(),
+                )
+            });
         let snapshot = SpaceDoc::new().snapshot();
         let mut transaction = self.pool.begin().await?;
         // Serialize registrations per account so two tabs cannot both pass
@@ -122,15 +338,33 @@ impl PostgresSyncStore {
             .bind(account_id)
             .execute(&mut *transaction)
             .await?;
-        let already_exists = sqlx::query(
-            "SELECT 1 FROM spaces WHERE account_id = $1 AND space_id = $2 AND deleted_at IS NULL",
+        let existing = sqlx::query(
+            "SELECT stable_id::TEXT AS stable_id
+             FROM spaces WHERE account_id = $1 AND space_id = $2",
         )
         .bind(account_id)
         .bind(to_i64(space_id))
         .fetch_optional(&mut *transaction)
-        .await?
-        .is_some();
-        if !already_exists {
+        .await?;
+        if let Some(existing) = existing {
+            let stored_stable_id: String = existing.try_get("stable_id")?;
+            validate_requested_stable_space_id(requested_stable_id, &stored_stable_id)?;
+        } else {
+            let stable_id_collision = sqlx::query(
+                "SELECT 1 FROM spaces
+                 WHERE account_id = $1 AND stable_id = $2 AND space_id <> $3",
+            )
+            .bind(account_id)
+            .bind(stable_id)
+            .bind(to_i64(space_id))
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
+            if stable_id_collision {
+                return Err(PostgresStoreError::InvalidInput(
+                    "stable space id is already assigned to another space".to_owned(),
+                ));
+            }
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM spaces WHERE account_id = $1 AND deleted_at IS NULL",
             )
@@ -142,10 +376,11 @@ impl PostgresSyncStore {
             }
         }
         sqlx::query(
-            "INSERT INTO spaces (account_id, space_id, name) VALUES ($1, $2, $3)\n             ON CONFLICT (account_id, space_id) DO NOTHING",
+            "INSERT INTO spaces (account_id, space_id, stable_id, name) VALUES ($1, $2, $3, $4)\n             ON CONFLICT (account_id, space_id) DO NOTHING",
         )
         .bind(account_id)
         .bind(to_i64(space_id))
+        .bind(stable_id)
         .bind(name)
         .execute(&mut *transaction)
         .await?;
@@ -161,23 +396,21 @@ impl PostgresSyncStore {
         Ok(())
     }
 
-    pub async fn list_spaces(&self, account_id: &str) -> Result<Vec<Space>, PostgresStoreError> {
+    pub async fn list_spaces(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<SpaceManifestEntry>, PostgresStoreError> {
         let rows = sqlx::query(
-            "SELECT s.space_id, s.name, s.metadata_version, s.archived,\n             EXTRACT(EPOCH FROM s.created_at)::BIGINT AS created_at,\n             EXTRACT(EPOCH FROM s.updated_at)::BIGINT AS updated_at,\n             EXTRACT(EPOCH FROM s.deleted_at)::BIGINT AS deleted_at, d.snapshot\n             FROM spaces s\n             JOIN crdt_documents d ON d.account_id = s.account_id AND d.space_id = s.space_id\n             WHERE s.account_id = $1\n             ORDER BY s.created_at, s.space_id",
+            "SELECT s.space_id, s.stable_id::TEXT AS stable_id, s.name, s.metadata_version, s.archived,\n             (EXTRACT(EPOCH FROM s.created_at) * 1000)::BIGINT AS created_at,\n             (EXTRACT(EPOCH FROM s.updated_at) * 1000)::BIGINT AS updated_at,\n             (EXTRACT(EPOCH FROM s.deleted_at) * 1000)::BIGINT AS deleted_at\n             FROM spaces s\n             WHERE s.account_id = $1\n             ORDER BY s.created_at, s.space_id",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
-                let snapshot: Vec<u8> = row.try_get("snapshot")?;
-                if snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
-                    return Err(PostgresStoreError::PayloadTooLarge);
-                }
-                let document = SpaceDoc::from_update(&snapshot)
-                    .map_err(|error| PostgresStoreError::InvalidUpdate(error.to_string()))?;
-                Ok(Space {
+                Ok(SpaceManifestEntry {
                     id: to_u64(row.try_get::<i64, _>("space_id")?),
+                    stable_id: row.try_get("stable_id")?,
                     name: row.try_get("name")?,
                     metadata_version: to_u64(row.try_get::<i64, _>("metadata_version")?),
                     archived: row.try_get("archived")?,
@@ -190,7 +423,7 @@ impl PostgresSyncStore {
                         .map(to_u64)
                         .unwrap_or_default(),
                     deleted_at: row.try_get::<Option<i64>, _>("deleted_at")?.map(to_u64),
-                    board: document.board(),
+                    board: BoardData::default(),
                 })
             })
             .collect()
@@ -230,7 +463,8 @@ impl PostgresSyncStore {
         let operation_mutation_id = format!("metadata:{}", request.operation_id);
         let row = sqlx::query(
             "SELECT name, archived, metadata_version,
-             EXTRACT(EPOCH FROM deleted_at)::BIGINT AS deleted_at, last_operation_id, last_operation_hash
+             (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT AS deleted_at, last_operation_id, last_operation_hash,
+             stable_id::TEXT AS stable_space_id
              FROM spaces WHERE account_id = $1 AND space_id = $2 FOR UPDATE",
         )
         .bind(account_id)
@@ -238,10 +472,16 @@ impl PostgresSyncStore {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        let stored_stable_space_id: String = row.try_get("stable_space_id")?;
+        validate_requested_stable_space_id(
+            request.stable_space_id.as_deref(),
+            &stored_stable_space_id,
+        )?;
         if let Some(previous) = sqlx::query(
             "SELECT request_hash, metadata
-             FROM crdt_updates
-             WHERE account_id = $1 AND space_id = $2 AND mutation_id = $3",
+             FROM sync_mutation_claims
+             WHERE account_id = $1 AND space_id = $2
+               AND mutation_kind = 'metadata' AND mutation_id = $3",
         )
         .bind(account_id)
         .bind(to_i64(request.space_id))
@@ -261,6 +501,7 @@ impl PostgresSyncStore {
             return Ok(SyncMetadataResponse {
                 protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
                 space_id: request.space_id,
+                stable_space_id: Some(stored_stable_space_id.clone()),
                 metadata_version: metadata.metadata_version,
                 name: metadata.name,
                 archived: metadata.archived,
@@ -268,7 +509,18 @@ impl PostgresSyncStore {
             });
         }
         let current_version: i64 = row.try_get("metadata_version")?;
-        let current_operation: Option<String> = row.try_get("last_operation_id")?;
+        // Older builds stored the claim namespace prefix in this projection,
+        // while the metadata conflict rule is defined over the caller's
+        // operation ID. Normalize both representations before comparing so a
+        // retry or same-version conflict is deterministic across rollout.
+        let current_operation: Option<String> = row
+            .try_get::<Option<String>, _>("last_operation_id")?
+            .map(|operation_id| {
+                operation_id
+                    .strip_prefix("metadata:")
+                    .unwrap_or(&operation_id)
+                    .to_owned()
+            });
         let current_operation_hash: Option<Vec<u8>> = row.try_get("last_operation_hash")?;
         let currently_deleted: Option<i64> = row.try_get("deleted_at")?;
         if current_operation.as_deref() == Some(request.operation_id.as_str()) {
@@ -279,13 +531,26 @@ impl PostgresSyncStore {
                 return Err(PostgresStoreError::MetadataOperationIdReused);
             }
             transaction.commit().await?;
-            return metadata_response_from_row(request.space_id, row);
+            return metadata_response_from_row(
+                request.space_id,
+                Some(stored_stable_space_id.clone()),
+                row,
+            );
         }
         if request
             .expected_version
             .is_some_and(|version| version != to_u64(current_version))
         {
-            return Err(PostgresStoreError::MetadataVersionConflict);
+            // Metadata is outside the document CRDT, so concurrent scalar
+            // operations need an explicit deterministic tie-breaker. The
+            // operation id is cryptographically random and stable across
+            // retries; the lexicographically greater id wins regardless of
+            // which API instance happened to commit first.
+            match current_operation.as_deref() {
+                Some(current_operation) if request.operation_id.as_str() > current_operation => {}
+                Some(_) => return Err(PostgresStoreError::MetadataConflictSuperseded),
+                None => return Err(PostgresStoreError::MetadataVersionConflict),
+            }
         }
         if currently_deleted.is_some()
             && !matches!(&request.operation, SpaceMetadataOperation::Restore)
@@ -318,7 +583,7 @@ impl PostgresSyncStore {
              last_operation_hash = $8, updated_at = NOW()
              WHERE account_id = $1 AND space_id = $2
              RETURNING name, archived, metadata_version,
-             EXTRACT(EPOCH FROM deleted_at)::BIGINT AS deleted_at, last_operation_id",
+             (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT AS deleted_at, last_operation_id",
         )
         .bind(account_id)
         .bind(to_i64(request.space_id))
@@ -330,15 +595,33 @@ impl PostgresSyncStore {
         .bind(&metadata_request_hash)
         .fetch_one(&mut *transaction)
         .await?;
-        let response = metadata_response_from_row(request.space_id, row)?;
+        let response = metadata_response_from_row(
+            request.space_id,
+            Some(stored_stable_space_id.clone()),
+            row,
+        )?;
         let metadata = SyncMetadataEvent {
             metadata_version: response.metadata_version,
             name: response.name.clone(),
             archived: response.archived,
             deleted_at: response.deleted_at,
+            operation: Some(request.operation.clone()),
         };
         let metadata_json = serde_json::to_value(&metadata)
             .map_err(|error| PostgresStoreError::InvalidInput(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO sync_mutation_claims
+                (account_id, space_id, mutation_kind, mutation_id, request_hash, update, metadata)
+             VALUES ($1, $2, 'metadata', $3, $4, $5, $6)",
+        )
+        .bind(account_id)
+        .bind(to_i64(request.space_id))
+        .bind(&operation_mutation_id)
+        .bind(&metadata_request_hash)
+        .bind(Vec::<u8>::new())
+        .bind(metadata_json.clone())
+        .execute(&mut *transaction)
+        .await?;
         let event_id: i64 = sqlx::query(
             "INSERT INTO crdt_updates (account_id, space_id, mutation_id, update, request_hash, metadata, event_kind)
              VALUES ($1, $2, $3, $4, $5, $6, 'metadata') RETURNING event_id",
@@ -367,8 +650,10 @@ impl PostgresSyncStore {
             account_id: account_id.to_owned(),
             event: SyncEvent {
                 protocol_version: SYNC_PROTOCOL_VERSION,
+                document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
                 event_id: to_u64(event_id),
                 space_id: request.space_id,
+                stable_space_id: Some(stored_stable_space_id.clone()),
                 update: EncodedUpdate::from_bytes(&[]),
                 metadata: Some(metadata),
             },
@@ -383,6 +668,7 @@ impl PostgresSyncStore {
     ) -> Result<Option<SyncEvent>, PostgresStoreError> {
         validate_entity_id(request.space_id)?;
         validate_sync_protocol(request.protocol_version)?;
+        validate_sync_document_schema(request.document_schema_version)?;
         let update = request
             .update
             .to_bytes()
@@ -397,17 +683,20 @@ impl PostgresSyncStore {
         }
         let mut transaction = self.pool.begin().await?;
         let space_id = to_i64(request.space_id);
-        let space_exists = sqlx::query(
-            "SELECT 1 FROM spaces WHERE account_id = $1 AND space_id = $2 AND deleted_at IS NULL",
+        let space_row = sqlx::query(
+            "SELECT stable_id::TEXT AS stable_space_id FROM spaces
+             WHERE account_id = $1 AND space_id = $2 AND deleted_at IS NULL",
         )
         .bind(account_id)
         .bind(space_id)
         .fetch_optional(&mut *transaction)
         .await?
-        .is_some();
-        if !space_exists {
-            return Err(PostgresStoreError::SpaceAccessDenied);
-        }
+        .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        let stored_stable_space_id: String = space_row.try_get("stable_space_id")?;
+        validate_requested_stable_space_id(
+            request.stable_space_id.as_deref(),
+            &stored_stable_space_id,
+        )?;
 
         let row = sqlx::query(
             "SELECT snapshot FROM crdt_documents WHERE account_id = $1 AND space_id = $2 FOR UPDATE",
@@ -422,7 +711,9 @@ impl PostgresSyncStore {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
         if let Some(row) = sqlx::query(
-            "SELECT update FROM crdt_updates WHERE account_id = $1 AND space_id = $2 AND mutation_id = $3",
+            "SELECT update FROM sync_mutation_claims
+             WHERE account_id = $1 AND space_id = $2
+               AND mutation_kind = 'push' AND mutation_id = $3",
         )
         .bind(account_id)
         .bind(space_id)
@@ -446,6 +737,17 @@ impl PostgresSyncStore {
         if next_snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
+        sqlx::query(
+            "INSERT INTO sync_mutation_claims
+                (account_id, space_id, mutation_kind, mutation_id, update)
+             VALUES ($1, $2, 'push', $3, $4)",
+        )
+        .bind(account_id)
+        .bind(space_id)
+        .bind(&request.mutation_id)
+        .bind(&update)
+        .execute(&mut *transaction)
+        .await?;
         let event_id: i64 = sqlx::query(
             "INSERT INTO crdt_updates (account_id, space_id, mutation_id, update)\n             VALUES ($1, $2, $3, $4) RETURNING event_id",
         )
@@ -484,8 +786,10 @@ impl PostgresSyncStore {
 
         let event = SyncEvent {
             protocol_version: SYNC_PROTOCOL_VERSION,
+            document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
             event_id: to_u64(event_id),
             space_id: request.space_id,
+            stable_space_id: Some(stored_stable_space_id.clone()),
             update: EncodedUpdate::from_bytes(&update),
             metadata: None,
         };
@@ -503,6 +807,7 @@ impl PostgresSyncStore {
     ) -> Result<SyncPullResponse, PostgresStoreError> {
         validate_entity_id(request.space_id)?;
         validate_sync_protocol(request.protocol_version)?;
+        validate_sync_document_schema(request.document_schema_version)?;
         let state_vector = request
             .state_vector
             .to_bytes()
@@ -510,30 +815,57 @@ impl PostgresSyncStore {
         if state_vector.len() > MAX_SYNC_STATE_VECTOR_BYTES {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT d.snapshot FROM crdt_documents d\n             JOIN spaces s ON s.account_id = d.account_id AND s.space_id = d.space_id\n             WHERE d.account_id = $1 AND d.space_id = $2 AND s.deleted_at IS NULL",
+            "SELECT d.snapshot, s.stable_id::TEXT AS stable_space_id FROM crdt_documents d\n             JOIN spaces s ON s.account_id = d.account_id AND s.space_id = d.space_id\n             WHERE d.account_id = $1 AND d.space_id = $2 AND s.deleted_at IS NULL
+             FOR UPDATE",
         )
         .bind(account_id)
         .bind(to_i64(request.space_id))
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        let stored_stable_space_id: String = row.try_get("stable_space_id")?;
+        validate_requested_stable_space_id(
+            request.stable_space_id.as_deref(),
+            &stored_stable_space_id,
+        )?;
         let snapshot: Vec<u8> = row.try_get("snapshot")?;
         if snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
         let document = SpaceDoc::from_update(&snapshot)
             .map_err(|error| PostgresStoreError::InvalidStateVector(error.to_string()))?;
+        let migrated_snapshot = document.snapshot();
+        if migrated_snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+            return Err(PostgresStoreError::PayloadTooLarge);
+        }
+        if migrated_snapshot != snapshot {
+            sqlx::query(
+                "UPDATE crdt_documents
+                 SET snapshot = $3, updated_at = NOW()
+                 WHERE account_id = $1 AND space_id = $2",
+            )
+            .bind(account_id)
+            .bind(to_i64(request.space_id))
+            .bind(migrated_snapshot)
+            .execute(&mut *transaction)
+            .await?;
+        }
         let update = document
             .encode_update(&state_vector)
             .map_err(|error| PostgresStoreError::InvalidStateVector(error.to_string()))?;
         if update.len() > MAX_SYNC_UPDATE_BYTES {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
+        transaction.commit().await?;
         Ok(SyncPullResponse {
             protocol_version: SYNC_PROTOCOL_VERSION,
+            document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
             space_id: request.space_id,
+            stable_space_id: Some(stored_stable_space_id),
             update: EncodedUpdate::from_bytes(&update),
+            state_vector: EncodedUpdate::from_bytes(&document.state_vector()),
             has_more: false,
         })
     }
@@ -548,6 +880,7 @@ impl PostgresSyncStore {
     ) -> Result<SyncReconcileResponse, PostgresStoreError> {
         validate_entity_id(request.space_id)?;
         validate_sync_reconcile_protocol(request.protocol_version)?;
+        validate_sync_document_schema(request.document_schema_version)?;
         if request.mutation_id.trim().is_empty() || request.mutation_id.len() > 128 {
             return Err(PostgresStoreError::InvalidInput(
                 "mutation id must be between 1 and 128 characters".to_owned(),
@@ -576,6 +909,9 @@ impl PostgresSyncStore {
         request_bytes.push(0);
         request_bytes.extend_from_slice(&request.local_generation.to_be_bytes());
         request_bytes.push(0);
+        // `last_server_sequence` is replay context, not an effect identity;
+        // excluding it keeps a retry idempotent even if SSE advanced while
+        // the original request was in flight and preserves old outbox rows.
         request_bytes.extend_from_slice(&state_vector);
         request_bytes.push(0);
         request_bytes.extend_from_slice(&update);
@@ -583,7 +919,7 @@ impl PostgresSyncStore {
         let mut transaction = self.pool.begin().await?;
         let space_id = to_i64(request.space_id);
         let row = sqlx::query(
-            "SELECT d.snapshot FROM crdt_documents d
+            "SELECT d.snapshot, s.stable_id::TEXT AS stable_space_id FROM crdt_documents d
              JOIN spaces s ON s.account_id = d.account_id AND s.space_id = d.space_id
              WHERE d.account_id = $1 AND d.space_id = $2 AND s.deleted_at IS NULL
              FOR UPDATE",
@@ -593,13 +929,20 @@ impl PostgresSyncStore {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        let stored_stable_space_id: String = row.try_get("stable_space_id")?;
+        validate_requested_stable_space_id(
+            request.stable_space_id.as_deref(),
+            &stored_stable_space_id,
+        )?;
         let snapshot: Vec<u8> = row.try_get("snapshot")?;
         if snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
             return Err(PostgresStoreError::PayloadTooLarge);
         }
 
         let duplicate = if let Some(row) = sqlx::query(
-            "SELECT update, request_hash FROM crdt_updates WHERE account_id = $1 AND space_id = $2 AND mutation_id = $3",
+            "SELECT update, request_hash FROM sync_mutation_claims
+             WHERE account_id = $1 AND space_id = $2
+               AND mutation_kind = 'reconcile' AND mutation_id = $3",
         )
         .bind(account_id)
         .bind(space_id)
@@ -609,7 +952,9 @@ impl PostgresSyncStore {
         {
             let previous: Vec<u8> = row.try_get("update")?;
             let previous_hash: Option<Vec<u8>> = row.try_get("request_hash")?;
-            if previous_hash.as_deref().is_some_and(|hash| hash != request_hash.as_slice())
+            if previous_hash
+                .as_deref()
+                .is_some_and(|hash| hash != request_hash.as_slice())
                 || (previous_hash.is_none() && previous != update)
             {
                 return Err(PostgresStoreError::MutationIdReused);
@@ -621,11 +966,17 @@ impl PostgresSyncStore {
 
         let document = SpaceDoc::from_update(&snapshot)
             .map_err(|error| PostgresStoreError::InvalidUpdate(error.to_string()))?;
+        let migrated_snapshot = document.snapshot();
+        if migrated_snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+            return Err(PostgresStoreError::PayloadTooLarge);
+        }
+        let previous_state_vector = document.state_vector();
         if !duplicate && !update.is_empty() {
             document
                 .apply_update(&update)
                 .map_err(|error| PostgresStoreError::InvalidUpdate(error.to_string()))?;
         }
+        let changed = document.state_vector() != previous_state_vector;
         let server_delta = document
             .encode_update(&state_vector)
             .map_err(|error| PostgresStoreError::InvalidStateVector(error.to_string()))?;
@@ -635,8 +986,25 @@ impl PostgresSyncStore {
         let server_state_vector = document.state_vector();
         // Claim every non-duplicate mutation, including a no-op update. This
         // prevents a later request from reusing the same id with a different
-        // payload while keeping no-op claims out of the event stream.
-        let mutation_event_id = if !duplicate {
+        // payload. Only changed updates need durable replay rows and events;
+        // a fresh mutation that repeats already-known Yrs operations should
+        // not grow the replay log.
+        if !duplicate {
+            sqlx::query(
+                "INSERT INTO sync_mutation_claims
+                    (account_id, space_id, mutation_kind, mutation_id, request_hash, update)
+                 VALUES ($1, $2, 'reconcile', $3, $4, $5)",
+            )
+            .bind(account_id)
+            .bind(space_id)
+            .bind(&request.mutation_id)
+            .bind(&request_hash)
+            .bind(&update)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        self.maybe_inject_reconcile_fault("after_claim")?;
+        let mutation_event_id = if !duplicate && changed {
             Some(
                 sqlx::query(
                 "INSERT INTO crdt_updates (account_id, space_id, mutation_id, update, request_hash)
@@ -654,7 +1022,20 @@ impl PostgresSyncStore {
         } else {
             None
         };
-        let event_id = if duplicate || update.is_empty() {
+        self.maybe_inject_reconcile_fault("after_replay_row")?;
+        let event_id = if duplicate || !changed {
+            if migrated_snapshot != snapshot {
+                sqlx::query(
+                    "UPDATE crdt_documents
+                     SET snapshot = $3, updated_at = NOW()
+                     WHERE account_id = $1 AND space_id = $2",
+                )
+                .bind(account_id)
+                .bind(space_id)
+                .bind(&migrated_snapshot)
+                .execute(&mut *transaction)
+                .await?;
+            }
             None
         } else {
             let next_snapshot = document.snapshot();
@@ -672,6 +1053,7 @@ impl PostgresSyncStore {
                 None,
             )
             .await?;
+            self.maybe_inject_reconcile_fault("after_event")?;
             sqlx::query(
                 "UPDATE crdt_documents SET snapshot = $3, snapshot_event_id = $4, updated_at = NOW()
                  WHERE account_id = $1 AND space_id = $2",
@@ -689,15 +1071,27 @@ impl PostgresSyncStore {
             .bind(space_id)
             .execute(&mut *transaction)
             .await?;
+            self.maybe_inject_reconcile_fault("before_commit")?;
             Some(event_id)
         };
+        // This sequence is informational only. The reconcile response does
+        // not carry every metadata event up to this point, so the browser must
+        // not persist it as an applied SSE cursor.
+        let event_cursor: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(event_id), 0) FROM sync_events WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
         transaction.commit().await?;
 
         if let Some(event_id) = event_id {
             let event = SyncEvent {
                 protocol_version: SYNC_PROTOCOL_VERSION,
+                document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
                 event_id: to_u64(event_id),
                 space_id: request.space_id,
+                stable_space_id: Some(stored_stable_space_id.clone()),
                 update: EncodedUpdate::from_bytes(&update),
                 metadata: None,
             };
@@ -708,13 +1102,17 @@ impl PostgresSyncStore {
         }
         Ok(SyncReconcileResponse {
             protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+            document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
             space_id: request.space_id,
-            accepted: event_id.is_some() || duplicate,
+            stable_space_id: Some(stored_stable_space_id),
+            mutation_id: request.mutation_id.clone(),
+            acknowledged_generation: request.local_generation,
+            accepted: event_id.is_some() || duplicate || (!update.is_empty() && event_id.is_none()),
             event_id: event_id.map(to_u64),
             update: EncodedUpdate::from_bytes(&server_delta),
             state_vector: EncodedUpdate::from_bytes(&server_state_vector),
             entitlement_version: 0,
-            event_cursor: event_id.map(to_u64).unwrap_or_default(),
+            event_cursor: to_u64(event_cursor),
         })
     }
 
@@ -756,6 +1154,95 @@ impl PostgresSyncStore {
         Ok(deleted_updates)
     }
 
+    /// Compact documents whose snapshot has been idle for the retention
+    /// window. Compaction is deliberately a separate asynchronous job: the
+    /// caller chooses the supported offline/tombstone window, this method
+    /// locks each document before replacing it, and replay history is pruned
+    /// separately only after the replacement snapshot is durable.
+    pub async fn compact_documents(
+        &self,
+        retention_seconds: u64,
+        tombstone_retention_millis: u64,
+        limit: i64,
+    ) -> Result<u64, PostgresStoreError> {
+        let retention_seconds = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+        let limit = limit.clamp(1, 1_000);
+        let candidates = sqlx::query(
+            "SELECT account_id, space_id
+             FROM crdt_documents
+             WHERE GREATEST(updated_at, COALESCE(compacted_at, updated_at))
+                   < NOW() - ($1::BIGINT * INTERVAL '1 second')
+             ORDER BY GREATEST(updated_at, COALESCE(compacted_at, updated_at)) ASC
+             LIMIT $2",
+        )
+        .bind(retention_seconds)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut compacted = 0;
+        for candidate in candidates {
+            let account_id: String = candidate.try_get("account_id")?;
+            let space_id = to_u64(candidate.try_get::<i64, _>("space_id")?);
+            let mut transaction = self.pool.begin().await?;
+            let Some(row) = sqlx::query(
+                "SELECT snapshot
+                 FROM crdt_documents
+                 WHERE account_id = $1 AND space_id = $2
+                   AND GREATEST(updated_at, COALESCE(compacted_at, updated_at))
+                       < NOW() - ($3::BIGINT * INTERVAL '1 second')
+                 FOR UPDATE",
+            )
+            .bind(&account_id)
+            .bind(to_i64(space_id))
+            .bind(retention_seconds)
+            .fetch_optional(&mut *transaction)
+            .await?
+            else {
+                transaction.commit().await?;
+                continue;
+            };
+            let snapshot: Vec<u8> = row.try_get("snapshot")?;
+            if snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+                return Err(PostgresStoreError::PayloadTooLarge);
+            }
+            let document = SpaceDoc::from_update(&snapshot)
+                .map_err(|error| PostgresStoreError::InvalidUpdate(error.to_string()))?;
+            document.compact_tombstones(tombstone_retention_millis);
+            let next_snapshot = document.snapshot();
+            if next_snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES {
+                return Err(PostgresStoreError::PayloadTooLarge);
+            }
+            if next_snapshot != snapshot {
+                sqlx::query(
+                    "UPDATE crdt_documents
+                     SET snapshot = $3, compacted_at = NOW(), updated_at = NOW()
+                     WHERE account_id = $1 AND space_id = $2",
+                )
+                .bind(&account_id)
+                .bind(to_i64(space_id))
+                .bind(next_snapshot)
+                .execute(&mut *transaction)
+                .await?;
+                compacted += 1;
+            } else {
+                // Record a successful no-op compaction too, otherwise an
+                // already-compact document would be scanned every hour.
+                sqlx::query(
+                    "UPDATE crdt_documents
+                     SET compacted_at = NOW()
+                     WHERE account_id = $1 AND space_id = $2",
+                )
+                .bind(&account_id)
+                .bind(to_i64(space_id))
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+        }
+        Ok(compacted)
+    }
+
     pub async fn events_since(
         &self,
         account_id: &str,
@@ -773,29 +1260,22 @@ impl PostgresSyncStore {
             // proven complete (all history may have been pruned). Force the
             // explicit reset path instead of silently switching to live-only
             // delivery and losing future convergence hints.
-            if oldest.is_none() {
-                return Err(PostgresStoreError::EventCursorRequiresReset);
-            }
-            if oldest.is_some_and(|event_id| to_i64(after_event_id) < event_id.saturating_sub(1)) {
-                return Err(PostgresStoreError::EventCursorRequiresReset);
-            }
-            if newest.is_some_and(|event_id| to_i64(after_event_id) > event_id) {
-                // A cursor from a newer server generation is not replayable;
-                // a reset lets the client recover without discarding local
-                // generations.
+            if event_cursor_range_requires_reset(after_event_id, oldest, newest) {
                 return Err(PostgresStoreError::EventCursorRequiresReset);
             }
         }
         let rows = sqlx::query(
-            "SELECT event_id, space_id, update, metadata FROM sync_events
-             WHERE account_id = $1 AND event_id > $2
-            ORDER BY event_id ASC LIMIT 1001",
+            "SELECT e.event_id, e.space_id, s.stable_id::TEXT AS stable_space_id,
+                    e.update, e.metadata FROM sync_events e
+             JOIN spaces s ON s.account_id = e.account_id AND s.space_id = e.space_id
+             WHERE e.account_id = $1 AND e.event_id > $2
+            ORDER BY e.event_id ASC LIMIT 1001",
         )
         .bind(account_id)
         .bind(to_i64(after_event_id))
         .fetch_all(&self.pool)
         .await?;
-        if rows.len() > 1000 {
+        if rows.len() > MAX_SYNC_REPLAY_EVENTS {
             return Err(PostgresStoreError::EventCursorRequiresReset);
         }
         rows.into_iter()
@@ -808,8 +1288,10 @@ impl PostgresSyncStore {
                     .and_then(|value| serde_json::from_value::<SyncMetadataEvent>(value).ok());
                 Ok(SyncEvent {
                     protocol_version: SYNC_PROTOCOL_VERSION,
+                    document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
                     event_id: to_u64(event_id),
                     space_id: to_u64(space_id),
+                    stable_space_id: row.try_get("stable_space_id").ok(),
                     update: EncodedUpdate::from_bytes(&update),
                     metadata,
                 })
@@ -1291,6 +1773,14 @@ async fn insert_sync_event(
     .bind(metadata)
     .execute(&mut **transaction)
     .await?;
+    // NOTIFY is delivered only after the surrounding transaction commits.
+    // The listener fetches the full event from `sync_events`, so the payload
+    // never becomes a second source of truth and remains bounded.
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(SYNC_EVENT_CHANNEL)
+        .bind(event_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
     Ok(())
 }
 
@@ -1303,13 +1793,33 @@ fn validate_entity_id(id: EntityId) -> Result<(), PostgresStoreError> {
     Ok(())
 }
 
+fn validate_requested_stable_space_id(
+    requested: Option<&str>,
+    stored: &str,
+) -> Result<(), PostgresStoreError> {
+    let stored = Uuid::parse_str(stored).map_err(|_| {
+        PostgresStoreError::InvalidInput("stored space id is not a UUID".to_owned())
+    })?;
+    if let Some(requested) = requested {
+        let requested = Uuid::parse_str(requested).map_err(|_| {
+            PostgresStoreError::InvalidInput("stable space id must be a UUID".to_owned())
+        })?;
+        if requested != stored {
+            return Err(PostgresStoreError::SpaceAccessDenied);
+        }
+    }
+    Ok(())
+}
+
 fn metadata_response_from_row(
     space_id: EntityId,
+    stable_space_id: Option<String>,
     row: sqlx::postgres::PgRow,
 ) -> Result<SyncMetadataResponse, PostgresStoreError> {
     Ok(SyncMetadataResponse {
         protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
         space_id,
+        stable_space_id,
         metadata_version: to_u64(row.try_get::<i64, _>("metadata_version")?),
         name: row.try_get("name")?,
         archived: row.try_get("archived")?,
@@ -1324,6 +1834,14 @@ fn validate_sync_reconcile_protocol(version: u32) -> Result<(), PostgresStoreErr
         Err(PostgresStoreError::UnsupportedSyncReconcileProtocol(
             version,
         ))
+    }
+}
+
+fn validate_sync_document_schema(version: u32) -> Result<(), PostgresStoreError> {
+    if version == SYNC_DOCUMENT_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(PostgresStoreError::UnsupportedSyncDocumentSchema(version))
     }
 }
 
@@ -1685,6 +2203,251 @@ fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn event_cursor_range_requires_reset(
+    after_event_id: u64,
+    oldest_event_id: Option<i64>,
+    newest_event_id: Option<i64>,
+) -> bool {
+    if after_event_id == 0 {
+        return false;
+    }
+    let after_event_id = to_i64(after_event_id);
+    // No retained event means the server cannot prove that a non-zero cursor
+    // is still complete. Resetting is conservative and lets the manifest plus
+    // state-vector reconciliation repair the client without losing local work.
+    oldest_event_id.is_none()
+        || oldest_event_id.is_some_and(|event_id| after_event_id < event_id.saturating_sub(1))
+        // A cursor from a newer server generation is not replayable.
+        || newest_event_id.is_some_and(|event_id| after_event_id > event_id)
+}
+
 fn to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{PostgresStoreError, PostgresSyncStore, event_cursor_range_requires_reset};
+    use task_core::BoardData;
+    use task_core::Note;
+    use task_core::crdt::SpaceDoc;
+    use task_core::sync::{
+        EncodedUpdate, SYNC_DOCUMENT_SCHEMA_VERSION, SYNC_RECONCILE_PROTOCOL_VERSION,
+        SyncReconcileRequest,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn cursor_reset_requires_retained_history_to_cover_the_gap() {
+        assert!(!event_cursor_range_requires_reset(0, None, None));
+        assert!(event_cursor_range_requires_reset(4, None, None));
+        assert!(event_cursor_range_requires_reset(3, Some(5), Some(8)));
+        assert!(!event_cursor_range_requires_reset(4, Some(5), Some(8)));
+        assert!(!event_cursor_range_requires_reset(8, Some(5), Some(8)));
+        assert!(event_cursor_range_requires_reset(9, Some(5), Some(8)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TASK_SPACE_TEST_DATABASE_URL"]
+    async fn postgres_listener_forwards_committed_events_between_instances() {
+        let database_url = std::env::var("TASK_SPACE_TEST_DATABASE_URL")
+            .expect("set TASK_SPACE_TEST_DATABASE_URL for the PostgreSQL listener test");
+        let source = PostgresSyncStore::connect(&database_url)
+            .await
+            .expect("source PostgreSQL connection should work");
+        source.migrate().await.expect("migrations should apply");
+        let listener_store = PostgresSyncStore::connect(&database_url)
+            .await
+            .expect("listener PostgreSQL connection should work");
+        listener_store
+            .migrate()
+            .await
+            .expect("listener migrations should apply");
+
+        let account_id = format!("listener-smoke-{}", Uuid::new_v4());
+        let space_id = 9_300_000_000_000_u64;
+        let stable_space_id = Uuid::new_v4().to_string();
+        source
+            .register_space(
+                &account_id,
+                space_id,
+                Some(&stable_space_id),
+                "listener smoke",
+                100,
+            )
+            .await
+            .expect("source space registration should work");
+
+        let mut delivered = listener_store.subscribe();
+        let ready = listener_store.start_event_listener_with_ready();
+        tokio::time::timeout(Duration::from_secs(10), ready)
+            .await
+            .expect("PostgreSQL listener should become ready")
+            .expect("listener readiness signal should not be dropped");
+
+        let document = SpaceDoc::new();
+        document.import_board(&BoardData {
+            notes: vec![Note {
+                id: 1,
+                text: "cross-instance event".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let empty = SpaceDoc::new();
+        let update = document
+            .encode_update(&empty.state_vector())
+            .expect("event update should encode");
+        source
+            .reconcile(
+                &account_id,
+                &SyncReconcileRequest {
+                    protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+                    document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
+                    space_id,
+                    stable_space_id: Some(stable_space_id.clone()),
+                    mutation_id: format!("listener-mutation-{}", Uuid::new_v4()),
+                    device_id: format!("listener-device-{}", Uuid::new_v4()),
+                    local_generation: 1,
+                    last_server_sequence: 0,
+                    state_vector: EncodedUpdate::from_bytes(&empty.state_vector()),
+                    update: EncodedUpdate::from_bytes(&update),
+                },
+            )
+            .await
+            .expect("source reconcile should commit");
+
+        let delivery = tokio::time::timeout(Duration::from_secs(10), delivered.recv())
+            .await
+            .expect("listener should forward the committed event")
+            .expect("listener broadcast should remain open");
+        assert_eq!(delivery.account_id, account_id);
+        assert_eq!(delivery.event.space_id, space_id);
+        assert_eq!(
+            delivery.event.stable_space_id.as_deref(),
+            Some(stable_space_id.as_str())
+        );
+
+        sqlx::query("DELETE FROM spaces WHERE account_id = $1")
+            .bind(&account_id)
+            .execute(source.pool())
+            .await
+            .expect("listener smoke data should be removable");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TASK_SPACE_TEST_DATABASE_URL"]
+    async fn postgres_reconcile_transaction_faults_roll_back_all_stages() {
+        let database_url = std::env::var("TASK_SPACE_TEST_DATABASE_URL")
+            .expect("set TASK_SPACE_TEST_DATABASE_URL for transaction fault acceptance");
+        let store = PostgresSyncStore::connect(&database_url)
+            .await
+            .expect("PostgreSQL connection should work");
+        store.migrate().await.expect("migrations should apply");
+
+        let account_id = format!("transaction-fault-{}", Uuid::new_v4());
+        let space_id = 9_400_000_000_000_u64;
+        let stable_space_id = Uuid::new_v4().to_string();
+        store
+            .register_space(
+                &account_id,
+                space_id,
+                Some(&stable_space_id),
+                "transaction fault smoke",
+                100,
+            )
+            .await
+            .expect("fault smoke space should register");
+
+        let source = SpaceDoc::new();
+        source.import_board(&BoardData {
+            notes: vec![Note {
+                id: 1,
+                text: "transaction fault update".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let empty = SpaceDoc::new();
+        let update = source
+            .encode_update(&empty.state_vector())
+            .expect("fault smoke update should encode");
+
+        for (generation, stage) in [
+            (1, "after_claim"),
+            (2, "after_replay_row"),
+            (3, "after_event"),
+            (4, "before_commit"),
+        ] {
+            store.set_reconcile_fault(Some(stage));
+            let result = store
+                .reconcile(
+                    &account_id,
+                    &SyncReconcileRequest {
+                        protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+                        document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
+                        space_id,
+                        stable_space_id: Some(stable_space_id.clone()),
+                        mutation_id: format!("fault-{stage}"),
+                        device_id: format!("fault-device-{stage}"),
+                        local_generation: generation,
+                        last_server_sequence: 0,
+                        state_vector: EncodedUpdate::from_bytes(&empty.state_vector()),
+                        update: EncodedUpdate::from_bytes(&update),
+                    },
+                )
+                .await;
+            store.set_reconcile_fault(None);
+            assert!(matches!(
+                result,
+                Err(PostgresStoreError::InvalidInput(message))
+                    if message == format!("test reconcile fault at {stage}")
+            ));
+
+            for (table, expected) in [
+                ("sync_mutation_claims", 0_i64),
+                ("crdt_updates", 0_i64),
+                ("sync_events", 0_i64),
+            ] {
+                let count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE account_id = $1 AND space_id = $2"
+                ))
+                .bind(&account_id)
+                .bind(space_id as i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("fault smoke rows should be queryable");
+                assert_eq!(count, expected, "fault stage {stage} left rows in {table}");
+            }
+        }
+
+        let committed = store
+            .reconcile(
+                &account_id,
+                &SyncReconcileRequest {
+                    protocol_version: SYNC_RECONCILE_PROTOCOL_VERSION,
+                    document_schema_version: SYNC_DOCUMENT_SCHEMA_VERSION,
+                    space_id,
+                    stable_space_id: Some(stable_space_id),
+                    mutation_id: "after-fault-retry".to_owned(),
+                    device_id: "fault-retry-device".to_owned(),
+                    local_generation: 5,
+                    last_server_sequence: 0,
+                    state_vector: EncodedUpdate::from_bytes(&empty.state_vector()),
+                    update: EncodedUpdate::from_bytes(&update),
+                },
+            )
+            .await
+            .expect("reconcile should commit after fault injection is cleared");
+        assert!(committed.accepted);
+        assert!(committed.event_id.is_some());
+
+        sqlx::query("DELETE FROM spaces WHERE account_id = $1")
+            .bind(&account_id)
+            .execute(store.pool())
+            .await
+            .expect("fault smoke data should be removable");
+    }
 }

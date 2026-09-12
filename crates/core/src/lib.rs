@@ -10,8 +10,26 @@ pub mod billing;
 pub mod crdt;
 pub mod sync;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub type EntityId = u64;
+
+/// Stable UUID namespace used when upgrading legacy numeric identifiers.
+///
+/// The numeric `id` fields remain a compatibility alias for the current UI
+/// and route format. New CRDT identity is carried by `stable_id`; legacy
+/// values are mapped deterministically so every replica derives the same UUID
+/// without consulting a clock or a shared counter.
+pub fn legacy_entity_stable_id(kind: &str, id: EntityId) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("https://task-space.invalid/entity/{kind}/{id}").as_bytes(),
+    )
+    .to_string()
+}
+
+pub fn is_valid_stable_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok()
+}
 
 fn current_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
@@ -80,6 +98,8 @@ impl NoteColor {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Note {
     pub id: EntityId,
+    #[serde(default)]
+    pub stable_id: String,
     #[serde(default = "empty_string")]
     pub text: String,
     pub color: NoteColor,
@@ -93,6 +113,8 @@ pub struct Note {
     #[serde(default)]
     pub group_id: Option<EntityId>,
     #[serde(default)]
+    pub group_stable_id: Option<String>,
+    #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
     pub updated_at: u64,
@@ -103,6 +125,8 @@ pub struct Note {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Group {
     pub id: EntityId,
+    #[serde(default)]
+    pub stable_id: String,
     #[serde(default = "empty_string")]
     pub label: String,
     #[serde(default)]
@@ -128,6 +152,8 @@ pub enum TombstoneKind {
 pub struct Tombstone {
     pub kind: TombstoneKind,
     pub id: EntityId,
+    #[serde(default)]
+    pub stable_id: String,
     pub deleted_at: u64,
 }
 
@@ -157,6 +183,8 @@ impl Default for BoardData {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Space {
     pub id: EntityId,
+    #[serde(default)]
+    pub stable_id: String,
     pub name: String,
     #[serde(default)]
     pub metadata_version: u64,
@@ -168,6 +196,31 @@ pub struct Space {
     pub updated_at: u64,
     #[serde(default)]
     pub deleted_at: Option<u64>,
+    pub board: BoardData,
+}
+
+/// Metadata returned by the authenticated space manifest endpoint. Document
+/// content is intentionally excluded; clients fetch it through CRDT
+/// reconciliation so a large space cannot make manifest discovery fail.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SpaceManifestEntry {
+    pub id: EntityId,
+    #[serde(default)]
+    pub stable_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub metadata_version: u64,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
+    /// Kept empty during the additive rollout so older clients that decode a
+    /// `Space` still receive a valid projection without receiving content.
+    #[serde(default)]
     pub board: BoardData,
 }
 
@@ -202,6 +255,7 @@ mod tests {
             tombstones: vec![Tombstone {
                 kind: TombstoneKind::Note,
                 id: 42,
+                stable_id: legacy_entity_stable_id("note", 42),
                 deleted_at: 123,
             }],
             ..Default::default()
@@ -210,5 +264,19 @@ mod tests {
         let restored: BoardData = serde_json::from_str(&raw).expect("board should deserialize");
 
         assert_eq!(restored, board);
+    }
+
+    #[test]
+    fn space_manifest_is_metadata_only_with_compatibility_board() {
+        let manifest = SpaceManifestEntry {
+            id: 7,
+            stable_id: legacy_entity_stable_id("space", 7),
+            name: "work".into(),
+            ..Default::default()
+        };
+        let raw = serde_json::to_value(&manifest).expect("manifest should serialize");
+        assert_eq!(raw["board"]["notes"].as_array().map(Vec::len), Some(0));
+        assert_eq!(raw["board"]["groups"].as_array().map(Vec::len), Some(0));
+        assert!(!raw.to_string().contains("snapshot"));
     }
 }

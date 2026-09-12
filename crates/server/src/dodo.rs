@@ -136,12 +136,20 @@ impl DodoClient {
                 "DODO_PAYMENTS_ENVIRONMENT must be test_mode or live_mode".to_owned(),
             ));
         }
-        let expected_key_prefix = if config.environment == "live_mode" {
-            "dodo_live_"
+        // Dodo currently documents `dp_test_`/`dp_live_` keys, while older
+        // deployments used `dodo_test_`/`dodo_live_`. Some existing provider
+        // accounts also issue opaque keys, so only reject a key when it has a
+        // known prefix for the opposite environment; requiring one specific
+        // prefix prevents a valid account from starting at all.
+        let opposite_prefixes = if config.environment == "live_mode" {
+            ["dp_test_", "dodo_test_"]
         } else {
-            "dodo_test_"
+            ["dp_live_", "dodo_live_"]
         };
-        if !config.api_key.starts_with(expected_key_prefix) {
+        if opposite_prefixes
+            .iter()
+            .any(|prefix| config.api_key.starts_with(prefix))
+        {
             return Err(DodoError::InvalidPayload(format!(
                 "Dodo API key does not match {}",
                 config.environment
@@ -993,6 +1001,14 @@ mod tests {
             DodoClient::new(bad_key),
             Err(DodoError::InvalidPayload(message)) if message.contains("does not match")
         ));
+
+        let mut documented_test_key = client_config();
+        documented_test_key.api_key = "dp_test_example".to_owned();
+        assert!(DodoClient::new(documented_test_key).is_ok());
+
+        let mut opaque_key = client_config();
+        opaque_key.api_key = "provider-issued-opaque-test-key".to_owned();
+        assert!(DodoClient::new(opaque_key).is_ok());
 
         let mut bad_return_url = client_config();
         bad_return_url.return_url = "/app".to_owned();

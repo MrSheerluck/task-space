@@ -6,4 +6,6 @@
 /apps/web/node_modules
 /apps/web/src/main.css
 /apps/web/src/fonts-inline.css
+__pycache__/
+*.py[cod]
 roadmap.md
