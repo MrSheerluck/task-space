@@ -159,6 +159,79 @@ impl SyncStatus {
     }
 }
 
+fn sync_status_heading(status: SyncStatus, pending: usize, connected: bool) -> &'static str {
+    match status {
+        SyncStatus::Disabled => "local only",
+        SyncStatus::Checking => "checking your account",
+        SyncStatus::Syncing if pending > 0 => "sending changes",
+        SyncStatus::Syncing if !connected => "reconnecting",
+        SyncStatus::Syncing => "listening for changes",
+        SyncStatus::Synced => "up to date",
+        SyncStatus::Offline => "waiting for connection",
+        SyncStatus::AuthPaused => "sign-in required",
+        SyncStatus::BillingPaused => "sync paused",
+        SyncStatus::Error => "needs attention",
+    }
+}
+
+fn sync_status_explanation(status: SyncStatus, pending: usize, connected: bool) -> &'static str {
+    match status {
+        SyncStatus::Disabled => "This workspace is saved only on this device.",
+        SyncStatus::Checking => "Checking whether cloud sync is available.",
+        SyncStatus::Syncing if pending > 0 => {
+            "Your latest changes are on this device and are being sent now."
+        }
+        SyncStatus::Syncing if !connected => {
+            "The live connection is reconnecting; local changes stay safe."
+        }
+        SyncStatus::Syncing => {
+            "This browser is connected and ready for changes from your other devices."
+        }
+        SyncStatus::Synced => "Everything saved here has reached the cloud.",
+        SyncStatus::Offline => "Changes are saved here and will upload when you are back online.",
+        SyncStatus::AuthPaused => "Sign in again to continue sending local changes to the cloud.",
+        SyncStatus::BillingPaused => "Cloud sync is paused until your plan is active again.",
+        SyncStatus::Error => "The last sync attempt failed; retry to continue.",
+    }
+}
+
+fn sync_status_tone(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::Synced => "bg-note-green text-note-ink-green",
+        SyncStatus::Offline | SyncStatus::AuthPaused | SyncStatus::BillingPaused => {
+            "bg-note-yellow text-note-ink-yellow"
+        }
+        SyncStatus::Error => "bg-note-pink text-note-ink-pink",
+        _ => "bg-ink-soft/20 text-ink",
+    }
+}
+
+fn latest_sync_timestamp(
+    last_server_ack_at: Option<u64>,
+    transport: &SyncTransportDiagnostics,
+) -> Option<u64> {
+    [last_server_ack_at, transport.last_event_at]
+        .into_iter()
+        .flatten()
+        .max()
+}
+
+fn format_sync_age(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "not yet".to_owned();
+    };
+    let elapsed = now_millis().saturating_sub(timestamp);
+    if elapsed < 2_000 {
+        "just now".to_owned()
+    } else if elapsed < 60_000 {
+        format!("{}s ago", elapsed / 1_000)
+    } else if elapsed < 3_600_000 {
+        format!("{}m ago", elapsed / 60_000)
+    } else {
+        format!("{}h ago", elapsed / 3_600_000)
+    }
+}
+
 thread_local! {
     static SYNC_PRINCIPAL: RefCell<String> = RefCell::new("guest".to_owned());
     static SYNC_ACKED_STATE_VECTORS: RefCell<HashMap<(String, u64), Vec<u8>>> = RefCell::new(HashMap::new());
@@ -179,6 +252,8 @@ thread_local! {
         const { RefCell::new(VecDeque::new()) };
     static LOCAL_METADATA_WATERMARKS: RefCell<HashMap<(String, u64), String>> =
         RefCell::new(HashMap::new());
+    static SYNC_REGISTERED_SPACES: RefCell<HashSet<(String, u64)>> =
+        RefCell::new(HashSet::new());
     static SYNC_SPACE_NETWORK_IN_FLIGHT: RefCell<HashSet<(String, u64)>> =
         RefCell::new(HashSet::new());
     static STORAGE_WRITE_GENERATION: Cell<u64> = const { Cell::new(0) };
@@ -4530,6 +4605,18 @@ async fn register_sync_space(space_id: u64, name: &str, stable_id: Option<&str>)
     }
 }
 
+fn sync_space_is_registered(space_id: u64) -> bool {
+    let principal = current_sync_principal();
+    SYNC_REGISTERED_SPACES.with(|spaces| spaces.borrow().contains(&(principal, space_id)))
+}
+
+fn mark_sync_space_registered(space_id: u64) {
+    let principal = current_sync_principal();
+    SYNC_REGISTERED_SPACES.with(|spaces| {
+        spaces.borrow_mut().insert((principal, space_id));
+    });
+}
+
 fn queue_space_metadata_operation(
     spaces: RwSignal<Vec<Space>>,
     active_space_id: u64,
@@ -4676,8 +4763,16 @@ fn queue_crdt_update(
         // attempts its first push.
         if sync_is_active()
             && let Some(name) = space_name.as_deref()
+            && !sync_space_is_registered(space_id)
         {
-            let _ = register_sync_space(space_id, name, space_stable_id.as_deref()).await;
+            // Existing spaces are registered during session startup. Only an
+            // offline-created/new space needs this one-time repair request;
+            // re-registering on every note edit adds a full network round trip
+            // before the actual CRDT mutation can leave the device.
+            if !register_sync_space(space_id, name, space_stable_id.as_deref()).await {
+                return;
+            }
+            mark_sync_space_registered(space_id);
         }
         // The local tab channel carries the committed CRDT update itself.
         // This is what makes two tabs converge while offline; the server
@@ -4896,6 +4991,7 @@ async fn register_sync_spaces(spaces: RwSignal<Vec<Space>>) {
         if !register_sync_space(space.id, &space.name, Some(&space.stable_id)).await {
             return;
         }
+        mark_sync_space_registered(space.id);
     }
 }
 
@@ -6096,6 +6192,7 @@ async fn apply_local_tab_update(
     }
 
     let space_id = message.space_id;
+    let had_existing_doc = crdt_docs.get_untracked().contains_key(&space_id);
     let doc = if let Some(doc) = crdt_docs.get_untracked().get(&space_id).cloned() {
         doc
     } else {
@@ -6135,11 +6232,19 @@ async fn apply_local_tab_update(
         }
     };
 
-    let pending_updates = match load_pending_crdt_updates(space_id).await {
-        Ok(updates) => updates,
-        Err(()) => {
-            mark_storage_repair_required();
-            return;
+    let pending_updates = if had_existing_doc {
+        // The live CRDT already includes local edits and every sibling update
+        // that reached this tab. Do not block the visible projection on a
+        // second IndexedDB read; the inbox remains the recovery path for a
+        // suspended tab and is loaded when the document is next hydrated.
+        PendingCrdtUpdates::default()
+    } else {
+        match load_pending_crdt_updates(space_id).await {
+            Ok(updates) => updates,
+            Err(()) => {
+                mark_storage_repair_required();
+                return;
+            }
         }
     };
     if !replay_pending_crdt_updates(&doc, &pending_updates.updates) {
@@ -6147,33 +6252,12 @@ async fn apply_local_tab_update(
         return;
     }
 
-    // Persist the sibling delta before applying it to the live projection.
-    // The snapshot mirror below is intentionally best-effort because another
-    // tab may have won the generation race; the inbox is the crash-safe copy
-    // that lets the next hydration replay this exact operation.
     let origin_device_id = message
         ._origin_device_id
         .as_deref()
         .or(message.origin_tab_id.as_deref())
         .unwrap_or("unknown");
     let encoded_update = EncodedUpdate::from_bytes(&update);
-    if JsFuture::from(indexed_db_queue_incoming_crdt_update(
-        &message.principal,
-        space_id,
-        origin_device_id,
-        message.local_generation,
-        encoded_update.as_str(),
-    ))
-    .await
-    .is_err()
-    {
-        mark_storage_repair_required();
-        return;
-    }
-    if message.principal != current_sync_principal() {
-        return;
-    }
-
     let candidate = doc.clone();
     if candidate.apply_update(&update).is_err() {
         return;
@@ -6200,6 +6284,29 @@ async fn apply_local_tab_update(
         notes.set(board.notes.clone());
         groups.set(board.groups.clone());
     }
+
+    // Render first. The originating tab already durably queued the update;
+    // this tab only needs the inbox write for crash recovery. Keeping that
+    // write off the projection path makes sibling tabs converge in the same
+    // turn instead of waiting on IndexedDB before repainting.
+    let incoming_principal = message.principal.clone();
+    let incoming_generation = message.local_generation;
+    let incoming_update = encoded_update.as_str().to_owned();
+    let incoming_origin = origin_device_id.to_owned();
+    spawn_local(async move {
+        if JsFuture::from(indexed_db_queue_incoming_crdt_update(
+            &incoming_principal,
+            space_id,
+            &incoming_origin,
+            incoming_generation,
+            &incoming_update,
+        ))
+        .await
+        .is_err()
+        {
+            mark_storage_repair_required();
+        }
+    });
 
     let principal = message.principal;
     queue_indexed_db_crdt_save(
@@ -10464,12 +10571,16 @@ pub fn Board() -> impl IntoView {
             groups: groups.get(),
             tombstones: Vec::new(),
         };
-        // Pointer moves are rendered locally at frame rate, but they should
-        // not each become a durable CRDT mutation. The final board state is
-        // queued when the interaction signal returns to idle on pointerup.
+        // Pointer moves and text edits are rendered locally immediately, but
+        // they should not each become a durable CRDT mutation. Otherwise a
+        // remote browser receives a note one character at a time (or a card
+        // one pointer frame at a time). Queue the final board state when the
+        // interaction returns to idle on pointerup or edit commit.
         let interaction_in_progress = dragged.get().is_some()
             || group_dragging.get().is_some()
-            || group_resizing.get().is_some();
+            || group_resizing.get().is_some()
+            || editing.get().is_some()
+            || group_editing.get().is_some();
         // A remote projection can be followed by a local UI edit before this
         // reactive effect runs. Compare against the live CRDT, not only the
         // projection-generation marker: remote-only work needs no new outbox
@@ -11650,7 +11761,7 @@ pub fn Board() -> impl IntoView {
                 <span class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
                     "shift-drag to select · shift-click to add · drag empty space to pan"
                 </span>
-                <div class="flex min-h-7 items-center gap-2">
+                <div class="pointer-events-auto flex min-h-7 items-center gap-2">
                     {move || restore_message.get().map(|message| view! {
                         <span class="rounded-[3px] bg-note-green px-2.5 py-1.5 text-note-ink-green shadow-sm">{message}</span>
                     })}
@@ -11671,56 +11782,170 @@ pub fn Board() -> impl IntoView {
                     </span>
                     <button
                         type="button"
-                        disabled=move || !sync_started.get()
-                        on:click=move |_| {
-                            sync_status.set(SyncStatus::Syncing);
-                            spawn_local(async move {
-                                let refreshed = load_account_state().await;
-                                account_state.set(refreshed);
-                                schedule_sync_drain();
-                            });
-                        }
-                        class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm hover:bg-white/70 disabled:cursor-not-allowed disabled:opacity-50"
-                        title="Retry synchronization now"
-                    >
-                        "sync now"
-                    </button>
-                    <span class=move || match sync_status.get() {
-                        SyncStatus::AuthPaused | SyncStatus::BillingPaused | SyncStatus::Error =>
-                            "rounded-[3px] border border-note-ink-yellow/30 bg-note-yellow/70 px-2.5 py-1.5 text-note-ink-yellow shadow-sm backdrop-blur-sm",
-                        _ => "rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm",
-                    }>
-                        {move || sync_status.get().label()}
-                    </span>
-                    {move || (pending_sync_count.get() > 0).then(|| view! {
-                        <span
-                            class="rounded-[3px] border border-note-ink-yellow/30 bg-note-yellow/60 px-2.5 py-1.5 text-note-ink-yellow shadow-sm"
-                            title=move || last_server_ack_at.get().map_or_else(
-                                || "no server acknowledgement yet".to_owned(),
-                                |timestamp| format!("last server acknowledgement: {timestamp}"),
-                            )
-                        >
-                            {move || format!("{} pending", pending_sync_count.get())}
-                        </span>
-                    })}
-                    <button
-                        type="button"
+                        aria-expanded=move || show_sync_diagnostics.get().to_string()
+                        aria-controls="sync-details-panel"
                         on:click=move |_| show_sync_diagnostics.update(|open| *open = !*open)
-                        class="rounded-[3px] border border-ink-soft/15 bg-paper/85 px-2.5 py-1.5 shadow-sm backdrop-blur-sm hover:bg-white/70 focus:outline-none focus:ring-2 focus:ring-ink/30"
-                        title="Show safe synchronization diagnostics"
+                        class=move || format!(
+                            "group flex items-center gap-2 rounded-[3px] border border-ink-soft/15 bg-paper/90 px-2.5 py-1.5 text-left shadow-sm backdrop-blur-sm hover:bg-white/70 focus:outline-none focus:ring-2 focus:ring-ink/30 {}",
+                            if matches!(sync_status.get(), SyncStatus::Error | SyncStatus::AuthPaused | SyncStatus::BillingPaused) {
+                                "border-note-ink-yellow/30"
+                            } else {
+                                ""
+                            },
+                        )
+                        title="Open sync details"
                     >
-                        "details"
+                        <span
+                            class=move || format!(
+                                "h-2.5 w-2.5 shrink-0 rounded-full {} {}",
+                                sync_status_tone(sync_status.get()),
+                                if sync_status.get() == SyncStatus::Syncing { "animate-pulse" } else { "" },
+                            )
+                            aria-hidden="true"
+                        ></span>
+                        <span class="flex min-w-0 flex-col leading-tight">
+                            <span class="font-medium text-ink">"cloud sync"</span>
+                            <span class="truncate text-[11px] text-ink-soft">
+                                {move || sync_status_heading(
+                                    sync_status.get(),
+                                    pending_sync_count.get(),
+                                    transport_sync_diagnostics.get().connected,
+                                )}
+                            </span>
+                        </span>
+                        {move || (pending_sync_count.get() > 0).then(|| view! {
+                            <span class="rounded-full bg-note-yellow/70 px-1.5 py-0.5 text-[10px] text-note-ink-yellow">
+                                {move || pending_sync_count.get()}
+                            </span>
+                        })}
+                        <span class="ml-1 text-ink-soft transition-transform group-hover:translate-x-0.5" aria-hidden="true">"↗"</span>
                     </button>
                 </div>
             </div>
 
             {move || show_sync_diagnostics.get().then(|| view! {
-                <section class="pointer-events-auto absolute bottom-14 right-3 z-20 w-[min(28rem,calc(100vw-1.5rem))] rounded-[3px] border border-ink-soft/20 bg-paper/95 p-3 text-xs text-ink shadow-xl backdrop-blur-sm sm:bottom-16 sm:right-5">
-                    <div class="flex items-center justify-between gap-3">
-                        <p class="font-medium uppercase tracking-[0.12em] text-ink-soft">"sync diagnostics"</p>
-                        <span class="text-ink-soft">{format!("schema {}", CURRENT_SCHEMA_VERSION)}</span>
+                <section
+                    id="sync-details-panel"
+                    role="dialog"
+                    aria-label="Sync details"
+                    class="pointer-events-auto absolute bottom-14 right-3 z-20 w-[min(24rem,calc(100vw-1.5rem))] overflow-hidden rounded-[5px] border border-ink-soft/20 bg-paper/95 text-xs text-ink shadow-2xl backdrop-blur-sm sm:bottom-16 sm:right-5"
+                >
+                    <div class="border-b border-ink-soft/10 bg-paper-shelf/50 p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <p class="text-[10px] font-medium uppercase tracking-[0.18em] text-ink-soft">"cloud sync"</p>
+                                <h2 class="mt-1 text-base font-medium text-ink">
+                                    {move || sync_status_heading(
+                                        sync_status.get(),
+                                        pending_sync_count.get(),
+                                        transport_sync_diagnostics.get().connected,
+                                    )}
+                                </h2>
+                                <p class="mt-2 leading-relaxed text-ink-soft">
+                                    {move || sync_status_explanation(
+                                        sync_status.get(),
+                                        pending_sync_count.get(),
+                                        transport_sync_diagnostics.get().connected,
+                                    )}
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                aria-label="Close sync details"
+                                on:click=move |_| show_sync_diagnostics.set(false)
+                                class="rounded-full px-2 py-1 text-lg leading-none text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                            >
+                                "×"
+                            </button>
+                        </div>
+                        {move || local_sync_diagnostics.get().and_then(|value| value.last_error).map(|message| view! {
+                            <p class="mt-3 rounded-[3px] bg-note-pink/70 px-3 py-2 text-note-ink-pink">{message}</p>
+                        })}
                     </div>
-                    <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                    <div class="p-4">
+                        <div class="grid grid-cols-2 gap-2">
+                            <div class="rounded-[3px] border border-ink-soft/10 bg-white/45 px-3 py-2">
+                                <p class="text-[10px] uppercase tracking-[0.12em] text-ink-soft">"this device"</p>
+                                <p class="mt-1 font-medium text-ink">
+                                    {move || match storage_status.get() {
+                                        StorageStatus::Saved => "saved locally",
+                                        StorageStatus::Saving => "saving locally…",
+                                        StorageStatus::Error => "local save needs attention",
+                                    }}
+                                </p>
+                            </div>
+                            <div class="rounded-[3px] border border-ink-soft/10 bg-white/45 px-3 py-2">
+                                <p class="text-[10px] uppercase tracking-[0.12em] text-ink-soft">"cloud"</p>
+                                <p class="mt-1 font-medium text-ink">
+                                    {move || if pending_sync_count.get() == 0 {
+                                        "up to date".to_owned()
+                                    } else {
+                                        format!("{} waiting", pending_sync_count.get())
+                                    }}
+                                </p>
+                            </div>
+                            <div class="rounded-[3px] border border-ink-soft/10 bg-white/45 px-3 py-2">
+                                <p class="text-[10px] uppercase tracking-[0.12em] text-ink-soft">"live connection"</p>
+                                <p class="mt-1 font-medium text-ink">
+                                    {move || if transport_sync_diagnostics.get().connected {
+                                        "connected"
+                                    } else if web_sys::window().is_some_and(|window| window.navigator().on_line()) {
+                                        "reconnecting"
+                                    } else {
+                                        "offline"
+                                    }}
+                                </p>
+                            </div>
+                            <div class="rounded-[3px] border border-ink-soft/10 bg-white/45 px-3 py-2">
+                                <p class="text-[10px] uppercase tracking-[0.12em] text-ink-soft">"last sync"</p>
+                                <p class="mt-1 font-medium text-ink">
+                                    {move || format_sync_age(latest_sync_timestamp(
+                                        last_server_ack_at.get(),
+                                        &transport_sync_diagnostics.get(),
+                                    ))}
+                                </p>
+                            </div>
+                        </div>
+                        <div class="mt-3 flex flex-wrap gap-2">
+                            <button
+                                type="button"
+                                disabled=move || !sync_started.get()
+                                on:click=move |_| {
+                                    sync_status.set(SyncStatus::Syncing);
+                                    spawn_local(async move {
+                                        let refreshed = load_account_state().await;
+                                        account_state.set(refreshed);
+                                        schedule_sync_drain();
+                                    });
+                                }
+                                class="rounded-[3px] bg-ink px-3 py-2 text-xs font-medium text-paper hover:bg-ink/85 disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-ink/30"
+                            >
+                                {move || if sync_status.get() == SyncStatus::Syncing { "syncing…" } else { "sync now" }}
+                            </button>
+                            <button
+                                type="button"
+                                on:click=move |_| export_sync_diagnostics(
+                                    active_space_id.get_untracked(),
+                                    sync_status.get_untracked(),
+                                    pending_sync_count.get_untracked(),
+                                    last_server_ack_at.get_untracked(),
+                                    last_request_id.get_untracked(),
+                                    last_sync_error.get_untracked(),
+                                    local_sync_diagnostics.get_untracked(),
+                                    transport_sync_diagnostics.get_untracked(),
+                                    restore_message,
+                                )
+                                class="rounded-[3px] border border-ink-soft/15 px-3 py-2 text-xs text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                            >
+                                "export troubleshooting"
+                            </button>
+                        </div>
+                    </div>
+                    <details class="border-t border-ink-soft/10 px-4 pb-4 pt-3">
+                        <summary class="cursor-pointer select-none text-[11px] font-medium uppercase tracking-[0.12em] text-ink-soft hover:text-ink">
+                            "advanced details"
+                        </summary>
+                        <dl class="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
                         <dt class="text-ink-soft">"principal"</dt>
                         <dd class="truncate">{current_sync_principal()}</dd>
                         <dt class="text-ink-soft">"device"</dt>
@@ -11770,24 +11995,8 @@ pub fn Board() -> impl IntoView {
                         <dt class="text-ink-soft">"last local sync error"</dt>
                         <dd class="truncate">{last_sync_error.get().unwrap_or_else(|| "none".to_owned())}</dd>
                     </dl>
-                    <button
-                        type="button"
-                        on:click=move |_| export_sync_diagnostics(
-                            active_space_id.get_untracked(),
-                            sync_status.get_untracked(),
-                            pending_sync_count.get_untracked(),
-                            last_server_ack_at.get_untracked(),
-                            last_request_id.get_untracked(),
-                            last_sync_error.get_untracked(),
-                            local_sync_diagnostics.get_untracked(),
-                            transport_sync_diagnostics.get_untracked(),
-                            restore_message,
-                        )
-                        class="mt-3 rounded-[3px] border border-ink-soft/15 bg-paper-shelf px-2.5 py-1.5 text-xs text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
-                    >
-                        "export diagnostics"
-                    </button>
-                    <p class="mt-3 border-t border-ink-soft/10 pt-2 text-ink-soft">"Safe diagnostics only; document contents and credentials are never shown."</p>
+                    <p class="mt-3 border-t border-ink-soft/10 pt-2 text-ink-soft">"Technical identifiers are hidden by default. Export troubleshooting data only when support needs it; note contents and credentials are never included."</p>
+                    </details>
                 </section>
             })}
 
