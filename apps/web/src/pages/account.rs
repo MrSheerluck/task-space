@@ -213,33 +213,32 @@ pub fn remember_authenticated_account(account_id: &str) {
     if account_id.trim().is_empty() {
         return;
     }
-    if let Some(window) = web_sys::window()
-        && let Ok(Some(storage)) = window.local_storage()
-    {
+    // Keep the account marker in both stores. Some privacy-focused browsers
+    // partition or clear localStorage while leaving sessionStorage intact;
+    // losing this marker on an expired session makes the account workspace
+    // look like a brand-new empty guest board.
+    for storage in auth_storages() {
         let _ = storage.set_item(ACTIVE_ACCOUNT_ID_STORAGE_KEY, account_id);
     }
 }
 
 pub fn remembered_account_principal() -> Option<String> {
-    let window = web_sys::window()?;
-    let authenticated = window
-        .local_storage()
-        .ok()
-        .flatten()
-        .and_then(|storage| storage.get_item(AUTHENTICATED_SESSION_STORAGE_KEY).ok())
-        .flatten()
-        .is_some_and(|value| value == "true");
-    if !authenticated {
-        return None;
-    }
-    window
-        .local_storage()
-        .ok()
-        .flatten()
-        .and_then(|storage| storage.get_item(ACTIVE_ACCOUNT_ID_STORAGE_KEY).ok())
-        .flatten()
-        .filter(|account_id| !account_id.trim().is_empty())
-        .map(|account_id| format!("account:{account_id}"))
+    auth_storages().into_iter().find_map(|storage| {
+        let authenticated = storage
+            .get_item(AUTHENTICATED_SESSION_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|value| value == "true");
+        if !authenticated {
+            return None;
+        }
+        storage
+            .get_item(ACTIVE_ACCOUNT_ID_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .filter(|account_id| !account_id.trim().is_empty())
+            .map(|account_id| format!("account:{account_id}"))
+    })
 }
 
 fn state_after_session_expiry() -> AccountState {

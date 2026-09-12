@@ -1199,6 +1199,61 @@ export function taskSpaceCommitCrdtPull(
   });
 }
 
+// Commit an already-applied SSE delta without making another network pull.
+// The event cursor is advanced only after this transaction succeeds, so a
+// crash before the write completes safely replays the durable server event.
+export function taskSpaceCommitCrdtEvent(
+  principal,
+  spaceId,
+  encodedSnapshot,
+  stateVector,
+) {
+  const writeSequence = taskSpaceNextCrdtWriteSequence(principal, spaceId);
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("task-space", 7);
+    request.onupgradeneeded = () => taskSpaceEnsureStores(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+    request.onsuccess = () => {
+      const db = taskSpaceConfigureDb(request.result);
+      const transaction = db.transaction(["sync-records", "sync-state", "crdt"], "readwrite");
+      const records = transaction.objectStore("sync-records");
+      const key = taskSpaceSyncRecordKey(principal, spaceId);
+      let accepted = false;
+      const read = records.get(key);
+      read.onerror = () => reject(read.error || new Error("Could not read sync record"));
+      read.onsuccess = () => {
+        const record = read.result || taskSpaceEmptySyncRecord(principal, spaceId);
+        const previousSequence = taskSpaceSafeCounter(record.snapshotWriteSequence);
+        accepted = writeSequence >= previousSequence;
+        // A local write that was already scheduled owns a newer snapshot
+        // sequence. Do not let an SSE projection clobber that local snapshot;
+        // its next reconcile will include the server delta if necessary.
+        if (accepted) {
+          record.snapshot = encodedSnapshot;
+          record.snapshotWriteSequence = writeSequence;
+          record.acknowledgedStateVector = stateVector;
+          record.lastError = null;
+          records.put(record, key);
+          transaction.objectStore("crdt").put(
+            encodedSnapshot,
+            taskSpaceKeyFor(principal, `space:${spaceId}`),
+          );
+          transaction.objectStore("sync-state").put(
+            stateVector,
+            taskSpaceKeyFor(principal, `space:${spaceId}`),
+          );
+        }
+      };
+      transaction.onerror = () => reject(transaction.error || new Error("Could not commit SSE event"));
+      transaction.oncomplete = () => resolve(accepted);
+    };
+  });
+}
+
 export function taskSpaceSaveSyncState(principal, spaceId, stateVector) {
   return new Promise((resolve, reject) => {
     if (!globalThis.indexedDB) {
@@ -2277,6 +2332,14 @@ unsafe extern "C" {
         state_vector: &str,
         local_generation: u64,
         inbox_keys_json: &str,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = taskSpaceCommitCrdtEvent)]
+    fn indexed_db_commit_crdt_event(
+        principal: &str,
+        space_id: u64,
+        encoded_snapshot: &str,
+        state_vector: &str,
     ) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = taskSpaceLoadSyncState)]
@@ -4086,6 +4149,47 @@ async fn persist_workspace_before_event_cursor(runtime: RemoteSyncEventRuntime) 
     JsFuture::from(indexed_db_save_workspace(&raw, &principal))
         .await
         .is_ok()
+}
+
+async fn persist_remote_crdt_event(
+    principal: &str,
+    space_id: u64,
+    snapshot: &[u8],
+    state_vector: &[u8],
+    run_generation: u64,
+) -> bool {
+    if principal != current_sync_principal()
+        || !sync_is_active()
+        || !sync_run_is_current(run_generation)
+        || snapshot.len() > MAX_SYNC_SNAPSHOT_BYTES
+        || state_vector.len() > MAX_SYNC_STATE_VECTOR_BYTES
+    {
+        return false;
+    }
+    let encoded_snapshot = EncodedUpdate::from_bytes(snapshot);
+    let encoded_state_vector = EncodedUpdate::from_bytes(state_vector);
+    let committed = JsFuture::from(indexed_db_commit_crdt_event(
+        principal,
+        space_id,
+        encoded_snapshot.as_str(),
+        encoded_state_vector.as_str(),
+    ))
+    .await
+    .ok()
+    .and_then(|value| value.as_bool())
+    .unwrap_or(false);
+    if !committed {
+        return false;
+    }
+    if principal != current_sync_principal()
+        || !sync_is_active()
+        || !sync_run_is_current(run_generation)
+    {
+        return false;
+    }
+    set_acknowledged_state_vector(principal, space_id, state_vector.to_vec());
+    SYNC_SERVER_CONTACT.with(|contact| contact.set(true));
+    true
 }
 
 fn begin_storage_write() -> u64 {
@@ -6441,14 +6545,9 @@ async fn process_remote_sync_event(raw: String, runtime: RemoteSyncEventRuntime)
             return;
         }
     }
-    // SSE is a latency optimization, never the correctness path. The event
-    // may contain a delta whose dependencies this tab did not receive, so
-    // always schedule a state-vector pull as well as attempting the fast
-    // local apply below.
-    schedule_sync_drain();
-    // SSE is a latency optimization, never the correctness path. The event
-    // may contain a delta whose dependencies this tab did not receive, so a
-    // document event is followed by an authenticated state-vector pull.
+    // A valid SSE delta is the fast path. It is applied directly to the local
+    // CRDT and rendered below; a state-vector pull is reserved for malformed,
+    // missing, or dependency-incompatible events.
     if let Some(metadata) = event.metadata.as_ref() {
         let current_metadata_version = spaces
             .get_untracked()
@@ -6509,12 +6608,6 @@ async fn process_remote_sync_event(raw: String, runtime: RemoteSyncEventRuntime)
                 notes.set(space.board.notes.clone());
                 groups.set(space.board.groups.clone());
             }
-            let workspace = workspace_snapshot(
-                spaces.get_untracked(),
-                active_space_id.get_untracked(),
-                workspace_tombstones.get_untracked(),
-            );
-            let _ = save_workspace(&workspace, None);
             if event.update.as_str().is_empty() {
                 if persist_workspace_before_event_cursor(event_runtime).await {
                     save_sync_cursor(event.event_id);
@@ -6622,32 +6715,48 @@ async fn process_remote_sync_event(raw: String, runtime: RemoteSyncEventRuntime)
         notes.set(board.notes);
         groups.set(board.groups);
     }
-    let workspace = workspace_snapshot(
-        spaces.get_untracked(),
-        active_space_id.get_untracked(),
-        workspace_tombstones.get_untracked(),
-    );
-    let _ = save_workspace(&workspace, None);
-    if !pull_space(
-        spaces,
-        active_space_id,
-        notes,
-        groups,
-        workspace_tombstones,
-        crdt_docs,
+    let Some((snapshot, state_vector)) = crdt_docs
+        .get_untracked()
+        .get(&event.space_id)
+        .map(|doc| (doc.snapshot(), doc.state_vector()))
+    else {
+        requeue_remote_sync_event(raw, event_runtime);
+        sync_wait_ms(1_000).await;
+        return;
+    };
+    let principal = current_sync_principal();
+    if !persist_remote_crdt_event(
+        &principal,
         event.space_id,
+        &snapshot,
+        &state_vector,
         run_generation,
     )
     .await
     {
-        requeue_remote_sync_event(raw, event_runtime);
-        sync_wait_ms(1_000).await;
-        return;
+        // IndexedDB persistence is part of the cursor contract. If it fails,
+        // recover through the authenticated pull before acknowledging the SSE
+        // event so a reload cannot skip this durable server operation.
+        if !pull_space(
+            spaces,
+            active_space_id,
+            notes,
+            groups,
+            workspace_tombstones,
+            crdt_docs,
+            event.space_id,
+            run_generation,
+        )
+        .await
+        {
+            requeue_remote_sync_event(raw, event_runtime);
+            sync_wait_ms(1_000).await;
+            return;
+        }
     }
     if persist_workspace_before_event_cursor(event_runtime).await {
         // The queue processes SSE events serially, so every lower event ID
-        // has completed its own pull or metadata persistence before this
-        // cursor is made durable.
+        // has completed its local CRDT commit before this cursor is durable.
         save_sync_cursor(event.event_id);
     } else {
         requeue_remote_sync_event(raw, event_runtime);
@@ -7034,9 +7143,11 @@ fn start_authenticated_sync(
     last_error: RwSignal<Option<String>>,
     local_diagnostics: RwSignal<Option<LocalSyncDiagnostics>>,
     transport_diagnostics: RwSignal<SyncTransportDiagnostics>,
+    initial_sync_ready: RwSignal<bool>,
 ) {
     let principal = current_sync_principal();
     let run_generation = next_sync_run_generation();
+    initial_sync_ready.set(false);
     let cleanup_principal = principal.clone();
     let online_listener = window_event_listener_untyped("online", |_| {
         schedule_sync_drain();
@@ -7086,6 +7197,7 @@ fn start_authenticated_sync(
             release_sync_lease(&cleanup_principal);
             stop_sync_broadcast();
         }
+        initial_sync_ready.set(true);
         online_listener.remove();
         visibility_listener.remove();
         stop_sync_safety_timer(safety_timer);
@@ -7096,7 +7208,7 @@ fn start_authenticated_sync(
     on_hint.forget();
 
     spawn_local(async move {
-        let _ =
+        let manifest_loaded =
             merge_remote_spaces(spaces, next_space_id, active_space_id, workspace_tombstones).await;
         if principal != current_sync_principal() || !sync_run_is_current(run_generation) {
             return;
@@ -7130,17 +7242,24 @@ fn start_authenticated_sync(
         if principal != current_sync_principal() || !sync_run_is_current(run_generation) {
             return;
         }
-        refresh_manifest_and_reconcile(
-            spaces,
-            next_space_id,
-            active_space_id,
-            notes,
-            groups,
-            workspace_tombstones,
-            crdt_docs,
-            run_generation,
-        )
-        .await;
+        if manifest_loaded {
+            refresh_manifest_and_reconcile(
+                spaces,
+                next_space_id,
+                active_space_id,
+                notes,
+                groups,
+                workspace_tombstones,
+                crdt_docs,
+                run_generation,
+            )
+            .await;
+        }
+        // Do not expose the account's local placeholder as an empty board
+        // while the canonical manifest and active CRDT document are still
+        // being hydrated. If the network is unavailable, release the gate
+        // after the attempted read so local-first editing remains usable.
+        initial_sync_ready.set(true);
         // Refreshing the manifest first also resolves canonical space UUIDs
         // for legacy numeric rows before any pending outbox request is sent.
         schedule_sync_drain();
@@ -9868,6 +9987,7 @@ pub fn Board() -> impl IntoView {
         surface_storage_repair(storage_status, restore_message);
     }
     let sync_started = RwSignal::new(false);
+    let initial_sync_ready = RwSignal::new(true);
     let account_state = RwSignal::new(AccountState::Checking);
     let sync_entitled = RwSignal::new(false);
     let sync_status = RwSignal::new(SyncStatus::Checking);
@@ -10168,6 +10288,7 @@ pub fn Board() -> impl IntoView {
                 last_sync_error,
                 local_sync_diagnostics,
                 transport_sync_diagnostics,
+                initial_sync_ready,
             );
         }
     });
@@ -10343,6 +10464,12 @@ pub fn Board() -> impl IntoView {
             groups: groups.get(),
             tombstones: Vec::new(),
         };
+        // Pointer moves are rendered locally at frame rate, but they should
+        // not each become a durable CRDT mutation. The final board state is
+        // queued when the interaction signal returns to idle on pointerup.
+        let interaction_in_progress = dragged.get().is_some()
+            || group_dragging.get().is_some()
+            || group_resizing.get().is_some();
         // A remote projection can be followed by a local UI edit before this
         // reactive effect runs. Compare against the live CRDT, not only the
         // projection-generation marker: remote-only work needs no new outbox
@@ -10352,11 +10479,12 @@ pub fn Board() -> impl IntoView {
             .get_untracked()
             .get(&active_id)
             .map(SpaceDoc::board);
-        let should_queue_crdt = should_queue_crdt_projection(
-            remote_projection_changed,
-            canonical_board_before.as_ref(),
-            &board,
-        );
+        let should_queue_crdt = !interaction_in_progress
+            && should_queue_crdt_projection(
+                remote_projection_changed,
+                canonical_board_before.as_ref(),
+                &board,
+            );
         let previous_board = last_projected_board
             .borrow()
             .as_ref()
@@ -10936,6 +11064,21 @@ pub fn Board() -> impl IntoView {
                     />
                 </div>
             </div>
+
+            {move || if !initial_sync_ready.get()
+                && matches!(account_state.get(), AccountState::SignedIn(_))
+            {
+                view! {
+                    <div class="pointer-events-auto absolute inset-0 z-[60] grid place-items-center bg-paper/80 p-6 backdrop-blur-[2px]">
+                        <div class="rounded-[3px] border border-ink-soft/20 bg-paper-shelf px-6 py-5 text-center shadow-xl">
+                            <p class="font-handwriting text-3xl text-ink">"opening your spaces…"</p>
+                            <p class="mt-1 text-sm text-ink-soft">"bringing the latest board state to this browser"</p>
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                ().into_any()
+            }}
 
             {move || context_menu.get().map(|menu| {
                 let menu_style = format!(
