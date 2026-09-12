@@ -9433,6 +9433,7 @@ fn NoteCard(
     drag_offset: RwSignal<Option<(f64, f64)>>,
     drag_snapshot: RwSignal<Option<BoardData>>,
     drag_origin: RwSignal<Option<(f64, f64)>>,
+    suppress_note_click: RwSignal<bool>,
     pan: RwSignal<(f64, f64)>,
     zoom: RwSignal<f64>,
 ) -> impl IntoView {
@@ -9521,6 +9522,13 @@ fn NoteCard(
         }
     };
     let edit_note = move |ev: MouseEvent| {
+        if suppress_note_click.get_untracked() {
+            // Pointerup is followed by a synthetic click in the browser. A
+            // completed drag must consume that click instead of opening the
+            // editor for the card that was just moved.
+            suppress_note_click.set(false);
+            return;
+        }
         let Some(target) = ev
             .target()
             .and_then(|target| target.dyn_into::<Element>().ok())
@@ -9556,6 +9564,7 @@ fn NoteCard(
             return;
         }
         ev.stop_propagation();
+        suppress_note_click.set(false);
         let Some(handle) = ev
             .current_target()
             .and_then(|target| target.dyn_into::<Element>().ok())
@@ -9629,6 +9638,7 @@ fn NoteCard(
                     }
                 }
             });
+            suppress_note_click.set(true);
         }
     };
     let finish_drag = move |ev: PointerEvent| {
@@ -9695,6 +9705,15 @@ fn NoteCard(
         dragged_ids.set(Vec::new());
         dragged.set(None);
         drag_offset.set(None);
+        if suppress_note_click.get_untracked()
+            && let Some(window) = web_sys::window()
+        {
+            let clear_click = Closure::once_into_js(move || suppress_note_click.set(false));
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                clear_click.unchecked_ref(),
+                250,
+            );
+        }
     };
     let open_note_context_menu = move |ev: MouseEvent| {
         ev.prevent_default();
@@ -10063,6 +10082,7 @@ pub fn Board() -> impl IntoView {
     let drag_offset = RwSignal::new(None::<(f64, f64)>);
     let drag_snapshot = RwSignal::new(None::<BoardData>);
     let drag_origin = RwSignal::new(None::<(f64, f64)>);
+    let suppress_note_click = RwSignal::new(false);
     let initial_view = load_view(initial_space_id);
     let pan = RwSignal::new(initial_view.pan);
     let zoom = RwSignal::new(initial_view.zoom);
@@ -11167,6 +11187,7 @@ pub fn Board() -> impl IntoView {
                                     drag_offset=drag_offset
                                     drag_snapshot=drag_snapshot
                                     drag_origin=drag_origin
+                                    suppress_note_click=suppress_note_click
                                     pan=pan
                                     zoom=zoom
                                 />
@@ -11557,7 +11578,7 @@ pub fn Board() -> impl IntoView {
                     </span>
                 </div>
 
-                <div class="pointer-events-auto flex min-w-0 max-w-full shrink-0 items-center gap-1 overflow-x-auto whitespace-nowrap rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:gap-2 sm:p-1.5">
+                <div class="pointer-events-auto flex w-full min-w-0 max-w-full flex-wrap items-center justify-center gap-1 rounded-md border border-ink-soft/15 bg-paper/90 p-1 shadow-md backdrop-blur-sm sm:w-auto sm:shrink-0 sm:justify-start sm:gap-2 sm:p-1.5">
                     <button
                         type="button"
                         on:click=undo
@@ -11853,7 +11874,7 @@ pub fn Board() -> impl IntoView {
                                 type="button"
                                 aria-label="Close sync details"
                                 on:click=move |_| show_sync_diagnostics.set(false)
-                                class="rounded-full px-2 py-1 text-lg leading-none text-ink-soft hover:bg-white/70 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
+                                class="grid h-8 w-8 shrink-0 place-items-center rounded-full p-0 text-xl leading-none text-ink-soft transition-colors hover:bg-ink/10 hover:text-ink focus:outline-none focus:ring-2 focus:ring-ink/30"
                             >
                                 "×"
                             </button>
