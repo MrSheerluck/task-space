@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -84,6 +85,21 @@ pub struct PostgresSyncStore {
     events: Arc<broadcast::Sender<DeliveryEvent>>,
     #[cfg(test)]
     reconcile_fault: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// JSON CRUD projection used by the simplified account-backed application.
+/// The legacy CRDT tables remain available during the pre-production cutover,
+/// but new requests use the board snapshot stored directly on `spaces`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CrudSpaceRecord {
+    pub id: EntityId,
+    pub stable_id: String,
+    pub name: String,
+    pub archived: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub deleted_at: Option<u64>,
+    pub board_version: u64,
 }
 
 const MAX_SAFE_ENTITY_ID: u64 = (1u64 << 53) - 1;
@@ -427,6 +443,215 @@ impl PostgresSyncStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn crud_list_spaces(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<CrudSpaceRecord>, PostgresStoreError> {
+        let rows = sqlx::query(
+            "SELECT space_id, stable_id::TEXT AS stable_id, name, archived,
+             (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at,
+             (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at,
+             (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT AS deleted_at,
+             board_version
+             FROM spaces
+             WHERE account_id = $1
+             ORDER BY created_at, space_id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(CrudSpaceRecord {
+                    id: to_u64(row.try_get::<i64, _>("space_id")?),
+                    stable_id: row.try_get("stable_id")?,
+                    name: row.try_get("name")?,
+                    archived: row.try_get("archived")?,
+                    created_at: row
+                        .try_get::<Option<i64>, _>("created_at")?
+                        .map(to_u64)
+                        .unwrap_or_default(),
+                    updated_at: row
+                        .try_get::<Option<i64>, _>("updated_at")?
+                        .map(to_u64)
+                        .unwrap_or_default(),
+                    deleted_at: row.try_get::<Option<i64>, _>("deleted_at")?.map(to_u64),
+                    board_version: to_u64(row.try_get::<i64, _>("board_version")?),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn crud_create_space(
+        &self,
+        account_id: &str,
+        name: &str,
+        max_spaces: u32,
+    ) -> Result<CrudSpaceRecord, PostgresStoreError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 48 {
+            return Err(PostgresStoreError::InvalidInput(
+                "space name must be between 1 and 48 characters".to_owned(),
+            ));
+        }
+        let board_json = serde_json::to_value(BoardData::default())
+            .map_err(|error| PostgresStoreError::InvalidInput(error.to_string()))?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM spaces WHERE account_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if count >= i64::from(max_spaces) {
+            return Err(PostgresStoreError::SpaceLimitReached);
+        }
+        let space_id: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(space_id), 0) + 1 FROM spaces WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let stable_id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO spaces (account_id, space_id, stable_id, name, board_json)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING space_id, stable_id::TEXT AS stable_id, name, archived,
+             (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at,
+             (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at,
+             (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT AS deleted_at, board_version",
+        )
+        .bind(account_id)
+        .bind(space_id)
+        .bind(stable_id)
+        .bind(name)
+        .bind(board_json)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(CrudSpaceRecord {
+            id: to_u64(row.try_get::<i64, _>("space_id")?),
+            stable_id: row.try_get("stable_id")?,
+            name: row.try_get("name")?,
+            archived: row.try_get("archived")?,
+            created_at: row
+                .try_get::<Option<i64>, _>("created_at")?
+                .map(to_u64)
+                .unwrap_or_default(),
+            updated_at: row
+                .try_get::<Option<i64>, _>("updated_at")?
+                .map(to_u64)
+                .unwrap_or_default(),
+            deleted_at: row.try_get::<Option<i64>, _>("deleted_at")?.map(to_u64),
+            board_version: to_u64(row.try_get::<i64, _>("board_version")?),
+        })
+    }
+
+    pub async fn crud_update_space(
+        &self,
+        account_id: &str,
+        space_id: EntityId,
+        name: Option<&str>,
+        archived: Option<bool>,
+        deleted: Option<bool>,
+    ) -> Result<CrudSpaceRecord, PostgresStoreError> {
+        validate_entity_id(space_id)?;
+        if name.is_some_and(|value| value.trim().is_empty() || value.chars().count() > 48) {
+            return Err(PostgresStoreError::InvalidInput(
+                "space name must be between 1 and 48 characters".to_owned(),
+            ));
+        }
+        let row = sqlx::query(
+            "UPDATE spaces
+             SET name = COALESCE($3, name),
+                 archived = COALESCE($4, archived),
+                 deleted_at = CASE
+                    WHEN $5 = TRUE THEN NOW()
+                    WHEN $5 = FALSE THEN NULL
+                    ELSE deleted_at
+                 END,
+                 updated_at = NOW(), metadata_version = metadata_version + 1
+             WHERE account_id = $1 AND space_id = $2
+             RETURNING space_id, stable_id::TEXT AS stable_id, name, archived,
+             (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at,
+             (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at,
+             (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT AS deleted_at, board_version",
+        )
+        .bind(account_id)
+        .bind(to_i64(space_id))
+        .bind(name.map(str::trim))
+        .bind(archived)
+        .bind(deleted)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        Ok(CrudSpaceRecord {
+            id: to_u64(row.try_get::<i64, _>("space_id")?),
+            stable_id: row.try_get("stable_id")?,
+            name: row.try_get("name")?,
+            archived: row.try_get("archived")?,
+            created_at: row
+                .try_get::<Option<i64>, _>("created_at")?
+                .map(to_u64)
+                .unwrap_or_default(),
+            updated_at: row
+                .try_get::<Option<i64>, _>("updated_at")?
+                .map(to_u64)
+                .unwrap_or_default(),
+            deleted_at: row.try_get::<Option<i64>, _>("deleted_at")?.map(to_u64),
+            board_version: to_u64(row.try_get::<i64, _>("board_version")?),
+        })
+    }
+
+    pub async fn crud_get_board(
+        &self,
+        account_id: &str,
+        space_id: EntityId,
+    ) -> Result<(u64, BoardData), PostgresStoreError> {
+        validate_entity_id(space_id)?;
+        let row = sqlx::query(
+            "SELECT board_json, board_version FROM spaces
+             WHERE account_id = $1 AND space_id = $2",
+        )
+        .bind(account_id)
+        .bind(to_i64(space_id))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        let value: serde_json::Value = row.try_get("board_json")?;
+        let board = serde_json::from_value(value)
+            .map_err(|error| PostgresStoreError::InvalidInput(error.to_string()))?;
+        Ok((to_u64(row.try_get::<i64, _>("board_version")?), board))
+    }
+
+    pub async fn crud_put_board(
+        &self,
+        account_id: &str,
+        space_id: EntityId,
+        board: &BoardData,
+    ) -> Result<u64, PostgresStoreError> {
+        validate_entity_id(space_id)?;
+        let value = serde_json::to_value(board)
+            .map_err(|error| PostgresStoreError::InvalidInput(error.to_string()))?;
+        let row = sqlx::query(
+            "UPDATE spaces
+             SET board_json = $3, board_version = board_version + 1, updated_at = NOW()
+             WHERE account_id = $1 AND space_id = $2 AND deleted_at IS NULL
+             RETURNING board_version",
+        )
+        .bind(account_id)
+        .bind(to_i64(space_id))
+        .bind(value)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PostgresStoreError::SpaceAccessDenied)?;
+        Ok(to_u64(row.try_get::<i64, _>("board_version")?))
     }
 
     pub async fn apply_metadata(

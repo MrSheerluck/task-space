@@ -1,8 +1,7 @@
 //! Shared Task Space document schema.
 //!
-//! The browser currently persists this model locally. Keeping the schema in
-//! this crate means the future API and sync worker can consume the exact same
-//! document without copying the UI's private types.
+//! The browser uses this model for both the free device-local board and the
+//! authenticated account-backed CRUD API, keeping wire and UI data aligned.
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +185,15 @@ pub struct Space {
     #[serde(default)]
     pub stable_id: String,
     pub name: String,
+    /// Guest spaces are device-local; account spaces are persisted through the
+    /// authenticated CRUD API. This flag remains for compatibility with older
+    /// saved workspaces and is always true for account-backed spaces.
+    #[serde(default)]
+    pub sync_enabled: bool,
+    /// Retained for compatibility with older saved workspaces. The simplified
+    /// product no longer exposes a per-space cloud-sync toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_override: Option<bool>,
     #[serde(default)]
     pub metadata_version: u64,
     #[serde(default)]

@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header::CACHE_CONTROL};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -25,13 +25,16 @@ use task_core::sync::{
     SyncPullRequest, SyncPullResponse, SyncPushRequest, SyncPushResponse, SyncReconcileRequest,
     SyncReconcileResponse,
 };
+use task_core::{BoardData, EntityId};
 use tokio_stream::StreamExt;
 use url::Url;
 use uuid::Uuid;
 
 use crate::dodo::{BillingInterval, DodoClient, DodoError};
 use crate::metrics::Metrics;
-use crate::postgres::{PostgresBillingStore, PostgresStoreError, PostgresSyncStore};
+use crate::postgres::{
+    CrudSpaceRecord, PostgresBillingStore, PostgresStoreError, PostgresSyncStore,
+};
 
 // EncodedUpdate values are URL-safe base64 in JSON, so the HTTP envelope is
 // larger than the decoded 2 MiB update limit. Keep a separate bounded envelope
@@ -259,6 +262,226 @@ pub fn protected_sync_router(state: SyncHttpState) -> Router {
         .with_state(state)
 }
 
+/// Authenticated HTTP CRUD surface used by the simplified application. The
+/// legacy sync router remains available to old acceptance tests during the
+/// pre-production cutover, but the running server mounts this router instead.
+pub fn protected_api_router(state: SyncHttpState) -> Router {
+    Router::new()
+        .route("/api/spaces", get(crud_list_spaces).post(crud_create_space))
+        .route(
+            "/api/spaces/{space_id}",
+            patch(crud_update_space).delete(crud_delete_space),
+        )
+        .route(
+            "/api/spaces/{space_id}/board",
+            get(crud_get_board).put(crud_put_board),
+        )
+        .route("/auth/session", get(auth_session))
+        .route("/auth/diagnostics", get(auth_diagnostics))
+        .route("/account/entitlement", get(account_entitlement))
+        .route("/billing/checkout", post(create_checkout))
+        .route("/billing/portal", post(create_billing_portal))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_session,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            observe_request,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_SYNC_REQUEST_BODY_BYTES))
+        .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct CrudCreateSpaceRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CrudUpdateSpaceRequest {
+    name: Option<String>,
+    archived: Option<bool>,
+    deleted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrudPutBoardRequest {
+    board: BoardData,
+}
+
+#[derive(Debug, Serialize)]
+struct CrudBoardResponse {
+    space_id: EntityId,
+    version: u64,
+    board: BoardData,
+}
+
+async fn crud_list_spaces(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CrudSpaceRecord>>, ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-spaces-list",
+        &account.account_id,
+        120,
+        600,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    require_sync_entitlement(&state.billing, &account.account_id).await?;
+    state
+        .store
+        .crud_list_spaces(&account.account_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn crud_create_space(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    headers: HeaderMap,
+    Json(request): Json<CrudCreateSpaceRequest>,
+) -> Result<(StatusCode, Json<CrudSpaceRecord>), ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-space-create",
+        &account.account_id,
+        120,
+        600,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    let entitlement = require_sync_entitlement(&state.billing, &account.account_id).await?;
+    let space = state
+        .store
+        .crud_create_space(&account.account_id, &request.name, entitlement.max_spaces)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(space)))
+}
+
+async fn crud_update_space(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Path(space_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<CrudUpdateSpaceRequest>,
+) -> Result<Json<CrudSpaceRecord>, ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-space-update",
+        &account.account_id,
+        240,
+        1_200,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    require_sync_entitlement(&state.billing, &account.account_id).await?;
+    state
+        .store
+        .crud_update_space(
+            &account.account_id,
+            space_id,
+            request.name.as_deref(),
+            request.archived,
+            request.deleted,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn crud_delete_space(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Path(space_id): Path<u64>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-space-delete",
+        &account.account_id,
+        120,
+        600,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    require_sync_entitlement(&state.billing, &account.account_id).await?;
+    state
+        .store
+        .crud_update_space(&account.account_id, space_id, None, Some(true), Some(true))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn crud_get_board(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Path(space_id): Path<u64>,
+    headers: HeaderMap,
+) -> Result<Json<CrudBoardResponse>, ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-board-get",
+        &account.account_id,
+        600,
+        3_000,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    require_sync_entitlement(&state.billing, &account.account_id).await?;
+    let (version, board) = state
+        .store
+        .crud_get_board(&account.account_id, space_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(CrudBoardResponse {
+        space_id,
+        version,
+        board,
+    }))
+}
+
+async fn crud_put_board(
+    State(state): State<SyncHttpState>,
+    Extension(account): Extension<AuthenticatedAccount>,
+    Path(space_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<CrudPutBoardRequest>,
+) -> Result<Json<CrudBoardResponse>, ApiError> {
+    if !state.rate_limiter.allow_account_and_ip(
+        &headers,
+        "crud-board-put",
+        &account.account_id,
+        600,
+        3_000,
+        Duration::from_secs(60),
+    ) {
+        return Err(ApiError::RateLimited);
+    }
+    require_sync_entitlement(&state.billing, &account.account_id).await?;
+    let version = state
+        .store
+        .crud_put_board(&account.account_id, space_id, &request.board)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(CrudBoardResponse {
+        space_id,
+        version,
+        board: request.board,
+    }))
+}
+
 #[derive(Clone)]
 struct MetricsState {
     metrics: Metrics,
@@ -397,6 +620,9 @@ fn metric_route(path: &str) -> &'static str {
         "/account/entitlement" => "account_entitlement",
         "/billing/checkout" => "billing_checkout",
         "/billing/portal" => "billing_portal",
+        "/api/spaces" => "crud_spaces",
+        _ if path.starts_with("/api/spaces/") && path.ends_with("/board") => "crud_board",
+        _ if path.starts_with("/api/spaces/") => "crud_space",
         _ if path.starts_with("/sync/spaces/") => "sync_space",
         _ => "other",
     }
@@ -874,7 +1100,16 @@ async fn sync_events(
             })
             .collect()
     };
-    let replay_stream = tokio_stream::iter(replay_events);
+    // Flush a comment as the first frame. This proves the response is a live
+    // SSE stream immediately instead of making mobile browsers wait for the
+    // first database event or the keep-alive timer before they consider the
+    // connection usable.
+    let connection_event = tokio_stream::once(Ok::<Event, Infallible>(
+        Event::default()
+            .comment("task-space-sync-connected")
+            .retry(Duration::from_secs(5)),
+    ));
+    let replay_stream = connection_event.chain(tokio_stream::iter(replay_events));
     let live_stream =
         tokio_stream::wrappers::BroadcastStream::new(live_receiver).filter_map(move |message| {
             match message {
@@ -896,10 +1131,14 @@ async fn sync_events(
     let mut response = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
-                .interval(Duration::from_secs(30))
+                .interval(Duration::from_secs(10))
                 .text("heartbeat"),
         )
         .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
     response.headers_mut().insert(
         CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),

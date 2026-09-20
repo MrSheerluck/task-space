@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use task_server::dodo::{DodoClient, DodoClientConfig, DodoWebhook, DodoWebhookConfig};
 use task_server::http::{
     RequestRateLimiter, SyncHttpState, add_request_id, health_router, metrics_router,
-    protected_sync_router,
+    protected_api_router,
 };
 use task_server::metrics::Metrics;
 use task_server::postgres::{PostgresBillingStore, PostgresSyncStore};
@@ -43,60 +43,15 @@ async fn main() {
         .migrate()
         .await
         .expect("database migrations should run");
-    let migrated_documents = store
-        .backfill_document_migrations()
-        .await
-        .expect("CRDT document migrations should run");
-    if migrated_documents > 0 {
-        eprintln!("materialized {migrated_documents} migrated CRDT snapshots");
-    }
-    store.start_event_listener();
     workos
         .check_readiness()
         .await
         .expect("WorkOS JWKS readiness check should pass");
-    let retention_seconds = std::env::var("SYNC_EVENT_RETENTION_SECONDS")
+    let retention_seconds = std::env::var("BILLING_RETENTION_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(90 * 24 * 60 * 60);
-    let tombstone_retention_seconds = std::env::var("SYNC_TOMBSTONE_RETENTION_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(retention_seconds);
     let metrics = Metrics::default();
-    let retention_store = store.clone();
-    let retention_metrics = metrics.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
-        loop {
-            interval.tick().await;
-            let tombstone_retention_millis = tombstone_retention_seconds.saturating_mul(1_000);
-            retention_metrics.inc("task_space_sync_compaction_runs_total");
-            match retention_store
-                .compact_documents(retention_seconds, tombstone_retention_millis, 100)
-                .await
-            {
-                Ok(compacted) if compacted > 0 => {
-                    retention_metrics.add("task_space_sync_compacted_snapshots_total", compacted);
-                    eprintln!("sync document compaction replaced {compacted} snapshots")
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    retention_metrics.inc("task_space_sync_compaction_failures_total");
-                    eprintln!("sync document compaction failed: {error}");
-                }
-            }
-            match retention_store.prune_history(retention_seconds).await {
-                Ok(deleted) => {
-                    retention_metrics.add("task_space_sync_pruned_updates_total", deleted);
-                }
-                Err(error) => {
-                    retention_metrics.inc("task_space_sync_retention_failures_total");
-                    eprintln!("sync history retention failed: {error}");
-                }
-            }
-        }
-    });
     let billing = PostgresBillingStore::new(pool);
     let billing_history_store = billing.clone();
     tokio::spawn(async move {
@@ -190,13 +145,19 @@ async fn main() {
                     .is_some_and(|origin| allowed_origins.iter().any(|allowed| allowed == origin))
             }
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             ACCEPT,
             AUTHORIZATION,
             CACHE_CONTROL,
             CONTENT_TYPE,
-            HeaderName::from_static("last-event-id"),
             HeaderName::from_static("x-request-id"),
         ])
         .expose_headers([
@@ -216,7 +177,7 @@ async fn main() {
             metrics.clone(),
             std::env::var("TASK_SPACE_METRICS_TOKEN").ok(),
         ))
-        .merge(protected_sync_router(SyncHttpState {
+        .merge(protected_api_router(SyncHttpState {
             store,
             billing,
             payments: dodo_client,
