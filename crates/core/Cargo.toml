@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v5"] }
 yrs = "0.27"
 
 [dev-dependencies]

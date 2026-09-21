@@ -1,0 +1,72 @@
+groups:
+  - name: task-space-sync
+    rules:
+      - alert: TaskSpaceApi5xx
+        expr: sum(rate(task_space_http_responses_total{status=~"5.."}[5m])) > 0
+        for: 10m
+        labels:
+          severity: page
+          owner: sync-service
+        annotations:
+          summary: Task Space API is returning 5xx responses
+          description: The API has returned 5xx responses continuously for 10 minutes.
+
+      - alert: TaskSpaceSyncReconcileFailures
+        expr: sum(rate(task_space_sync_reconcile_failures_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+          owner: sync-service
+        annotations:
+          summary: Sync reconciliation failures are sustained
+          description: Reconciliation failures have been observed continuously for 15 minutes.
+
+      - alert: TaskSpaceSyncCursorResets
+        expr: sum(increase(task_space_sync_cursor_resets_total[1h])) > 25
+        for: 10m
+        labels:
+          severity: ticket
+          owner: sync-service
+        annotations:
+          summary: Many clients are requiring full sync resets
+          description: Investigate event retention, SSE delivery, and database latency.
+
+      - alert: TaskSpaceApiRateLimited
+        expr: sum(rate(task_space_http_responses_total{status="429"}[10m])) > 1
+        for: 15m
+        labels:
+          severity: ticket
+          owner: sync-service
+        annotations:
+          summary: API rate limiting is sustained
+          description: Check abusive clients, account hot spots, and limiter sizing before raising limits.
+
+      - alert: TaskSpaceReadinessFailures
+        expr: increase(task_space_readiness_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: page
+          owner: database
+        annotations:
+          summary: Task Space is failing database-backed readiness checks
+          description: Investigate PostgreSQL availability, disk pressure, recovery state, and connection exhaustion.
+
+      - alert: TaskSpaceWebhookFailures
+        expr: sum(rate(task_space_webhook_failures_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: page
+          owner: billing
+        annotations:
+          summary: Dodo webhook processing is failing
+          description: Check webhook signatures, provider reachability, and the billing inbox.
+
+      - alert: TaskSpaceCompactionStalled
+        expr: increase(task_space_sync_compaction_runs_total[2h]) == 0
+        for: 30m
+        labels:
+          severity: ticket
+          owner: database
+        annotations:
+          summary: Sync compaction worker has not reported a run
+          description: Check the API process, scheduler, PostgreSQL connectivity, and retention logs.

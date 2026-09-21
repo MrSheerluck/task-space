@@ -5,8 +5,10 @@ use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
 use web_sys::{RequestCredentials, UrlSearchParams};
 
-use super::account::{load_account_state, remember_authenticated_session};
-use super::api::api_url;
+use super::account::{
+    load_account_state, remember_authenticated_account, remember_authenticated_session,
+};
+use super::api::{api_url, send_request_with_timeout};
 
 const PENDING_AUTH_STORAGE_KEY: &str = "task_space_pending_auth";
 
@@ -15,6 +17,8 @@ struct AuthApiResponse {
     status: String,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
     #[serde(default)]
     pending_authentication_token: Option<String>,
 }
@@ -47,8 +51,7 @@ async fn post_auth<T: Serialize>(path: &str, payload: &T) -> Result<AuthApiRespo
         .credentials(RequestCredentials::Include)
         .json(payload)
         .map_err(|_| "the form could not be sent".to_owned())?;
-    let response = builder
-        .send()
+    let response = send_request_with_timeout(builder)
         .await
         .map_err(|_| "the server could not be reached".to_owned())?;
     let status = response.status();
@@ -149,7 +152,11 @@ pub fn SignIn() -> impl IntoView {
         spawn_local(async move {
             match post_auth("/auth/sign-in", &payload).await {
                 Ok(response) if response.status == "authenticated" => {
-                    remember_authenticated_session();
+                    if let Some(account_id) = response.account_id.as_deref() {
+                        remember_authenticated_account(account_id);
+                    } else {
+                        remember_authenticated_session();
+                    }
                     redirect("/app")
                 }
                 Ok(response) if response.status == "verification_required" => {
@@ -239,7 +246,11 @@ pub fn SignUp() -> impl IntoView {
         spawn_local(async move {
             match post_auth("/auth/sign-up", &payload).await {
                 Ok(response) if response.status == "authenticated" => {
-                    remember_authenticated_session();
+                    if let Some(account_id) = response.account_id.as_deref() {
+                        remember_authenticated_account(account_id);
+                    } else {
+                        remember_authenticated_session();
+                    }
                     redirect("/app")
                 }
                 Ok(response) if response.status == "verification_required" => {
@@ -475,8 +486,12 @@ pub fn VerifyEmail() -> impl IntoView {
         };
         spawn_local(async move {
             match post_auth("/auth/verify-email", &payload).await {
-                Ok(_) => {
-                    remember_authenticated_session();
+                Ok(response) => {
+                    if let Some(account_id) = response.account_id.as_deref() {
+                        remember_authenticated_account(account_id);
+                    } else {
+                        remember_authenticated_session();
+                    }
                     forget_pending_authentication_token();
                     redirect("/app")
                 }

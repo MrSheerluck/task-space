@@ -61,12 +61,14 @@
 @layer components {
   .context-menu-item {
     width: 100%;
+    min-height: 2.75rem;
     border-radius: 3px;
-    padding: 0.4rem 0.5rem;
+    padding: 0.65rem 0.6rem;
     text-align: left;
     font-size: 0.8rem;
     line-height: 1.25rem;
     color: var(--color-ink-soft);
+    touch-action: manipulation;
   }
 
   .context-menu-item:hover,
@@ -96,5 +98,39 @@
   .context-menu-item:disabled {
     cursor: not-allowed;
     opacity: 0.35;
+  }
+
+  #task-space-board {
+    touch-action: none;
+    overscroll-behavior: none;
+    user-select: none;
+  }
+
+  button,
+  a,
+  label {
+    min-height: 2.75rem;
+    touch-action: manipulation;
+  }
+
+  @media (max-width: 639px) {
+    .task-space-safe-top {
+      padding-top: max(0.75rem, env(safe-area-inset-top));
+    }
+
+    .task-space-safe-bottom {
+      padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
   }
 }

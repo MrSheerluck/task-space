@@ -192,6 +192,11 @@ fn Header() -> impl IntoView {
                             "start writing"
                         </a>
                     }.into_any(),
+                    AccountState::Expired => view! {
+                        <a href="/signin" class="hover:text-ink">
+                            "sign in again"
+                        </a>
+                    }.into_any(),
                     AccountState::Unavailable => view! {
                         <span class="text-xs text-ink-soft">"account check unavailable"</span>
                     }.into_any(),

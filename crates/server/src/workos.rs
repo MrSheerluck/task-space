@@ -9,19 +9,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::{COOKIE, HeaderValue, SET_COOKIE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use crate::http::{AuthError, AuthenticatedAccount, SessionVerifier};
+use crate::http::{AuthError, AuthenticatedAccount, RequestRateLimiter, SessionVerifier};
 
 const STATE_TTL: Duration = Duration::from_secs(600);
 const JWKS_TTL: Duration = Duration::from_secs(300);
@@ -29,6 +33,10 @@ const SESSION_MAX_AGE: u64 = 3_600;
 const REFRESH_MAX_AGE: u64 = 2_592_000;
 const PENDING_AUTH_MAX_AGE: u64 = 600;
 const PENDING_AUTH_COOKIE: &str = "task_space_pending_auth";
+const OAUTH_STATE_COOKIE: &str = "task_space_oauth_state";
+const MAX_PENDING_STATES: usize = 4_096;
+const MAX_WORKOS_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_IDENTITY_CLAIM_LEN: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct WorkOsAuthConfig {
@@ -38,7 +46,9 @@ pub struct WorkOsAuthConfig {
     pub post_login_redirect_uri: String,
     pub issuer: String,
     pub token_issuer: Option<String>,
+    pub audience: Option<String>,
     pub cookie_name: String,
+    pub allowed_origins: Vec<String>,
 }
 
 impl WorkOsAuthConfig {
@@ -54,8 +64,12 @@ impl WorkOsAuthConfig {
             token_issuer: std::env::var("WORKOS_TOKEN_ISSUER")
                 .ok()
                 .filter(|issuer| !issuer.trim().is_empty()),
+            audience: std::env::var("WORKOS_AUDIENCE")
+                .ok()
+                .filter(|audience| !audience.trim().is_empty()),
             cookie_name: std::env::var("WORKOS_SESSION_COOKIE")
                 .unwrap_or_else(|_| "task_space_session".to_owned()),
+            allowed_origins: configured_allowed_origins(),
         })
     }
 }
@@ -94,6 +108,7 @@ struct WorkOsAuthInner {
     client: Client,
     pending_states: Mutex<HashMap<String, Instant>>,
     jwks: tokio::sync::RwLock<Option<CachedJwks>>,
+    request_limiter: RequestRateLimiter,
 }
 
 #[derive(Clone)]
@@ -123,6 +138,8 @@ struct WorkOsClaims {
     iss: String,
     #[serde(rename = "exp")]
     _exp: usize,
+    #[serde(rename = "nbf", default)]
+    _nbf: Option<usize>,
     #[serde(default)]
     org_id: Option<String>,
 }
@@ -155,6 +172,8 @@ struct AuthResponse {
     status: &'static str,
     message: Option<String>,
     email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_authentication_token: Option<String>,
 }
@@ -206,23 +225,61 @@ impl WorkOsAuth {
                 "credentials, redirect URI, and cookie name are required".to_owned(),
             ));
         }
-        Url::parse(&config.redirect_uri)
+        if config.cookie_name.len() > 64
+            || !config.cookie_name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(WorkOsError::InvalidConfiguration(
+                "session cookie name contains unsupported characters".to_owned(),
+            ));
+        }
+        let redirect_uri = Url::parse(&config.redirect_uri)
             .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+        if !matches!(redirect_uri.scheme(), "http" | "https")
+            || redirect_uri.host_str().is_none()
+            || !redirect_uri.username().is_empty()
+            || redirect_uri.password().is_some()
+        {
+            return Err(WorkOsError::InvalidConfiguration(
+                "redirect URI must be an origin-owned HTTP(S) URL".to_owned(),
+            ));
+        }
+        if redirect_uri.scheme() == "http"
+            && !is_local_development_host(redirect_uri.host_str().unwrap_or_default())
+        {
+            return Err(WorkOsError::InvalidConfiguration(
+                "non-local redirect URI must use HTTPS".to_owned(),
+            ));
+        }
         if config.post_login_redirect_uri.starts_with("http://")
             || config.post_login_redirect_uri.starts_with("https://")
         {
-            Url::parse(&config.post_login_redirect_uri)
+            let post_login = Url::parse(&config.post_login_redirect_uri)
                 .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+            if post_login.host_str().is_none()
+                || !post_login.username().is_empty()
+                || post_login.password().is_some()
+            {
+                return Err(WorkOsError::InvalidConfiguration(
+                    "post-login redirect URL must not contain credentials".to_owned(),
+                ));
+            }
+            if post_login.scheme() == "http"
+                && !is_local_development_host(post_login.host_str().unwrap_or_default())
+            {
+                return Err(WorkOsError::InvalidConfiguration(
+                    "non-local post-login redirect must use HTTPS".to_owned(),
+                ));
+            }
         } else if !config.post_login_redirect_uri.starts_with('/') {
             return Err(WorkOsError::InvalidConfiguration(
                 "post-login redirect must be an absolute URL or path".to_owned(),
             ));
         }
-        Url::parse(&config.issuer)
-            .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+        validate_service_url(&config.issuer, "issuer")?;
         if let Some(token_issuer) = config.token_issuer.as_deref() {
-            Url::parse(token_issuer)
-                .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?;
+            validate_service_url(token_issuer, "token issuer")?;
         }
 
         Ok(Self {
@@ -234,6 +291,7 @@ impl WorkOsAuth {
                     .map_err(|error| WorkOsError::InvalidConfiguration(error.to_string()))?,
                 pending_states: Mutex::new(HashMap::new()),
                 jwks: tokio::sync::RwLock::new(None),
+                request_limiter: RequestRateLimiter::default(),
             }),
         })
     }
@@ -244,6 +302,27 @@ impl WorkOsAuth {
 
     pub fn refresh_cookie_name(&self) -> String {
         format!("{}_refresh", self.inner.config.cookie_name)
+    }
+
+    /// Verify the configured WorkOS JWKS endpoint before accepting traffic.
+    /// Authentication requests can still refresh the cache later for key
+    /// rotation, but startup should fail rather than serving an instance that
+    /// cannot verify any session.
+    pub async fn check_readiness(&self) -> Result<(), WorkOsError> {
+        let keys = self
+            .fetch_jwks(true)
+            .await
+            .map_err(|_| WorkOsError::Request("WorkOS JWKS is unavailable".to_owned()))?;
+        if keys
+            .iter()
+            .any(|key| key.kty == "RSA" && key.n.is_some() && key.e.is_some())
+        {
+            Ok(())
+        } else {
+            Err(WorkOsError::InvalidResponse(
+                "WorkOS JWKS did not contain a usable RSA key".to_owned(),
+            ))
+        }
     }
 
     pub fn authorization_url(&self, screen_hint: &str) -> Result<String, WorkOsError> {
@@ -420,23 +499,10 @@ impl WorkOsAuth {
         if !response.status().is_success() {
             return Err(self.provider_error(response).await);
         }
-        let response = response
-            .json::<WorkOsAuthenticateResponse>()
+        let response = bounded_json_response::<WorkOsAuthenticateResponse>(response)
             .await
-            .map_err(|error| WorkOsError::InvalidResponse(error.to_string()))?;
-        let account_id = response
-            .organization_id
-            .clone()
-            .unwrap_or_else(|| response.user.id.clone());
-        Ok(WorkOsSession {
-            account: AuthenticatedAccount {
-                user_id: response.user.id,
-                account_id,
-                session_id: String::new(),
-            },
-            access_token: response.access_token,
-            refresh_token: response.refresh_token,
-        })
+            .map_err(WorkOsError::InvalidResponse)?;
+        self.session_from_authenticate_response(response)
     }
 
     async fn authenticate(
@@ -460,10 +526,9 @@ impl WorkOsAuth {
         if !response.status().is_success() {
             return Err(self.provider_error(response).await);
         }
-        let response = response
-            .json::<WorkOsAuthenticateResponse>()
+        let response = bounded_json_response::<WorkOsAuthenticateResponse>(response)
             .await
-            .map_err(|error| WorkOsError::InvalidResponse(error.to_string()))?;
+            .map_err(WorkOsError::InvalidResponse)?;
         self.session_from_authenticate_response(response)
     }
 
@@ -471,13 +536,34 @@ impl WorkOsAuth {
         &self,
         response: WorkOsAuthenticateResponse,
     ) -> Result<WorkOsSession, WorkOsError> {
+        if response.access_token.trim().is_empty()
+            || response.refresh_token.trim().is_empty()
+            || response.access_token.len() > 16 * 1024
+            || response.refresh_token.len() > 16 * 1024
+        {
+            return Err(WorkOsError::InvalidResponse(
+                "WorkOS returned an invalid session token".to_owned(),
+            ));
+        }
+        let user_id = response.user.id.trim().to_owned();
         let account_id = response
             .organization_id
-            .clone()
-            .unwrap_or_else(|| response.user.id.clone());
+            .as_deref()
+            .unwrap_or(&user_id)
+            .trim()
+            .to_owned();
+        if user_id.is_empty()
+            || account_id.is_empty()
+            || user_id.len() > MAX_IDENTITY_CLAIM_LEN
+            || account_id.len() > MAX_IDENTITY_CLAIM_LEN
+        {
+            return Err(WorkOsError::InvalidResponse(
+                "WorkOS returned invalid identity claims".to_owned(),
+            ));
+        }
         Ok(WorkOsSession {
             account: AuthenticatedAccount {
-                user_id: response.user.id,
+                user_id,
                 account_id,
                 session_id: String::new(),
             },
@@ -488,9 +574,10 @@ impl WorkOsAuth {
 
     async fn provider_error(&self, response: reqwest::Response) -> WorkOsError {
         let status = response.status().as_u16();
-        let body = response
-            .json::<serde_json::Value>()
+        let body = bounded_response_bytes(response)
             .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .unwrap_or_default();
         let details = body.get("error").unwrap_or(&body);
         let details = serde_json::from_value::<WorkOsApiErrorBody>(details.clone()).ok();
@@ -531,7 +618,7 @@ impl WorkOsAuth {
             self.inner.config.issuer.trim_end_matches('/'),
             self.inner.config.client_id
         );
-        let keys = self
+        let response = self
             .inner
             .client
             .get(endpoint)
@@ -539,8 +626,8 @@ impl WorkOsAuth {
             .await
             .map_err(|_| AuthError::VerificationFailed)?
             .error_for_status()
-            .map_err(|_| AuthError::VerificationFailed)?
-            .json::<WorkOsJwkSet>()
+            .map_err(|_| AuthError::VerificationFailed)?;
+        let keys = bounded_json_response::<WorkOsJwkSet>(response)
             .await
             .map_err(|_| AuthError::VerificationFailed)?
             .keys;
@@ -553,11 +640,24 @@ impl WorkOsAuth {
 
     fn create_state(&self) -> Result<String, WorkOsError> {
         let state = Uuid::new_v4().to_string();
-        self.inner
+        let mut states = self
+            .inner
             .pending_states
             .lock()
-            .map_err(|_| WorkOsError::InvalidState)?
-            .insert(state.clone(), Instant::now());
+            .map_err(|_| WorkOsError::InvalidState)?;
+        let now = Instant::now();
+        states.retain(|_, created| now.duration_since(*created) <= STATE_TTL);
+        states.insert(state.clone(), now);
+        while states.len() > MAX_PENDING_STATES {
+            let oldest = states
+                .iter()
+                .min_by_key(|(_, created)| **created)
+                .map(|(state, _)| state.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            states.remove(&oldest);
+        }
         Ok(state)
     }
 }
@@ -579,6 +679,13 @@ impl SessionVerifier for WorkOsAuth {
             );
             return Err(AuthError::VerificationFailed);
         }
+        let token_kid = match header.kid.as_deref().filter(|kid| !kid.trim().is_empty()) {
+            Some(kid) if kid.len() <= 256 => kid,
+            _ => {
+                eprintln!("auth verification failed: JWT header has no usable key id");
+                return Err(AuthError::VerificationFailed);
+            }
+        };
         let mut keys = match self.fetch_jwks(false).await {
             Ok(keys) => keys,
             Err(error) => {
@@ -588,7 +695,7 @@ impl SessionVerifier for WorkOsAuth {
         };
         let mut jwk = keys
             .iter()
-            .find(|key| key.kid.as_deref() == header.kid.as_deref())
+            .find(|key| key.kid.as_deref() == Some(token_kid))
             .filter(|key| key.kty == "RSA")
             .cloned();
         // WorkOS can rotate signing keys while our short-lived JWKS cache is
@@ -600,7 +707,7 @@ impl SessionVerifier for WorkOsAuth {
             keys = fresh_keys;
             jwk = keys
                 .iter()
-                .find(|key| key.kid.as_deref() == header.kid.as_deref())
+                .find(|key| key.kid.as_deref() == Some(token_kid))
                 .filter(|key| key.kty == "RSA")
                 .cloned();
         }
@@ -652,8 +759,13 @@ impl SessionVerifier for WorkOsAuth {
         }
 
         let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_nbf = true;
         validation.set_issuer(&allowed_issuers);
-        validation.validate_aud = false;
+        if let Some(audience) = self.inner.config.audience.as_deref() {
+            validation.set_audience(&[audience]);
+        } else {
+            validation.validate_aud = false;
+        }
         let token = match decode::<WorkOsClaims>(bearer_token, &key, &validation) {
             Ok(token) => token,
             Err(error) => {
@@ -671,11 +783,29 @@ impl SessionVerifier for WorkOsAuth {
             );
             return Err(AuthError::VerificationFailed);
         }
-        let user_id = token.claims.sub;
+        let user_id = token.claims.sub.trim().to_owned();
+        let session_id = token.claims.sid.trim().to_owned();
+        let account_id = token
+            .claims
+            .org_id
+            .as_deref()
+            .unwrap_or(&user_id)
+            .trim()
+            .to_owned();
+        if user_id.is_empty()
+            || session_id.is_empty()
+            || account_id.is_empty()
+            || user_id.len() > MAX_IDENTITY_CLAIM_LEN
+            || session_id.len() > MAX_IDENTITY_CLAIM_LEN
+            || account_id.len() > MAX_IDENTITY_CLAIM_LEN
+        {
+            eprintln!("auth verification failed: required identity claim is empty");
+            return Err(AuthError::VerificationFailed);
+        }
         Ok(AuthenticatedAccount {
-            user_id: user_id.clone(),
-            account_id: token.claims.org_id.unwrap_or(user_id),
-            session_id: token.claims.sid,
+            user_id,
+            account_id,
+            session_id,
         })
     }
 }
@@ -689,16 +819,59 @@ pub fn router(auth: Arc<WorkOsAuth>) -> Router {
         .route("/auth/password-reset", post(request_password_reset))
         .route("/auth/password-reset/confirm", post(confirm_password_reset))
         .route("/auth/refresh", axum::routing::post(refresh))
-        .route("/auth/logout", get(logout))
+        .route("/auth/logout", post(logout))
+        // Every authentication mutation is protected against cross-site
+        // form/login CSRF, including endpoints that do not yet carry a
+        // session cookie.
+        .layer(middleware::from_fn_with_state(
+            auth.clone(),
+            require_auth_origin,
+        ))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(auth)
 }
 
-async fn sign_in(State(auth): State<Arc<WorkOsAuth>>) -> Result<Redirect, AuthRouteError> {
-    Ok(Redirect::temporary(&auth.authorization_url("sign-in")?))
+async fn require_auth_origin(
+    State(auth): State<Arc<WorkOsAuth>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some((route, limit)) = auth_rate_limit(request.uri().path())
+        && !auth.inner.request_limiter.allow_ip(
+            request.headers(),
+            route,
+            limit,
+            Duration::from_secs(60),
+        )
+    {
+        return AuthRouteError::RateLimited.into_response();
+    }
+    if request.method() == axum::http::Method::POST
+        && ensure_same_site_request(request.headers(), &auth.inner.config.allowed_origins).is_err()
+    {
+        return AuthRouteError::CsrfRejected.into_response();
+    }
+    next.run(request).await
 }
 
-async fn sign_up(State(auth): State<Arc<WorkOsAuth>>) -> Result<Redirect, AuthRouteError> {
-    Ok(Redirect::temporary(&auth.authorization_url("sign-up")?))
+fn auth_rate_limit(path: &str) -> Option<(&'static str, usize)> {
+    Some(match path {
+        "/auth/sign-in" | "/auth/sign-up" => ("auth-password", 20),
+        "/auth/verify-email" => ("auth-verify", 30),
+        "/auth/password-reset" | "/auth/password-reset/confirm" => ("auth-reset", 20),
+        "/auth/refresh" => ("auth-refresh", 120),
+        "/auth/logout" => ("auth-logout", 120),
+        "/auth/callback" => ("auth-callback", 60),
+        _ => return None,
+    })
+}
+
+async fn sign_in(State(auth): State<Arc<WorkOsAuth>>) -> Result<Response, AuthRouteError> {
+    auth.authorization_redirect("sign-in")
+}
+
+async fn sign_up(State(auth): State<Arc<WorkOsAuth>>) -> Result<Response, AuthRouteError> {
+    auth.authorization_redirect("sign-up")
 }
 
 async fn password_sign_in(
@@ -714,11 +887,12 @@ async fn password_sign_in(
             code,
             pending_authentication_token: Some(token),
             ..
-        }) if code == "email_verification_required" => {
+        }) if code == "email_verification_required" && token.len() <= 8 * 1024 => {
             let mut response = Json(AuthResponse {
                 status: "verification_required",
                 message: Some("check your email for the verification code".to_owned()),
                 email: Some(credentials.email.trim().to_owned()),
+                account_id: None,
                 pending_authentication_token: Some(token.clone()),
             })
             .into_response();
@@ -773,6 +947,12 @@ async fn verify_email(
             return auth.user_facing_error(error, "your verification session has expired");
         }
     };
+    if pending_token.len() > 8 * 1024 {
+        return auth.user_facing_error(
+            WorkOsError::InvalidState,
+            "your verification session has expired",
+        );
+    }
     match auth
         .authenticate_email_verification(&request, &pending_token)
         .await
@@ -798,6 +978,7 @@ async fn request_password_reset(
             status: "reset_requested",
             message: Some("if that email has an account, a reset link is on its way".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -805,6 +986,7 @@ async fn request_password_reset(
             status: "reset_requested",
             message: Some("if that email has an account, a reset link is on its way".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -816,7 +998,11 @@ async fn confirm_password_reset(
     State(auth): State<Arc<WorkOsAuth>>,
     Json(request): Json<PasswordResetConfirmation>,
 ) -> Response {
-    if request.token.trim().is_empty() || request.new_password.trim().len() < 10 {
+    if request.token.trim().is_empty()
+        || request.token.len() > 8 * 1024
+        || request.new_password.trim().len() < 10
+        || request.new_password.len() > 1024
+    {
         return json_error(
             StatusCode::BAD_REQUEST,
             "use a valid reset link and a password of at least 10 characters",
@@ -827,6 +1013,7 @@ async fn confirm_password_reset(
             status: "password_reset",
             message: Some("your password has been reset".to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         })
         .into_response(),
@@ -838,7 +1025,7 @@ fn validate_credentials(credentials: &PasswordCredentials) -> Result<(), &'stati
     if !is_valid_email(&credentials.email) {
         return Err("enter a valid email address");
     }
-    if credentials.password.trim().len() < 10 {
+    if credentials.password.trim().len() < 10 || credentials.password.len() > 1024 {
         return Err("your password must be at least 10 characters");
     }
     Ok(())
@@ -847,6 +1034,7 @@ fn validate_credentials(credentials: &PasswordCredentials) -> Result<(), &'stati
 fn is_valid_email(email: &str) -> bool {
     let email = email.trim();
     email.len() >= 3
+        && email.len() <= 320
         && email.contains('@')
         && email
             .rsplit_once('@')
@@ -854,16 +1042,22 @@ fn is_valid_email(email: &str) -> bool {
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
-    (
+    let mut response = (
         status,
         Json(AuthResponse {
             status: "error",
             message: Some(message.to_owned()),
             email: None,
+            account_id: None,
             pending_authentication_token: None,
         }),
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -874,15 +1068,36 @@ struct AuthCallbackQuery {
 
 async fn callback(
     State(auth): State<Arc<WorkOsAuth>>,
+    headers: HeaderMap,
     Query(query): Query<AuthCallbackQuery>,
 ) -> Result<Response, AuthRouteError> {
     let state = query.state.as_deref().ok_or(WorkOsError::InvalidState)?;
-    auth.consume_state(state)?;
+    let state_cookie = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| cookie_value(cookies, OAUTH_STATE_COOKIE))
+        .ok_or(WorkOsError::InvalidState)?;
+    if state_cookie != state {
+        return Err(WorkOsError::InvalidState.into());
+    }
+    // The HttpOnly, host-only state cookie is the cross-instance binding. The
+    // in-memory record remains a best-effort replay guard on the same process,
+    // but a callback routed to another instance is still valid.
+    let _ = auth.consume_state(state);
     let session = auth
         .exchange_code(query.code.as_deref().ok_or(WorkOsError::MissingCode)?)
         .await?;
     let mut response = Redirect::to(&auth.inner.config.post_login_redirect_uri).into_response();
     let secure = auth.secure_cookie_suffix();
+    let state_cookie = format!(
+        "{OAUTH_STATE_COOKIE}=; Path=/; HttpOnly{}; SameSite=Lax; Max-Age=0",
+        secure
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&state_cookie)
+            .map_err(|error| WorkOsError::InvalidResponse(error.to_string()))?,
+    );
     let cookie = format!(
         "{}={}; Path=/; HttpOnly{}; SameSite=Lax; Max-Age={}",
         auth.cookie_name(),
@@ -914,6 +1129,7 @@ async fn refresh(
     State(auth): State<Arc<WorkOsAuth>>,
     headers: HeaderMap,
 ) -> Result<Response, AuthRouteError> {
+    ensure_same_site_request(&headers, &auth.inner.config.allowed_origins)?;
     let refresh_token = headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -942,10 +1158,17 @@ async fn refresh(
         HeaderValue::from_str(&rotated_refresh_cookie)
             .map_err(|error| WorkOsError::InvalidResponse(error.to_string()))?,
     );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
     Ok(response)
 }
 
-async fn logout(State(auth): State<Arc<WorkOsAuth>>) -> Response {
+async fn logout(State(auth): State<Arc<WorkOsAuth>>, headers: HeaderMap) -> Response {
+    if let Err(error) = ensure_same_site_request(&headers, &auth.inner.config.allowed_origins) {
+        return error.into_response();
+    }
     let secure = auth.secure_cookie_suffix();
     let cookie = format!(
         "{}=; Path=/; HttpOnly{}; SameSite=Lax; Max-Age=0",
@@ -956,6 +1179,7 @@ async fn logout(State(auth): State<Arc<WorkOsAuth>>) -> Response {
         status: "signed_out",
         message: None,
         email: None,
+        account_id: None,
         pending_authentication_token: None,
     })
     .into_response();
@@ -972,16 +1196,108 @@ async fn logout(State(auth): State<Arc<WorkOsAuth>>) -> Response {
         SET_COOKIE,
         HeaderValue::from_str(&refresh_cookie).expect("configured cookie name should be valid"),
     );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
     response
 }
 
+fn ensure_same_site_request(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+) -> Result<(), AuthRouteError> {
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return Err(AuthRouteError::CsrfRejected);
+    }
+    let fetch_site = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    if fetch_site.is_some_and(|value| value.eq_ignore_ascii_case("same-origin")) {
+        return Ok(());
+    }
+    let source = headers
+        .get("origin")
+        .or_else(|| headers.get("referer"))
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AuthRouteError::CsrfRejected)?;
+    let url = Url::parse(source).map_err(|_| AuthRouteError::CsrfRejected)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AuthRouteError::CsrfRejected);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AuthRouteError::CsrfRejected);
+    }
+    let source_host = url.host_str().ok_or(AuthRouteError::CsrfRejected)?;
+    let request_host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let source_host_authority = if source_host.contains(':') && !source_host.starts_with('[') {
+        format!("[{source_host}]")
+    } else {
+        source_host.to_owned()
+    };
+    let source_authority = match url.port() {
+        Some(port) => format!("{source_host_authority}:{port}"),
+        None => source_host_authority,
+    };
+    let source_origin = format!("{}://{source_authority}", url.scheme());
+    if allowed_origins
+        .iter()
+        .any(|origin| origin == &source_origin)
+    {
+        return Ok(());
+    }
+    let request_host_name = Url::parse(&format!("http://{request_host}"))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let local_dev = matches!(source_host, "localhost" | "127.0.0.1" | "::1")
+        && request_host_name
+            .as_deref()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+    // Production origins must be explicitly configured. Loopback origins are
+    // the only implicit exception for a local UI/API split-port setup.
+    if !local_dev {
+        return Err(AuthRouteError::CsrfRejected);
+    }
+    Ok(())
+}
+
 impl WorkOsAuth {
+    fn authorization_redirect(&self, screen_hint: &str) -> Result<Response, AuthRouteError> {
+        let location = self.authorization_url(screen_hint)?;
+        let state = Url::parse(&location)
+            .ok()
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .ok_or(WorkOsError::InvalidState)?;
+        let mut response = Redirect::temporary(&location).into_response();
+        let cookie = format!(
+            "{OAUTH_STATE_COOKIE}={state}; Path=/; HttpOnly{}; SameSite=Lax; Max-Age={}",
+            self.secure_cookie_suffix(),
+            STATE_TTL.as_secs()
+        );
+        set_cookie(&mut response, &cookie)?;
+        Ok(response)
+    }
+
     fn secure_cookie_suffix(&self) -> &'static str {
-        Url::parse(&self.inner.config.redirect_uri)
+        if Url::parse(&self.inner.config.redirect_uri)
             .ok()
             .is_some_and(|url| url.scheme() == "https")
-            .then_some("; Secure")
-            .unwrap_or_default()
+        {
+            "; Secure"
+        } else {
+            ""
+        }
     }
 
     fn authenticated_response(&self, session: WorkOsSession) -> Response {
@@ -989,6 +1305,7 @@ impl WorkOsAuth {
             status: "authenticated",
             message: None,
             email: None,
+            account_id: Some(session.account.account_id.clone()),
             pending_authentication_token: None,
         })
         .into_response();
@@ -1142,6 +1459,8 @@ fn cookie_value(cookies: &str, cookie_name: &str) -> Option<String> {
 #[derive(Debug)]
 enum AuthRouteError {
     WorkOs(WorkOsError),
+    CsrfRejected,
+    RateLimited,
 }
 
 impl From<WorkOsError> for AuthRouteError {
@@ -1152,7 +1471,11 @@ impl From<WorkOsError> for AuthRouteError {
 
 impl IntoResponse for AuthRouteError {
     fn into_response(self) -> Response {
+        let is_csrf_rejected = matches!(&self, Self::CsrfRejected);
+        let is_rate_limited = matches!(&self, Self::RateLimited);
         let status = match self {
+            Self::CsrfRejected => axum::http::StatusCode::FORBIDDEN,
+            Self::RateLimited => axum::http::StatusCode::TOO_MANY_REQUESTS,
             Self::WorkOs(WorkOsError::Request(_))
             | Self::WorkOs(WorkOsError::InvalidResponse(_)) => axum::http::StatusCode::BAD_GATEWAY,
             Self::WorkOs(WorkOsError::InvalidState) | Self::WorkOs(WorkOsError::MissingCode) => {
@@ -1166,10 +1489,333 @@ impl IntoResponse for AuthRouteError {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-        (status, format!("authentication failed: {self:?}")).into_response()
+        // Do not serialize provider details, authorization codes, refresh
+        // tokens, or pending-authentication tokens into a browser response.
+        // Those fields are useful only to bounded server-side diagnostics.
+        let message = if is_rate_limited {
+            "too many authentication requests; please try again later"
+        } else if is_csrf_rejected {
+            "request origin was rejected"
+        } else {
+            "authentication failed"
+        };
+        let mut response = (status, message).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        if is_rate_limited {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("60"),
+            );
+        }
+        response
     }
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    origin_from_parsed_url(&url)
+}
+
+fn configured_allowed_origins() -> Vec<String> {
+    if let Ok(value) = std::env::var("TASK_SPACE_ALLOWED_ORIGINS") {
+        // Presence of the explicit variable is authoritative, even if an
+        // operator mistyped an origin. Falling back in that case could widen
+        // a deliberately restricted production policy.
+        return value.split(',').filter_map(normalize_origin).collect();
+    }
+    [
+        "WORKOS_POST_LOGIN_REDIRECT_URI",
+        "DODO_PAYMENTS_RETURN_URL",
+        "WORKOS_REDIRECT_URI",
+    ]
+    .into_iter()
+    .filter_map(|variable| std::env::var(variable).ok())
+    .filter_map(|value| origin_from_url(&value))
+    .fold(Vec::new(), |mut origins, origin| {
+        if !origins.iter().any(|existing| existing == &origin) {
+            origins.push(origin);
+        }
+        origins
+    })
+}
+
+fn origin_from_url(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    origin_from_parsed_url(&url)
+}
+
+fn origin_from_parsed_url(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    Some(format!("{}://{authority}", url.scheme()))
+}
+
+fn validate_service_url(value: &str, label: &str) -> Result<(), WorkOsError> {
+    let url = Url::parse(value).map_err(|error| {
+        WorkOsError::InvalidConfiguration(format!("{label} is invalid: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.scheme() == "http"
+            && !is_local_development_host(url.host_str().unwrap_or_default()))
+    {
+        return Err(WorkOsError::InvalidConfiguration(format!(
+            "{label} must be an HTTP(S) URL without credentials, query, or fragment"
+        )));
+    }
+    Ok(())
+}
+
+fn is_local_development_host(host: &str) -> bool {
+    matches!(
+        host.trim_matches(['[', ']']),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+async fn bounded_response_bytes(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_WORKOS_RESPONSE_BYTES {
+            return Err("WorkOS response is too large".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn bounded_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    let bytes = bounded_response_bytes(response).await?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 fn required_env(name: &'static str) -> Result<String, WorkOsError> {
     std::env::var(name).map_err(|_| WorkOsError::MissingEnvironment(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::{HOST, ORIGIN};
+
+    fn auth_config() -> WorkOsAuthConfig {
+        WorkOsAuthConfig {
+            api_key: "sk_test_example".to_owned(),
+            client_id: "client_example".to_owned(),
+            redirect_uri: "http://localhost:3000/auth/callback".to_owned(),
+            post_login_redirect_uri: "/app".to_owned(),
+            issuer: "https://api.workos.com".to_owned(),
+            token_issuer: None,
+            audience: None,
+            cookie_name: "task_space_session".to_owned(),
+            allowed_origins: vec!["http://localhost:8080".to_owned()],
+        }
+    }
+
+    #[test]
+    fn auth_service_urls_cannot_use_non_http_schemes_or_credentials() {
+        let mut config = auth_config();
+        config.issuer = "file:///tmp/workos".to_owned();
+        assert!(matches!(
+            WorkOsAuth::new(config),
+            Err(WorkOsError::InvalidConfiguration(message))
+                if message.contains("issuer")
+        ));
+
+        let mut config = auth_config();
+        config.redirect_uri = "http://auth.example.com/callback".to_owned();
+        assert!(matches!(
+            WorkOsAuth::new(config),
+            Err(WorkOsError::InvalidConfiguration(message))
+                if message.contains("redirect URI")
+        ));
+
+        let mut config = auth_config();
+        config.token_issuer = Some("https://user:pass@example.com".to_owned());
+        assert!(matches!(
+            WorkOsAuth::new(config),
+            Err(WorkOsError::InvalidConfiguration(message))
+                if message.contains("token issuer")
+        ));
+    }
+
+    #[test]
+    fn authorization_state_cache_is_bounded() {
+        let auth = WorkOsAuth::new(auth_config()).expect("test auth config should be valid");
+        for _ in 0..(MAX_PENDING_STATES + 32) {
+            auth.create_state().expect("state should be generated");
+        }
+        assert!(
+            auth.inner
+                .pending_states
+                .lock()
+                .expect("state lock should not be poisoned")
+                .len()
+                <= MAX_PENDING_STATES
+        );
+    }
+
+    #[test]
+    fn csrf_accepts_configured_origin_and_rejects_cross_site() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
+        headers.insert(HOST, HeaderValue::from_static("api.example.com"));
+        let allowed = vec!["https://app.example.com".to_owned()];
+        assert!(ensure_same_site_request(&headers, &allowed).is_ok());
+
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(matches!(
+            ensure_same_site_request(&headers, &allowed),
+            Err(AuthRouteError::CsrfRejected)
+        ));
+    }
+
+    #[test]
+    fn csrf_rejects_missing_or_untrusted_origin() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            ensure_same_site_request(&headers, &[]),
+            Err(AuthRouteError::CsrfRejected)
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        headers.insert(HOST, HeaderValue::from_static("api.example.com"));
+        assert!(matches!(
+            ensure_same_site_request(&headers, &[]),
+            Err(AuthRouteError::CsrfRejected)
+        ));
+    }
+
+    #[test]
+    fn csrf_does_not_trust_localhost_origin_for_a_production_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:8080"));
+        headers.insert(HOST, HeaderValue::from_static("api.example.com"));
+        assert!(matches!(
+            ensure_same_site_request(&headers, &[]),
+            Err(AuthRouteError::CsrfRejected)
+        ));
+    }
+
+    #[test]
+    fn csrf_rejects_origin_credentials_even_when_host_is_allowed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_static("https://user:pass@app.example.com"),
+        );
+        headers.insert(HOST, HeaderValue::from_static("api.example.com"));
+        assert!(matches!(
+            ensure_same_site_request(&headers, &["https://app.example.com".to_owned()]),
+            Err(AuthRouteError::CsrfRejected)
+        ));
+    }
+
+    #[test]
+    fn origin_normalization_rejects_paths_and_credentials() {
+        assert_eq!(
+            normalize_origin(" https://app.example.com:8443/ "),
+            Some("https://app.example.com:8443".to_owned())
+        );
+        assert_eq!(
+            normalize_origin("http://[::1]:8080/"),
+            Some("http://[::1]:8080".to_owned())
+        );
+        assert!(normalize_origin("https://app.example.com/path").is_none());
+        assert!(normalize_origin("https://user:pass@app.example.com/").is_none());
+    }
+
+    #[test]
+    fn authenticated_response_exposes_only_the_verified_account_id() {
+        let response = AuthResponse {
+            status: "authenticated",
+            message: None,
+            email: None,
+            account_id: Some("account_123".to_owned()),
+            pending_authentication_token: None,
+        };
+        let json = serde_json::to_value(response).expect("auth response should serialize");
+        assert_eq!(json["account_id"], "account_123");
+        assert!(json.get("pending_authentication_token").is_none());
+    }
+
+    #[test]
+    fn auth_rate_limits_cover_provider_authentication_surface() {
+        assert_eq!(
+            auth_rate_limit("/auth/sign-in"),
+            Some(("auth-password", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/sign-up"),
+            Some(("auth-password", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/verify-email"),
+            Some(("auth-verify", 30))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/password-reset/confirm"),
+            Some(("auth-reset", 20))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/refresh"),
+            Some(("auth-refresh", 120))
+        );
+        assert_eq!(
+            auth_rate_limit("/auth/callback"),
+            Some(("auth-callback", 60))
+        );
+        assert_eq!(auth_rate_limit("/auth/session"), None);
+    }
+
+    #[test]
+    fn auth_rate_limit_response_is_cacheless_and_retryable() {
+        let response = AuthRouteError::RateLimited.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("cache-control"),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get("retry-after"),
+            Some(&HeaderValue::from_static("60"))
+        );
+    }
 }
