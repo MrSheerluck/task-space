@@ -36,7 +36,7 @@ services:
     # example, `cloudflared tunnel run --url http://127.0.0.1:8081`). Keep it
     # loopback-only on the host.
     ports:
-      - "127.0.0.1:8081:80"
+      - "${TASK_SPACE_FRONTEND_PORT:-127.0.0.1:8081}:80"
 
   task-space-api:
     build:

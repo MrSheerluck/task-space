@@ -134,32 +134,27 @@ fn GithubLink(class: &'static str) -> impl IntoView {
 }
 
 #[component]
-fn Header() -> impl IntoView {
-    let account_state = RwSignal::new(AccountState::Checking);
-    spawn_local(async move {
-        account_state.set(load_account_state().await);
-    });
-
+fn Header(account_state: RwSignal<AccountState>) -> impl IntoView {
     view! {
         <header class="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-6 py-4">
-            <a href="/" class="flex items-center gap-2">
+            <a href="/" class="inline-flex items-center gap-2">
                 <img src="/smbl-logo.png" alt="SMBL" class="h-7 w-auto"/>
                 <span class="font-handwriting text-4xl leading-none">
                     "Task Space"
                 </span>
             </a>
-            <nav class="flex items-center gap-5 text-ink-soft">
-                <a href="#features" class="hidden sm:block hover:text-ink">
+            <nav class="flex flex-wrap items-center justify-end gap-x-5 gap-y-1 text-ink-soft">
+                <a href="#features" class="hidden items-center hover:text-ink sm:inline-flex">
                     "features"
                 </a>
                 {move || match account_state.get() {
                     AccountState::SignedIn(entitlement) => view! {
-                        <a href="/app" class="hover:text-ink">
+                        <a href="/app" class="inline-flex items-center hover:text-ink">
                             "open board"
                         </a>
                         {if entitlement.can_sync() {
                             view! {
-                                <span class="hidden rounded-[3px] border border-note-ink-green/30 bg-note-green/60 px-2 py-1 text-xs text-note-ink-green sm:inline-block">
+                                <span class="hidden items-center rounded-[3px] border border-note-ink-green/30 bg-note-green/60 px-2 py-1 text-xs text-note-ink-green sm:inline-flex">
                                     "pro member"
                                 </span>
                             }.into_any()
@@ -173,7 +168,7 @@ fn Header() -> impl IntoView {
                         <button
                             type="button"
                             on:click=move |_| spawn_local(sign_out())
-                            class="hover:text-ink"
+                            class="inline-flex items-center hover:text-ink"
                         >
                             "sign out"
                         </button>
@@ -182,18 +177,18 @@ fn Header() -> impl IntoView {
                         <span class="text-xs text-ink-soft">"checking account…"</span>
                     }.into_any(),
                     AccountState::Guest => view! {
-                        <a href="/signin" class="hover:text-ink">
+                        <a href="/signin" class="inline-flex items-center hover:text-ink">
                             "sign in"
                         </a>
                         <a
                             href="/signup"
-                            class="bg-marker text-ink rounded-[3px] px-3 py-1.5 font-medium hover:brightness-95"
+                            class="inline-flex items-center rounded-[3px] bg-marker px-3 py-1.5 font-medium text-ink hover:brightness-95"
                         >
                             "start writing"
                         </a>
                     }.into_any(),
                     AccountState::Expired => view! {
-                        <a href="/signin" class="hover:text-ink">
+                        <a href="/signin" class="inline-flex items-center hover:text-ink">
                             "sign in again"
                         </a>
                     }.into_any(),
@@ -201,7 +196,7 @@ fn Header() -> impl IntoView {
                         <span class="text-xs text-ink-soft">"account check unavailable"</span>
                     }.into_any(),
                 }}
-                <GithubLink class="hover:text-ink"/>
+                <GithubLink class="inline-flex items-center justify-center hover:text-ink"/>
             </nav>
         </header>
     }
@@ -254,9 +249,14 @@ fn Footer() -> impl IntoView {
 
 #[component]
 pub fn Home() -> impl IntoView {
+    let account_state = RwSignal::new(AccountState::Checking);
+    spawn_local(async move {
+        account_state.set(load_account_state().await);
+    });
+
     view! {
         <div class="min-h-screen flex flex-col">
-            <Header/>
+            <Header account_state=account_state/>
             <main class="flex-1">
                 <section class="max-w-6xl mx-auto px-6 pt-10 pb-8 grid lg:grid-cols-2 gap-10 items-center">
                     <div>
@@ -265,8 +265,8 @@ pub fn Home() -> impl IntoView {
                         </h1>
                         <p class="mt-4 text-ink-soft text-lg">
                             "An infinite canvas of sticky notes for tasks and plans. Local-first:
-                            works offline, data stays in your browser, sync across devices
-                            is optional, and only when you want it."
+                            works offline, data stays in your browser, and an account is only
+                            needed when you want cloud sync across devices."
                         </p>
                         <div class="mt-6 flex flex-wrap items-center gap-3">
                             <a
@@ -275,15 +275,20 @@ pub fn Home() -> impl IntoView {
                             >
                                 "open my board"
                             </a>
-                            <a
-                                href="/signup"
-                                class="rounded-[3px] border border-ink/20 bg-paper-shelf/70 px-5 py-2.5 font-medium text-ink-soft hover:bg-paper-shelf hover:text-ink"
-                            >
-                                "create an account"
-                            </a>
+                            {move || match account_state.get() {
+                                AccountState::Guest => view! {
+                                    <a
+                                        href="/signup"
+                                        class="rounded-[3px] border border-ink/20 bg-paper-shelf/70 px-5 py-2.5 font-medium text-ink-soft hover:bg-paper-shelf hover:text-ink"
+                                    >
+                                        "create an account"
+                                    </a>
+                                }.into_any(),
+                                _ => ().into_any(),
+                            }}
                         </div>
                         <p class="mt-3 text-sm text-ink-soft">
-                            "start locally for free. sign in only when you want sync across devices."
+                            "use it free and offline. add an account when you want cloud sync."
                         </p>
                     </div>
                     <div class="flex justify-center">
@@ -295,11 +300,14 @@ pub fn Home() -> impl IntoView {
                     <h2 class="font-handwriting text-5xl text-center">
                         "a desk, not a database"
                     </h2>
-                    <div class="mt-8 grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <p class="mx-auto mt-3 max-w-xl text-center text-ink-soft">
+                        "Keep your work local and offline for free. Pay only when you want account-based cloud sync across devices."
+                    </p>
+                    <div class="mt-8 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                         <Feature
                             icon="offline ✎"
                             title="Local-first"
-                            body="Your spaces live in your browser. Work offline forever, export a file, don't lose anything when the network does."
+                            body="Your spaces live in your browser and work without an account. Keep working offline, then export or restore your data whenever you like."
                         />
                         <Feature
                             icon="paper"
@@ -309,12 +317,7 @@ pub fn Home() -> impl IntoView {
                         <Feature
                             icon="sync ⇄"
                             title="Sync, only if you want"
-                            body="Multi-device sync is a paid option (Pro). No account, no tracking for the free local mode, ever."
-                        />
-                        <Feature
-                            icon="keys"
-                            title="Keyboard-first"
-                            body="Create, move, complete and organise notes without ever touching the mouse. Tailwind-fast board, steady desk."
+                            body="Your board stays local by default. Pro adds optional, account-based cloud sync so your spaces stay in step across devices."
                         />
                     </div>
                 </section>
@@ -333,8 +336,8 @@ pub fn Home() -> impl IntoView {
                             </p>
                             <ul class="mt-3 space-y-1 text-sm text-ink-soft">
                                 <li>"unlimited local spaces"</li>
-                                <li>"offline-first, data stays in your browser"</li>
-                                <li>"JSON export & restore"</li>
+                                <li>"work offline without an account"</li>
+                                <li>"JSON export and restore"</li>
                             </ul>
                         </div>
                         <div class="rounded-md border border-ink/20 p-6 rotate-[-0.5deg] shadow-md bg-note-yellow text-note-ink-yellow">
@@ -345,9 +348,9 @@ pub fn Home() -> impl IntoView {
                                 "$2 / mo · $20 / yr"
                             </p>
                             <ul class="mt-3 space-y-1 text-sm">
-                                <li>"sync your spaces across any browser (web app, installable)"</li>
-                                <li>"same local files, nothing converted"</li>
-                                <li>"runs offline everywhere, syncs when it can"</li>
+                                <li>"account-based cloud sync across devices"</li>
+                                <li>"keep working offline between syncs"</li>
+                                <li>"changes sync when you're back online"</li>
                             </ul>
                             <a
                                 href="/signup"
